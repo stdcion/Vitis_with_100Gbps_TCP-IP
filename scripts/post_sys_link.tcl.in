@@ -97,6 +97,7 @@ puts "$${}{__TCLID} bd gt quad is $${}{bd_gt_gtyquad_0} and gt clock ref is $${}
 puts "$${}{__TCLID} bd gt quad is $${}{bd_gt_gtyquad_1} and gt clock ref is $${}{bd_gt_ref_clk_1_name_a}"
 
 # U280 -> frc0(50)
+# U200 -> frc1(100 MHz)
 # U250 -> frc1(100 MHz)
 # U50  -> frc2(100 MHz)
 # U55c -> frc2(100 MHz)

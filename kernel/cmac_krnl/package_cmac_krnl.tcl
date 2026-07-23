@@ -53,8 +53,10 @@ set path_to_common "./kernel/common"
 set words [split $device "_"]
 set board [lindex $words 1]
 
-if {[string compare -nocase $board "u280"] == 0} {
-  	set projPart "xcu280-fsvh2892-2L-e"
+if {[string compare -nocase $board "u200"] == 0} {
+    set projPart "xcu200-fsgd2104-2-e"
+} elseif {[string compare -nocase $board "u280"] == 0} {
+    set projPart "xcu280-fsvh2892-2L-e"
 } elseif {[string compare -nocase $board "u250"] == 0} {
   	set projPart "xcu250-figd2104-2L-e"
 } elseif {[string compare -nocase $board "u50"] == 0} {
@@ -101,6 +103,13 @@ if {[string compare -nocase $board "u280"] == 0} {
 	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
 	puts "Generating IPI for u280 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
 
+} elseif {[string compare -nocase $board "u200"] == 0} {
+	# Possible core_selection CMACE4_X0Y6 (X1Y48~X1Y51) and CMACE4_X0Y7 (X1Y44~X1Y47)
+  	set core_selection  CMACE4_X0Y6
+    set group_selection X1Y48~X1Y51
+	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
+	puts "Generating IPI for u200 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
+
 } elseif {[string compare -nocase $board "u250"] == 0} {
   	set core_selection  CMACE4_X0Y7
     set group_selection X1Y44~X1Y47
@@ -114,6 +123,7 @@ if {[string compare -nocase $board "u280"] == 0} {
 	set group_selection X0Y28~X0Y31
   	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
 	puts "Generating IPI for u50 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
+
 } elseif {[string compare -nocase $board "u55c"] == 0} {
 	set gt_ref_clk 161.1328125
 	# Possible core_selection CMACE4_X0Y2; CMACE4_X0Y3; CMACE4_X0Y4
@@ -121,6 +131,7 @@ if {[string compare -nocase $board "u280"] == 0} {
 	set group_selection X0Y24~X0Y27
   	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
 	puts "Generating IPI for u55c cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
+
 } else {
     puts "Unknown board $board"
     exit 
