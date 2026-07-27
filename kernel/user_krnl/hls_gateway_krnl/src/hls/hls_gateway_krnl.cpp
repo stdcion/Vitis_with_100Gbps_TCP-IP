@@ -236,7 +236,8 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
               hls::stream<ap_uint<16> >& toClientLength,
               hls::stream<ap_uint<16> >& clientSessionFifo,
               hls::stream<bool>& clientLostFifo,
-              hls::stream<bool>& upstreamLostFifo)
+              hls::stream<bool>& upstreamLostFifo,
+              hls::stream<bool>& upstreamLostTxFifo)
 {
 #pragma HLS INLINE off
 
@@ -267,7 +268,9 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
           if (serverSessionValid && closedSession == serverSession)
           {
                serverSessionValid = false;
+               // сообщаем и тому, кто переподключается, и передатчику
                upstreamLostFifo.write(true);
+               upstreamLostTxFifo.write(true);
           }
           else if (clientSessionValid && closedSession == clientSession)
           {
@@ -677,7 +680,8 @@ void hls_gateway_krnl(
               serverSessionToRoute,
               toServerData, toServerLength,
               toClientData, toClientLength,
-              clientSessionFifo, clientLostFifo, upstreamLostFifo);
+              clientSessionFifo, clientLostFifo,
+              upstreamLostFifo, upstreamLostTxFifo);
 
      // 5. Единственный передатчик — обслуживает оба направления
      gw_tx_merged(serverSessionToTx, clientSessionFifo,
