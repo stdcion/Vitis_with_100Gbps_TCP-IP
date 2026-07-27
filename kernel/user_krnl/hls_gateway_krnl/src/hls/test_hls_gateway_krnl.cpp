@@ -27,11 +27,18 @@ C-симуляция для hls_gateway_krnl.
 #include "ap_axi_sdata.h"
 #include "ap_int.h"
 #include "hls_stream.h"
-#include "../../../../common/include/communication.hpp"
 
 #include <iostream>
 #include <vector>
 #include <string>
+
+typedef ap_axiu<512, 0, 0, 0> pkt512;
+typedef ap_axiu<256, 0, 0, 0> pkt256;
+typedef ap_axiu<128, 0, 0, 0> pkt128;
+typedef ap_axiu<64, 0, 0, 0>  pkt64;
+typedef ap_axiu<32, 0, 0, 0>  pkt32;
+typedef ap_axiu<16, 0, 0, 0>  pkt16;
+typedef ap_axiu<8, 0, 0, 0>   pkt8;
 
 // Прототип тестируемого ядра
 extern "C" void hls_gateway_krnl(
