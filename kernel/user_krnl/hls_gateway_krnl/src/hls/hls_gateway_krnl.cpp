@@ -312,6 +312,12 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
      // Отложенная на такт запись лишней сессии в straySessionFifo
      static ap_uint<16> strayToClose = 0;
      static bool strayPending = false;
+     // Буфер на такт между чтением closedSessionFifo и сравнением
+     static ap_uint<16> closedSessionReg = 0;
+     static bool closedPending = false;
+     // Отложенная публикация sessionID клиента передатчику
+     static ap_uint<16> clientToPublish = 0;
+     static bool clientPublishPending = false;
 
      // Новый sessionID upstream-соединения (приходит при каждом
      // успешном подключении, в том числе после переподключения).
@@ -343,31 +349,48 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
      // принять запись, иначе эта стадия заблокируется на write и
      // перестанет читать s_axis_tcp_rx_data — см. комментарий о
      // дедлоке в gw_rx_handshake.
-     if (routeState == IDLE && !closedSessionFifo.empty()
-         && !upstreamLostFifo.full() && !upstreamLostTxFifo.full()
-         && !clientLostFifo.full())
+     //
+     // ТАЙМИНГ (UG1448, 200-880: "break up these dependencies in the
+     // user code"): чтение closedSessionFifo и сравнение с сессиями
+     // разнесены на два такта. Раньше путь был
+     //   read closedSessionFifo (1.409 нс) -> icmp -> and -> phi
+     //   -> and -> write clientSessionFifo (1.336 нс)
+     // = 4.161 нс против бюджета 2.920. Теперь прочитанное значение
+     // используется только на следующей итерации конвейера.
+     if (closedPending)
      {
-          ap_uint<16> closedSession = closedSessionFifo.read();
-
-          if (serverSessionValid && closedSession == serverSession)
+          if (serverSessionValid && closedSessionReg == serverSession)
           {
                serverSessionValid = false;
                // сообщаем и тому, кто переподключается, и передатчику
                upstreamLostFifo.write(true);
                upstreamLostTxFifo.write(true);
           }
-          else if (clientSessionValid && closedSession == clientSession)
+          else if (clientSessionValid && closedSessionReg == clientSession)
           {
                clientSessionValid = false;
                clientLostFifo.write(true);
           }
+          closedPending = false;
+     }
+     else if (routeState == IDLE && !closedSessionFifo.empty()
+              && !upstreamLostFifo.full() && !upstreamLostTxFifo.full()
+              && !clientLostFifo.full())
+     {
+          closedSessionReg = closedSessionFifo.read();
+          closedPending = true;
      }
 
-     // Отложенная запись лишней сессии (решение принято такт назад)
+     // Отложенные записи (решения приняты такт назад)
      if (strayPending && !straySessionFifo.full())
      {
           straySessionFifo.write(strayToClose);
           strayPending = false;
+     }
+     if (clientPublishPending && !clientSessionFifo.full())
+     {
+          clientSessionFifo.write(clientToPublish);
+          clientPublishPending = false;
      }
 
      switch (routeState)
@@ -375,7 +398,7 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
      case IDLE:
           if (!rxSessionFifo.empty() && !rxLengthFifo.empty() && !s_axis_tcp_rx_meta.empty()
               && !toClientLength.full() && !toServerLength.full()
-              && !clientSessionFifo.full() && !strayPending)
+              && !clientPublishPending && !strayPending)
           {
                s_axis_tcp_rx_meta.read();
                ap_uint<16> currentSession = rxSessionFifo.read();
@@ -406,7 +429,12 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
                     {
                          clientSession = currentSession;
                          clientSessionValid = true;
-                         clientSessionFifo.write(currentSession);
+                         // Запись в clientSessionFifo — следующим
+                         // тактом, по той же причине, что и stray:
+                         // иначе она стоит в конце цепочки сравнений
+                         // (это и был путь 4.161 нс).
+                         clientToPublish = currentSession;
+                         clientPublishPending = true;
                          toServerLength.write(length);
                     }
                     else if (currentSession == clientSession)
@@ -513,7 +541,7 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
      // ISSUE в следующем такте читает длину и выставляет tx_meta.
      // Раньше и арбитраж, и чтение длины, и (len+63)>>6 попадали в
      // один такт — критический путь 3.846 нс против бюджета 2.920 нс.
-     enum txStateType {SELECT, ISSUE, WAIT_META_SPACE, WAIT_STATUS, WRITE_DATA, DISCARD};
+     enum txStateType {SELECT, ISSUE, WAIT_STATUS, WRITE_DATA, DISCARD};
      static txStateType txState = SELECT;
 #pragma HLS RESET variable=txState
 
@@ -532,6 +560,8 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
      static ap_uint<16> bytesRemaining = 0;
      // Решение, принятое в SELECT и исполняемое в ISSUE
      static bool issueDiscard = false;
+     // Повтор tx_meta после error==2 (длину заново не читать)
+     static bool retryMeta = false;
 
      // Актуализируем sessionID (в т.ч. после переподключения)
      if (!serverSessionToTx.empty())
@@ -609,43 +639,39 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
           // Длина уже гарантированно есть (проверено в SELECT), но
           // между вызовами направление не менялось, поэтому читаем
           // ровно из выбранной очереди.
-          pendingLength = activeIsClient ? toClientLength.read()
-                                         : toServerLength.read();
-          wordsToSend = (pendingLength + 63) >> 6;
-          wordsSent = 0;
-          bytesRemaining = pendingLength;
+          //
+          // retryMeta означает повтор после tx_status error==2: длина
+          // уже прочитана в прошлый раз, читать её снова нельзя.
+          if (!retryMeta)
+          {
+               pendingLength = activeIsClient ? toClientLength.read()
+                                              : toServerLength.read();
+               wordsToSend = (pendingLength + 63) >> 6;
+               wordsSent = 0;
+               bytesRemaining = pendingLength;
+          }
+          retryMeta = false;
 
           if (issueDiscard)
           {
                txState = DISCARD;
           }
-          else if (!m_axis_tcp_tx_meta.full())
+          else
           {
+               // Единственное место записи в m_axis_tcp_tx_meta на всё
+               // ядро — см. пояснение про 200-1960 ниже в WRITE_DATA.
+               // full() не проверяем: блокировка на выходном порту к
+               // стеку — штатный backpressure. Раньше здесь были два
+               // обращения (full + write) и ещё одно в WAIT_META_SPACE,
+               // то есть три обращения к одному AXIS-порту.
                pkt32 tx_meta_pkt;
                tx_meta_pkt.data(15, 0) = activeIsClient ? clientSession : serverSession;
                tx_meta_pkt.data(31, 16) = pendingLength;
                m_axis_tcp_tx_meta.write(tx_meta_pkt);
                txState = WAIT_STATUS;
-          }
-          else
-          {
-               // meta-порт занят — длина уже прочитана, поэтому
-               // повторяем попытку записи в следующем такте
-               txState = WAIT_META_SPACE;
           }
           break;
      }
-
-     case WAIT_META_SPACE:
-          if (!m_axis_tcp_tx_meta.full())
-          {
-               pkt32 tx_meta_pkt;
-               tx_meta_pkt.data(15, 0) = activeIsClient ? clientSession : serverSession;
-               tx_meta_pkt.data(31, 16) = pendingLength;
-               m_axis_tcp_tx_meta.write(tx_meta_pkt);
-               txState = WAIT_STATUS;
-          }
-          break;
 
      case WAIT_STATUS:
           if (!s_axis_tcp_tx_status.empty())
@@ -684,10 +710,10 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
                {
                     // Нет места в буфере получателя — повторяем запрос.
                     // Длина и счётчики уже установлены и не меняются,
-                    // поэтому достаточно заново выставить tx_meta.
-                    // Через WAIT_META_SPACE, чтобы не блокироваться,
-                    // если meta-порт занят.
-                    txState = WAIT_META_SPACE;
+                    // поэтому возвращаемся в ISSUE, но БЕЗ повторного
+                    // чтения длины из FIFO (её там уже нет).
+                    retryMeta = true;
+                    txState = ISSUE;
                }
           }
           break;
@@ -709,10 +735,22 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
 
           bool dataReady = activeIsClient ? !toClientData.empty()
                                           : !toServerData.empty();
-          // При отбрасывании выходной порт не нужен и не проверяется
-          bool sinkReady = discarding || !m_axis_tcp_tx_data.full();
 
-          if (dataReady && sinkReady)
+          // full() на m_axis_tcp_tx_data НЕ проверяем.
+          //
+          // UG1448, сообщение 200-1960: множественные обращения к
+          // AXIS/ap_hs/FIFO-порту внутри одного конвейера дают
+          // "conflicts across pipeline stages". Проверка full() плюс
+          // write() — это два обращения к одному порту, и они как раз
+          // и удерживали II=2:
+          //   [200-880] between axis write (:739) and axis request (:713)
+          //   on port 'm_axis_tcp_tx_data'
+          //
+          // Блокирующая запись в выходной поток к стеку — это штатный
+          // backpressure, а не дедлок: стек всегда в конце концов
+          // забирает данные, обратной связи через это ядро нет.
+          // Guard здесь был лишним с самого начала.
+          if (dataReady)
           {
                ap_uint<512> payload = activeIsClient ? toClientData.read()
                                                     : toServerData.read();
@@ -763,24 +801,25 @@ void gw_close_stray(hls::stream<ap_uint<16> >& straySessionFifo,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     if (m_axis_tcp_close_connection.full())
-          return;
-
      // Два источника (gw_route и gw_tx_merged), потому что один
      // hls::stream нельзя писать из двух функций. Обслуживаем по
      // одному за вызов, приоритет не важен.
-     if (!straySessionFifo.empty())
+     //
+     // Одно место записи в m_axis_tcp_close_connection и без проверки
+     // full() — раньше было два write() плюс full(), то есть три
+     // обращения к одному AXIS-порту, что держало II=2
+     // (UG1448, 200-1960: multiple reads/writes to AXIS => conflicts
+     // across pipeline stages).
+     bool haveStray = !straySessionFifo.empty();
+     bool haveTxStray = !strayFromTx.empty();
+
+     if (haveStray || haveTxStray)
      {
+          ap_uint<16> session = haveStray ? straySessionFifo.read()
+                                         : strayFromTx.read();
           pkt16 close_pkt;
           close_pkt.data = 0;
-          close_pkt.data(15, 0) = straySessionFifo.read();
-          m_axis_tcp_close_connection.write(close_pkt);
-     }
-     else if (!strayFromTx.empty())
-     {
-          pkt16 close_pkt;
-          close_pkt.data = 0;
-          close_pkt.data(15, 0) = strayFromTx.read();
+          close_pkt.data(15, 0) = session;
           m_axis_tcp_close_connection.write(close_pkt);
      }
 }
