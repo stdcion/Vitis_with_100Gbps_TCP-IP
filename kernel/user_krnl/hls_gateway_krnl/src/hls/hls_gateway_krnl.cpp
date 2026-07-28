@@ -841,7 +841,7 @@ void gw_close_stray(hls::stream<ap_uint<16> >& straySessionFifo,
  * возможен. Внутренняя логика и глубины FIFO при этом ровно те же,
  * а именно их и нужно проверить на дедлок (UG1448, Data FIFO Sizing).
  */
-static void gw_core(int listenPort,
+void gw_core(int listenPort,
                     int serverIpAddress,
                     int serverPort,
                     ap_uint<32> reconnectDelay,
@@ -862,10 +862,15 @@ static void gw_core(int listenPort,
                     hls::stream<pkt512>& m_axis_tcp_tx_data,
                     hls::stream<pkt64>& s_axis_tcp_tx_status)
 {
-#pragma HLS INLINE
+// INLINE здесь ставить НЕЛЬЗЯ — HLS 214-272: "INLINE and DATAFLOW on
+// same function is allowed only for inlining into an outer dataflow
+// function". Top-функции сами не dataflow-регионы, они лишь вызывают
+// gw_core, поэтому gw_core остаётся отдельной dataflow-функцией.
+//
 // DATAFLOW, а не PIPELINE: стадии становятся независимыми процессами,
 // и обратная связь gw_route -> gw_connect_upstream через
 // upstreamLostFifo перестаёт быть carried dependence (было II=10).
+#pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
      // ---- Внутренние FIFO между стадиями ----
