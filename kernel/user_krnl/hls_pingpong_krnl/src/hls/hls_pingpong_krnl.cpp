@@ -22,8 +22,15 @@ TCP ping-pong (echo) kernel.
 #include "../../../../common/include/communication.hpp"
 #include "hls_stream.h"
 
-// Максимальный размер сообщения в 64-байтных словах (64 * 64 = 4096 байт)
+// Максимальный размер сообщения в 64-байтных словах (64 * 64 = 4096 байт).
+// Совпадает с MSS стека по умолчанию (FNS_TCP_STACK_MSS=4096), поэтому
+// один TCP-сегмент всегда влезает в буфер целиком.
+//
+// ДОЛЖНО БЫТЬ СТЕПЕНЬЮ ДВОЙКИ: в TX используется маска
+// (wordIdx & (PP_MAX_WORDS-1)) как защита от выхода за границу BRAM.
 #define PP_MAX_WORDS 64
+static_assert((PP_MAX_WORDS & (PP_MAX_WORDS - 1)) == 0,
+              "PP_MAX_WORDS должен быть степенью двойки (см. маску в TX)");
 
 /*
  * Открывает listen-порт, повторяя запрос до подтверждения стека.
@@ -32,6 +39,7 @@ void pp_listen(int listenPort,
                hls::stream<pkt16>& m_axis_tcp_listen_port,
                hls::stream<pkt8>& s_axis_tcp_port_status)
 {
+#pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
      static bool portRequested = false;
@@ -74,6 +82,7 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
              hls::stream<pkt512>& m_axis_tcp_tx_data,
              hls::stream<pkt64>& s_axis_tcp_tx_status)
 {
+#pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
      enum ppStateType {NOTIFY, META, RX, REQ, STATUS, TX};
@@ -84,8 +93,9 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
 #pragma HLS BIND_STORAGE variable=payload type=RAM_2P impl=BRAM
 
      static ap_uint<16> sessionID = 0;
-     static ap_uint<16> length = 0;
-     static ap_uint<16> wordCount = 0;
+     static ap_uint<16> length = 0;       // обещано уведомлением
+     static ap_uint<16> txLength = 0;     // фактически отражаем
+     static ap_uint<16> wordCount = 0;    // сохранено в payload[]
      static ap_uint<16> wordIdx = 0;
      static ap_uint<16> bytesRemaining = 0;
 
@@ -102,7 +112,20 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
                     // sessionID берём из уведомления — так реконнекты
                     // клиента подхватываются без дополнительной логики
                     sessionID = notification_pkt.data(15, 0);
-                    length = notifLength;
+
+                    // Запрашиваем не больше, чем вмещает буфер.
+                    //
+                    // Раньше запрашивалась вся notifLength, а RX молча
+                    // отбрасывал слова за PP_MAX_WORDS, продолжая
+                    // считать wordCount. В TX индекс уходил за границу
+                    // payload[], и эхо содержало мусор при заявленной
+                    // полной длине (проверено: слова 64,65 отдавались
+                    // как 0x101 вместо данных).
+                    //
+                    // Остаток стек отдаст следующим уведомлением —
+                    // read request только подтверждает то, что заберём.
+                    const ap_uint<16> maxBytes = PP_MAX_WORDS * 64;
+                    length = (notifLength > maxBytes) ? maxBytes : notifLength;
 
                     pkt32 readRequest_pkt;
                     readRequest_pkt.data(15, 0) = sessionID;
@@ -127,11 +150,14 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
           if (!s_axis_tcp_rx_data.empty())
           {
                pkt512 rx_word = s_axis_tcp_rx_data.read();
+               // Слова сверх буфера отбрасываем, но и НЕ засчитываем:
+               // wordCount задаёт, сколько слов отдаст TX, поэтому он
+               // не должен превышать число реально сохранённых.
                if (wordCount < PP_MAX_WORDS)
                {
                     payload[wordCount] = rx_word.data;
+                    wordCount++;
                }
-               wordCount++;
                if (rx_word.last)
                {
                     ppState = REQ;
@@ -141,9 +167,19 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
 
      case REQ:
      {
+          // Отражаем ровно то, что реально приняли и сохранили.
+          //
+          // length пришла из уведомления, wordCount — факт приёма.
+          // Если стек отдал меньше слов, чем обещал (или больше, чем
+          // вместил буфер), доверять надо факту: иначе tx_meta заявит
+          // длину, под которую нет данных, и стек будет ждать слова,
+          // которых ядро не отдаст.
+          ap_uint<16> wordBytes = (ap_uint<16>)(wordCount * 64);
+          txLength = (length < wordBytes) ? length : wordBytes;
+
           pkt32 tx_meta_pkt;
           tx_meta_pkt.data(15, 0) = sessionID;
-          tx_meta_pkt.data(31, 16) = length;
+          tx_meta_pkt.data(31, 16) = txLength;
           m_axis_tcp_tx_meta.write(tx_meta_pkt);
           ppState = STATUS;
           break;
@@ -158,7 +194,7 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
                if (error == 0)
                {
                     wordIdx = 0;
-                    bytesRemaining = length;
+                    bytesRemaining = txLength;
                     ppState = TX;
                }
                else if (error == 1)
@@ -177,7 +213,10 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
      case TX:
      {
           pkt512 tx_word;
-          tx_word.data = payload[wordIdx];
+          // Индекс не может выйти за буфер: wordCount ограничен
+          // PP_MAX_WORDS в RX. Маска — страховка на случай будущих
+          // правок, чтобы чтение за границей BRAM не появилось снова.
+          tx_word.data = payload[wordIdx & (PP_MAX_WORDS - 1)];
 
           // в последнем слове валидны только оставшиеся байты
           ap_uint<7> validBytes = (bytesRemaining >= 64) ? (ap_uint<7>)64
@@ -252,7 +291,13 @@ void hls_pingpong_krnl(
 #pragma HLS INTERFACE s_axilite port = listenPort bundle = control
 #pragma HLS INTERFACE ap_ctrl_none port = return
 
-#pragma HLS PIPELINE II=1
+// DATAFLOW, а не PIPELINE: стадии становятся независимыми процессами.
+// PIPELINE на топ-функции с несколькими stateful-стадиями склеивает их
+// в один конвейер — в gateway-ядре такая же конструкция давала II=10
+// (carried dependence между стадиями), то есть падение пропускной
+// способности в 10 раз. Идиома взята из iperf_client.cpp: DATAFLOW
+// сверху, PIPELINE II=1 + INLINE off на каждой стадии.
+#pragma HLS DATAFLOW disable_start_propagation
 
      // Неиспользуемые интерфейсы
      tie_off_udp(s_axis_udp_rx, m_axis_udp_tx, s_axis_udp_rx_meta, m_axis_udp_tx_meta);
