@@ -5,10 +5,14 @@ TCP gateway host application.
 которое слушает listenPort и проксирует трафик на upstream-сервер.
 
 Usage:
-  ./host <XCLBIN> <server_ip> [<server_port> [<listen_port>]]
+  ./host <XCLBIN> <server_ip> [<server_port> [<listen_port>
+                              [<reconnect_delay_cycles>]]]
 
 Пример:
   ./host ./gateway.xclbin 192.168.1.20 8080 5001
+
+reconnect_delay_cycles — пауза перед повторной попыткой подключения
+к upstream, в тактах ядра (250 МГц). По умолчанию 250000000 ≈ 1 с.
 **********/
 #include "xcl2.hpp"
 #include <vector>
@@ -152,20 +156,29 @@ int main(int argc, char **argv) {
     uint32_t serverIpAddr = parseIpString(argv[2]);
     uint32_t serverPort = 8080;
     uint32_t listenPort = 5001;
+    // Пауза между попытками переподключения к upstream, в тактах.
+    // Ядро работает на 250 МГц, поэтому 250e6 тактов ≈ 1 секунда.
+    // Раньше это была compile-time константа, из-за чего csim и синтез
+    // собирали разный код; теперь значение приходит через AXI-lite.
+    uint32_t reconnectDelay = 250000000;
 
     if (argc >= 4)
         serverPort = strtol(argv[3], NULL, 10);
     if (argc >= 5)
         listenPort = strtol(argv[4], NULL, 10);
+    if (argc >= 6)
+        reconnectDelay = strtoul(argv[5], NULL, 10);
 
     printf("listen port      : %d\n", listenPort);
     printf("upstream server  : %s (0x%08x)\n", argv[2], serverIpAddr);
     printf("upstream port    : %d\n", serverPort);
+    printf("reconnect delay  : %u cycles\n", reconnectDelay);
 
     // Аргументы ядра идут после 16 stream-портов
     OCL_CHECK(err, err = user_kernel.setArg(16, listenPort));
     OCL_CHECK(err, err = user_kernel.setArg(17, serverIpAddr));
     OCL_CHECK(err, err = user_kernel.setArg(18, serverPort));
+    OCL_CHECK(err, err = user_kernel.setArg(19, reconnectDelay));
 
     printf("enqueue gateway kernel...\n");
     auto start = std::chrono::high_resolution_clock::now();

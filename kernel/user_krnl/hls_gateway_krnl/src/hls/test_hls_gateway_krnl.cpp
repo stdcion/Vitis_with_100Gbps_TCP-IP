@@ -10,6 +10,28 @@ C-симуляция для hls_gateway_krnl.
 в цикле по одному такту (kernel_tick) и между тактами
 подкладывает/забирает данные.
 
+ОТЛИЧИЕ ОТ ПРЕДЫДУЩЕЙ ВЕРСИИ. Раньше тестбенч сам отвечал tx_status
+сразу после чтения tx_meta, и всегда успехом. Из-за этого ветки
+error==1 / error==2 и состояние DISCARD были мёртвым кодом, а
+backpressure не возникал никогда (FIFO глубиной 1024 не заполнялись
+глубже 2 слов).
+
+Теперь стек — независимый процесс stack_tick(), который вызывается
+на каждом такте вместе с ядром и ведёт себя настраиваемо:
+  - задержка ответа tx_status (statusDelay),
+  - произвольный код ошибки на N-й транзакции,
+  - опциональная приостановка выдачи (stall) для проверки
+    заполнения FIFO и корректности backpressure.
+
+ГРАНИЦЫ ПРИМЕНИМОСТИ. Тест [10] проверяет, что при остановленном
+получателе данные не теряются и не склеиваются. Но он НЕ доказывает
+отсутствие дедлока по заполнению FIFO: в C-симуляции hls::stream не
+имеет ограниченной глубины, блокирующая запись никогда не блокируется,
+и прагмы depth игнорируются. Проверки full() перед записью (см.
+gw_rx_handshake) обязательны для железа, но их эффект виден только в
+co-simulation (cosim_design) или на плате. Мутационная проверка это
+подтвердила: снятие guard'ов в csim не роняет ни один тест.
+
 Сценарии:
   1. Открытие listen-порта и подключение к upstream-серверу
   2. Uplink:   клиент -> сервер
@@ -17,12 +39,15 @@ C-симуляция для hls_gateway_krnl.
   4. Неполное слово (length не кратна 64) — проверка keep
   5. Реконнект клиента (новый sessionID)
   6. Обрыв upstream и автоматическое переподключение
+  7. tx_status error==2 (нет места) — повтор tx_meta
+  8. tx_status error==1 (обрыв) — сброс порции, DISCARD
+  9. Оба направления одновременно — round-robin и запрет
+     переключения в середине транзакции
+ 10. Backpressure: много пакетов подряд без немедленного слива
+ 11. Лишняя клиентская сессия — закрывается через close_connection
 
 Сборка (на машине с Vitis HLS):
     vitis_hls -f run_csim.tcl
-или вручную:
-    g++ -std=c++14 -I$XILINX_HLS/include \
-        test_hls_gateway_krnl.cpp hls_gateway_krnl.cpp -o tb && ./tb
 ************************************************/
 #include "ap_axi_sdata.h"
 #include "ap_int.h"
@@ -30,6 +55,7 @@ C-симуляция для hls_gateway_krnl.
 
 #include <iostream>
 #include <vector>
+#include <deque>
 #include <string>
 
 typedef ap_axiu<512, 0, 0, 0> pkt512;
@@ -60,7 +86,8 @@ extern "C" void hls_gateway_krnl(
      hls::stream<pkt64>& s_axis_tcp_tx_status,
      int listenPort,
      int serverIpAddress,
-     int serverPort);
+     int serverPort,
+     int reconnectDelay);
 
 // ---------------------------------------------------------------
 // Параметры теста
@@ -69,9 +96,14 @@ static const int LISTEN_PORT   = 5001;
 static const int SERVER_IP     = 0xC0A80114;  // 192.168.1.20
 static const int SERVER_PORT   = 8080;
 
+// Пауза реконнекта — теперь обычный аргумент, а не -D.
+// Малое значение, чтобы симуляция не ждала 250e6 тактов.
+static const int RECONNECT_DELAY = 100;
+
 static const ap_uint<16> SESSION_SERVER  = 7;   // выдаём при open
 static const ap_uint<16> SESSION_CLIENT  = 3;   // первый клиент
 static const ap_uint<16> SESSION_CLIENT2 = 9;   // после реконнекта
+static const ap_uint<16> SESSION_STRAY   = 11;  // лишний клиент
 
 // ---------------------------------------------------------------
 // Потоки между тестбенчем и ядром
@@ -108,8 +140,119 @@ static void check(bool cond, const std::string& what)
      }
 }
 
-// Один такт работы ядра
-static void kernel_tick()
+// ---------------------------------------------------------------
+// Модель TCP-стека: независимый процесс, тикает вместе с ядром
+// ---------------------------------------------------------------
+
+// Захваченная стеком транзакция (meta + собранные слова)
+struct TxCapture
+{
+     ap_uint<16> sessionID;
+     ap_uint<16> length;
+     int         words;
+     ap_uint<64> lastKeep;
+};
+
+static std::deque<TxCapture>  captured;      // завершённые транзакции
+static std::deque<ap_uint<16> > closedByGw;  // сессии, закрытые ядром
+
+// Настройки поведения стека
+static int  stk_statusDelay   = 0;      // тактов между meta и status
+static int  stk_forceErrorOn  = -1;     // номер транзакции с ошибкой
+static int  stk_forceErrorCode= 0;      // 1 = обрыв, 2 = нет места
+static bool stk_stallData     = false;  // не принимать tx_data
+
+// Внутреннее состояние стека
+static int         stk_txCount     = 0;   // сколько meta принято всего
+static bool        stk_haveMeta    = false;
+static ap_uint<16> stk_metaSession = 0;
+static ap_uint<16> stk_metaLength  = 0;
+static int         stk_delayLeft   = 0;
+static bool         stk_awaitData  = false;
+static TxCapture   stk_cur;
+
+static void stack_reset_cfg()
+{
+     stk_statusDelay    = 0;
+     stk_forceErrorOn   = -1;
+     stk_forceErrorCode = 0;
+     stk_stallData      = false;
+}
+
+// Один такт работы модели стека
+static void stack_tick()
+{
+     // 1. Приём tx_meta
+     if (!stk_haveMeta && !stk_awaitData && !m_axis_tcp_tx_meta.empty())
+     {
+          pkt32 meta = m_axis_tcp_tx_meta.read();
+          stk_metaSession = meta.data(15, 0);
+          stk_metaLength  = meta.data(31, 16);
+          stk_haveMeta    = true;
+          stk_delayLeft   = stk_statusDelay;
+          stk_txCount++;
+     }
+
+     // 2. Ответ tx_status после задержки
+     if (stk_haveMeta)
+     {
+          if (stk_delayLeft > 0)
+          {
+               stk_delayLeft--;
+          }
+          else
+          {
+               int err = 0;
+               if (stk_forceErrorOn == stk_txCount)
+                    err = stk_forceErrorCode;
+
+               pkt64 s;
+               s.data = 0;
+               s.data(15, 0)  = stk_metaSession;
+               s.data(31, 16) = stk_metaLength;
+               s.data(61, 32) = 60000;
+               s.data(63, 62) = err;
+               s_axis_tcp_tx_status.write(s);
+
+               stk_haveMeta = false;
+
+               if (err == 0)
+               {
+                    // ждём данные этой транзакции
+                    stk_awaitData      = true;
+                    stk_cur.sessionID  = stk_metaSession;
+                    stk_cur.length     = stk_metaLength;
+                    stk_cur.words      = 0;
+                    stk_cur.lastKeep   = 0;
+               }
+               // err==2: ядро должно повторить tx_meta (данные не идут)
+               // err==1: ядро сбрасывает порцию (данные не идут)
+          }
+     }
+
+     // 3. Приём tx_data
+     if (stk_awaitData && !stk_stallData && !m_axis_tcp_tx_data.empty())
+     {
+          pkt512 w = m_axis_tcp_tx_data.read();
+          stk_cur.words++;
+          stk_cur.lastKeep = w.keep;
+          if (w.last)
+          {
+               captured.push_back(stk_cur);
+               stk_awaitData = false;
+          }
+     }
+
+     // 4. Забираем close_connection
+     if (!m_axis_tcp_close_connection.empty())
+     {
+          pkt16 c = m_axis_tcp_close_connection.read();
+          closedByGw.push_back(c.data(15, 0));
+     }
+}
+
+// Один такт: ядро + стек
+static void tick()
 {
      hls_gateway_krnl(s_axis_udp_rx, m_axis_udp_tx,
                       s_axis_udp_rx_meta, m_axis_udp_tx_meta,
@@ -120,16 +263,33 @@ static void kernel_tick()
                       s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
                       m_axis_tcp_tx_meta, m_axis_tcp_tx_data,
                       s_axis_tcp_tx_status,
-                      LISTEN_PORT, SERVER_IP, SERVER_PORT);
+                      LISTEN_PORT, SERVER_IP, SERVER_PORT,
+                      RECONNECT_DELAY);
+     stack_tick();
 }
 
 static void run(int cycles)
 {
-     for (int i = 0; i < cycles; i++) kernel_tick();
+     for (int i = 0; i < cycles; i++) tick();
+}
+
+// Ждём появления N завершённых транзакций
+static bool wait_captured(size_t n, int limit)
+{
+     for (int i = 0; i < limit && captured.size() < n; i++) tick();
+     return captured.size() >= n;
+}
+
+static bool pop_captured(TxCapture& out, int limit = 400)
+{
+     if (!wait_captured(1, limit)) return false;
+     out = captured.front();
+     captured.pop_front();
+     return true;
 }
 
 // ---------------------------------------------------------------
-// Хелперы: имитация поведения TCP-стека
+// Хелперы: стек -> ядро
 // ---------------------------------------------------------------
 
 // Стек сообщает: в сессии sessionID пришло length байт
@@ -176,28 +336,6 @@ static void push_rx_payload(ap_uint<16> sessionID, int numWords, ap_uint<32> see
      }
 }
 
-// Стек подтверждает готовность принять tx (error = 0)
-static void push_tx_status_ok(ap_uint<16> sessionID, ap_uint<16> length)
-{
-     pkt64 s;
-     s.data = 0;
-     s.data(15, 0)  = sessionID;
-     s.data(31, 16) = length;
-     s.data(61, 32) = 60000;
-     s.data(63, 62) = 0;
-     s_axis_tcp_tx_status.write(s);
-}
-
-// Стек сообщает об обрыве при попытке передачи (error = 1)
-static void push_tx_status_torn(ap_uint<16> sessionID)
-{
-     pkt64 s;
-     s.data = 0;
-     s.data(15, 0)  = sessionID;
-     s.data(63, 62) = 1;
-     s_axis_tcp_tx_status.write(s);
-}
-
 // Ответ стека на запрос открыть соединение
 static void push_open_status(ap_uint<16> sessionID, bool success)
 {
@@ -208,48 +346,16 @@ static void push_open_status(ap_uint<16> sessionID, bool success)
      s_axis_tcp_open_status.write(st);
 }
 
-// Забрать tx-транзакцию: meta + данные. Возвращает false, если meta нет.
-static bool pop_tx(ap_uint<16>& sessionID, ap_uint<16>& length,
-                   int& wordsSeen, ap_uint<64>& lastKeep)
+// Полный цикл «пришли данные»: уведомление + read request + тело
+static void deliver(ap_uint<16> sessionID, ap_uint<16> length, int numWords,
+                    ap_uint<32> seed)
 {
-     if (m_axis_tcp_tx_meta.empty()) return false;
-
-     pkt32 meta = m_axis_tcp_tx_meta.read();
-     sessionID = meta.data(15, 0);
-     length    = meta.data(31, 16);
-
-     // Стек подтверждает готовность, после чего ядро шлёт данные
-     push_tx_status_ok(sessionID, length);
-
-     wordsSeen = 0;
-     lastKeep = 0;
-     bool sawLast = false;
-     for (int guard = 0; guard < 2000 && !sawLast; guard++)
-     {
-          kernel_tick();
-          while (!m_axis_tcp_tx_data.empty())
-          {
-               pkt512 w = m_axis_tcp_tx_data.read();
-               wordsSeen++;
-               lastKeep = w.keep;
-               if (w.last) { sawLast = true; break; }
-          }
-     }
-     return sawLast;
+     push_notification(sessionID, length);
+     run(5);
+     if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
+     push_rx_payload(sessionID, numWords, seed);
 }
 
-// Ждём появления tx_meta в течение limit тактов
-static bool wait_tx_meta(int limit)
-{
-     for (int i = 0; i < limit; i++)
-     {
-          if (!m_axis_tcp_tx_meta.empty()) return true;
-          kernel_tick();
-     }
-     return false;
-}
-
-// Подсчёт единиц в keep
 static int count_keep(ap_uint<64> keep)
 {
      int n = 0;
@@ -262,9 +368,8 @@ int main()
 {
      std::cout << "=== hls_gateway_krnl C-simulation ===" << std::endl;
 
-     ap_uint<16> sid, len;
-     int words;
-     ap_uint<64> keep;
+     TxCapture tx;
+     stack_reset_cfg();
 
      // -----------------------------------------------------------
      std::cout << "\n[1] Инициализация: listen-порт и upstream" << std::endl;
@@ -288,7 +393,6 @@ int main()
           check(oc.data(47, 32) == SERVER_PORT, "порт сервера верный");
      }
 
-     // Стек подтверждает: порт открыт, соединение установлено
      pkt8 ps; ps.data = 1;
      s_axis_tcp_port_status.write(ps);
      push_open_status(SESSION_SERVER, true);
@@ -310,50 +414,38 @@ int main()
      }
 
      push_rx_payload(SESSION_CLIENT, 2, 0xAA00);
-     run(20);
 
-     check(wait_tx_meta(50), "появилась tx-транзакция");
-     if (pop_tx(sid, len, words, keep))
+     if (pop_captured(tx))
      {
-          check(sid == SESSION_SERVER, "данные ушли в сессию СЕРВЕРА");
-          check(len == 128, "длина сохранена");
-          check(words == 2, "передано 2 слова");
+          check(tx.sessionID == SESSION_SERVER, "данные ушли в сессию СЕРВЕРА");
+          check(tx.length == 128, "длина сохранена");
+          check(tx.words == 2, "передано 2 слова");
      }
      else check(false, "uplink-транзакция не завершилась");
 
      // -----------------------------------------------------------
      std::cout << "\n[3] Downlink: сервер -> клиент" << std::endl;
 
-     push_notification(SESSION_SERVER, 64);
-     run(5);
-     if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
-     push_rx_payload(SESSION_SERVER, 1, 0xBB00);
-     run(20);
+     deliver(SESSION_SERVER, 64, 1, 0xBB00);
 
-     check(wait_tx_meta(50), "появилась downlink-транзакция");
-     if (pop_tx(sid, len, words, keep))
+     if (pop_captured(tx))
      {
-          check(sid == SESSION_CLIENT, "данные ушли в сессию КЛИЕНТА");
-          check(len == 64, "длина сохранена");
-          check(words == 1, "передано 1 слово");
+          check(tx.sessionID == SESSION_CLIENT, "данные ушли в сессию КЛИЕНТА");
+          check(tx.length == 64, "длина сохранена");
+          check(tx.words == 1, "передано 1 слово");
      }
      else check(false, "downlink-транзакция не завершилась");
 
      // -----------------------------------------------------------
      std::cout << "\n[4] Неполное слово: length = 100 байт" << std::endl;
 
-     push_notification(SESSION_CLIENT, 100);   // 1 полное + 36 байт
-     run(5);
-     if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
-     push_rx_payload(SESSION_CLIENT, 2, 0xCC00);
-     run(20);
+     deliver(SESSION_CLIENT, 100, 2, 0xCC00);   // 1 полное + 36 байт
 
-     check(wait_tx_meta(50), "появилась транзакция с неполным словом");
-     if (pop_tx(sid, len, words, keep))
+     if (pop_captured(tx))
      {
-          check(len == 100, "длина 100 сохранена");
-          check(words == 2, "передано 2 слова");
-          check(count_keep(keep) == 36, "keep последнего слова = 36 байт");
+          check(tx.length == 100, "длина 100 сохранена");
+          check(tx.words == 2, "передано 2 слова");
+          check(count_keep(tx.lastKeep) == 36, "keep последнего слова = 36 байт");
      }
      else check(false, "транзакция с неполным словом не завершилась");
 
@@ -363,48 +455,30 @@ int main()
      push_closed(SESSION_CLIENT);
      run(20);
 
-     // Новый клиент шлёт данные — ядро должно подхватить новый sessionID
-     push_notification(SESSION_CLIENT2, 64);
-     run(5);
-     if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
-     push_rx_payload(SESSION_CLIENT2, 1, 0xDD00);
-     run(20);
-
-     check(wait_tx_meta(50), "uplink нового клиента прошёл");
-     if (pop_tx(sid, len, words, keep))
-          check(sid == SESSION_SERVER, "данные нового клиента ушли на сервер");
+     deliver(SESSION_CLIENT2, 64, 1, 0xDD00);
+     if (pop_captured(tx))
+          check(tx.sessionID == SESSION_SERVER, "данные нового клиента ушли на сервер");
      else check(false, "uplink нового клиента не завершился");
 
-     // Ответ сервера должен уйти уже НОВОМУ клиенту
-     push_notification(SESSION_SERVER, 64);
-     run(5);
-     if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
-     push_rx_payload(SESSION_SERVER, 1, 0xEE00);
-     run(20);
-
-     check(wait_tx_meta(50), "downlink после реконнекта прошёл");
-     if (pop_tx(sid, len, words, keep))
-          check(sid == SESSION_CLIENT2, "ответ ушёл НОВОМУ клиенту");
+     deliver(SESSION_SERVER, 64, 1, 0xEE00);
+     if (pop_captured(tx))
+          check(tx.sessionID == SESSION_CLIENT2, "ответ ушёл НОВОМУ клиенту");
      else check(false, "downlink после реконнекта не завершился");
 
      // -----------------------------------------------------------
      std::cout << "\n[6] Обрыв upstream и переподключение" << std::endl;
 
-     // Очищаем возможный мусор
      while (!m_axis_tcp_open_connection.empty()) m_axis_tcp_open_connection.read();
 
      push_closed(SESSION_SERVER);
      run(50);
 
-     // Ядро выдерживает паузу GW_RECONNECT_DELAY (~250e6 тактов).
-     // Для симуляции это слишком долго, поэтому проверяем факт
-     // переподключения только если задержка уменьшена.
-     // Пересоберите с -DGW_RECONNECT_DELAY=100 для этой проверки.
-#ifdef GW_FAST_RECONNECT
+     // Пауза реконнекта задана аргументом RECONNECT_DELAY, поэтому
+     // проверка идёт всегда — без #ifdef и без пересборки.
      bool reconnected = false;
      for (int i = 0; i < 5000 && !reconnected; i++)
      {
-          kernel_tick();
+          tick();
           if (!m_axis_tcp_open_connection.empty()) reconnected = true;
      }
      check(reconnected, "ядро переоткрыло соединение с сервером");
@@ -415,21 +489,144 @@ int main()
           push_open_status(SESSION_SERVER, true);
           run(20);
 
-          // После восстановления релей должен снова работать
-          push_notification(SESSION_CLIENT2, 64);
-          run(5);
-          if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
-          push_rx_payload(SESSION_CLIENT2, 1, 0xFF00);
+          deliver(SESSION_CLIENT2, 64, 1, 0xFF00);
+          if (pop_captured(tx))
+               check(tx.sessionID == SESSION_SERVER, "данные снова идут на сервер");
+          else check(false, "релей не заработал после переподключения");
+     }
+
+     // -----------------------------------------------------------
+     std::cout << "\n[7] tx_status error==2: нет места, повтор tx_meta" << std::endl;
+
+     // Ошибка на СЛЕДУЮЩЕЙ транзакции
+     stk_forceErrorOn   = stk_txCount + 1;
+     stk_forceErrorCode = 2;
+
+     deliver(SESSION_CLIENT2, 64, 1, 0x1100);
+
+     // Ядро должно повторить tx_meta; второй раз стек ответит успехом
+     if (pop_captured(tx, 800))
+     {
+          check(tx.sessionID == SESSION_SERVER, "после error==2 данные ушли на сервер");
+          check(tx.length == 64, "длина не потерялась при повторе");
+          check(tx.words == 1, "данные переданы ровно один раз");
+     }
+     else check(false, "ядро не повторило tx_meta после error==2");
+
+     stack_reset_cfg();
+
+     // -----------------------------------------------------------
+     std::cout << "\n[8] tx_status error==1: обрыв, порция сбрасывается" << std::endl;
+
+     stk_forceErrorOn   = stk_txCount + 1;
+     stk_forceErrorCode = 1;
+
+     deliver(SESSION_CLIENT2, 128, 2, 0x2200);
+     run(200);
+
+     check(captured.empty(), "порция при error==1 не отправлена");
+
+     stack_reset_cfg();
+
+     // Сессия сервера помечена невалидной -> ядро переподключается
+     bool reopened = false;
+     for (int i = 0; i < 5000 && !reopened; i++)
+     {
+          tick();
+          if (!m_axis_tcp_open_connection.empty()) reopened = true;
+     }
+     check(reopened, "после error==1 ядро переоткрыло upstream");
+     if (reopened)
+     {
+          m_axis_tcp_open_connection.read();
+          push_open_status(SESSION_SERVER, true);
           run(20);
 
-          check(wait_tx_meta(100), "релей работает после переподключения");
-          if (pop_tx(sid, len, words, keep))
-               check(sid == SESSION_SERVER, "данные снова идут на сервер");
+          // Релей снова жив, и очередь не рассинхронизирована
+          deliver(SESSION_CLIENT2, 64, 1, 0x3300);
+          if (pop_captured(tx, 800))
+          {
+               check(tx.sessionID == SESSION_SERVER, "релей жив после error==1");
+               check(tx.length == 64, "границы пакетов не сдвинулись");
+          }
+          else check(false, "релей не восстановился после error==1");
      }
-#else
-     std::cout << "  [SKIP] проверка переподключения — пересоберите с "
-               << "-DGW_FAST_RECONNECT -DGW_RECONNECT_DELAY=100" << std::endl;
-#endif
+
+     // -----------------------------------------------------------
+     std::cout << "\n[9] Оба направления одновременно" << std::endl;
+
+     // Подаём uplink и downlink подряд, не давая слить первый
+     deliver(SESSION_CLIENT2, 64, 1, 0x4400);
+     deliver(SESSION_SERVER,  64, 1, 0x5500);
+
+     bool got2 = wait_captured(2, 2000);
+     check(got2, "обе транзакции завершились");
+     if (got2)
+     {
+          TxCapture a = captured.front(); captured.pop_front();
+          TxCapture b = captured.front(); captured.pop_front();
+
+          // Порядок не фиксируем (round-robin), но адресаты должны
+          // быть разными: одна порция серверу, одна клиенту.
+          bool oneEach = (a.sessionID != b.sessionID)
+                         && (a.sessionID == SESSION_SERVER || a.sessionID == SESSION_CLIENT2)
+                         && (b.sessionID == SESSION_SERVER || b.sessionID == SESSION_CLIENT2);
+          check(oneEach, "каждое направление обслужено ровно один раз");
+          check(a.words == 1 && b.words == 1,
+                "транзакции не перемешались (по 1 слову каждая)");
+     }
+
+     // -----------------------------------------------------------
+     std::cout << "\n[10] Backpressure: серия пакетов без слива" << std::endl;
+
+     // Стек перестаёт принимать данные -> FIFO заполняются,
+     // ядро обязано применить backpressure, а не потерять данные.
+     stk_stallData = true;
+
+     const int BURST = 24;
+     for (int i = 0; i < BURST; i++)
+          deliver(SESSION_CLIENT2, 64, 1, 0x6000 + i);
+
+     run(500);   // ядро упирается в остановленный стек
+
+     stk_stallData = false;
+
+     bool allDrained = wait_captured(BURST, 40000);
+     check(allDrained, "все пакеты дошли после снятия backpressure");
+     if (allDrained)
+     {
+          bool lengthsOk = true;
+          int  n = 0;
+          while (!captured.empty())
+          {
+               TxCapture c = captured.front(); captured.pop_front();
+               if (c.length != 64 || c.words != 1) lengthsOk = false;
+               n++;
+          }
+          check(lengthsOk, "ни одна порция не потеряна и не склеена");
+          check(n == BURST, "число транзакций совпало с числом пакетов");
+     }
+
+     // -----------------------------------------------------------
+     std::cout << "\n[11] Лишняя клиентская сессия закрывается" << std::endl;
+
+     closedByGw.clear();
+
+     // Второй клиент шлёт данные, хотя SESSION_CLIENT2 ещё жив
+     deliver(SESSION_STRAY, 64, 1, 0x7700);
+     run(300);
+
+     bool closedStray = false;
+     for (size_t i = 0; i < closedByGw.size(); i++)
+          if (closedByGw[i] == SESSION_STRAY) closedStray = true;
+     check(closedStray, "лишняя сессия закрыта через close_connection");
+
+     // Основной клиент не пострадал
+     deliver(SESSION_SERVER, 64, 1, 0x8800);
+     if (pop_captured(tx, 800))
+          check(tx.sessionID == SESSION_CLIENT2,
+                "основной клиент сохранён, ответ ушёл ему");
+     else check(false, "основной клиент потерян после лишней сессии");
 
      // -----------------------------------------------------------
      std::cout << "\n=== Итог: " << (failures == 0 ? "ВСЕ ТЕСТЫ ПРОШЛИ"
