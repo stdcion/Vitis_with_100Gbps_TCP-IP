@@ -164,6 +164,7 @@ static bool stk_stallData     = false;  // не принимать tx_data
 
 // Внутреннее состояние стека
 static int         stk_txCount     = 0;   // сколько meta принято всего
+static int         stk_strayWords  = 0;   // слова вне разрешённой транзакции
 static bool        stk_haveMeta    = false;
 static ap_uint<16> stk_metaSession = 0;
 static ap_uint<16> stk_metaLength  = 0;
@@ -241,6 +242,15 @@ static void stack_tick()
                captured.push_back(stk_cur);
                stk_awaitData = false;
           }
+     }
+     // Слова, пришедшие когда транзакция НЕ разрешена (после error==1
+     // или error==2, где данные идти не должны) — это нарушение
+     // протокола. Раньше они просто оставались в потоке и тест их не
+     // видел, из-за чего мутация DISCARD проходила незамеченной.
+     else if (!stk_awaitData && !stk_stallData && !m_axis_tcp_tx_data.empty())
+     {
+          m_axis_tcp_tx_data.read();
+          stk_strayWords++;
      }
 
      // 4. Забираем close_connection
@@ -521,10 +531,14 @@ int main()
      stk_forceErrorOn   = stk_txCount + 1;
      stk_forceErrorCode = 1;
 
+     stk_strayWords = 0;
      deliver(SESSION_CLIENT2, 128, 2, 0x2200);
      run(200);
 
      check(captured.empty(), "порция при error==1 не отправлена");
+     // Ключевая проверка: слова должны быть ВЫЧИТАНЫ из внутренних
+     // FIFO и выброшены, а НЕ отправлены в tx_data.
+     check(stk_strayWords == 0, "ни одно слово не ушло в tx_data после error==1");
 
      stack_reset_cfg();
 

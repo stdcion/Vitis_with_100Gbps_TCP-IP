@@ -305,13 +305,35 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
      // её слова надо вычитать из rx_data и выбрасывать, иначе поток
      // встанет, а границы следующих пакетов сдвинутся.
      static bool currentIsStray = false;
+     // Буфер на один такт между чтением serverSessionToRoute и
+     // применением значения — разрывает критический путь (см. ниже)
+     static ap_uint<16> pendingServerSession = 0;
+     static bool pendingServerSessionValid = false;
+     // Отложенная на такт запись лишней сессии в straySessionFifo
+     static ap_uint<16> strayToClose = 0;
+     static bool strayPending = false;
 
      // Новый sessionID upstream-соединения (приходит при каждом
-     // успешном подключении, в том числе после переподключения)
-     if (!serverSessionToRoute.empty())
+     // успешном подключении, в том числе после переподключения).
+     //
+     // ВАЖНО ДЛЯ ТАЙМИНГА: результат этого чтения НЕ используется в
+     // этом же такте. Раньше прочитанный serverSession сразу шёл в
+     // цепочку сравнений и дальше в запись straySessionFifo, и весь
+     // путь (1.336 + сравнения + 1.344 нс) не влезал в бюджет 2.920:
+     //   [HLS 200-871] Estimated clock period (4.483 ns)
+     // Поэтому обновление откладывается на следующий такт через
+     // pendingServerSession: чтение FIFO и использование значения
+     // разнесены по разным итерациям конвейера.
+     if (pendingServerSessionValid)
      {
-          serverSession = serverSessionToRoute.read();
+          serverSession = pendingServerSession;
           serverSessionValid = true;
+          pendingServerSessionValid = false;
+     }
+     else if (!serverSessionToRoute.empty())
+     {
+          pendingServerSession = serverSessionToRoute.read();
+          pendingServerSessionValid = true;
      }
 
      // Уведомления о разрывах обрабатываем только между пакетами,
@@ -341,12 +363,19 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
           }
      }
 
+     // Отложенная запись лишней сессии (решение принято такт назад)
+     if (strayPending && !straySessionFifo.full())
+     {
+          straySessionFifo.write(strayToClose);
+          strayPending = false;
+     }
+
      switch (routeState)
      {
      case IDLE:
           if (!rxSessionFifo.empty() && !rxLengthFifo.empty() && !s_axis_tcp_rx_meta.empty()
               && !toClientLength.full() && !toServerLength.full()
-              && !clientSessionFifo.full() && !straySessionFifo.full())
+              && !clientSessionFifo.full() && !strayPending)
           {
                s_axis_tcp_rx_meta.read();
                ap_uint<16> currentSession = rxSessionFifo.read();
@@ -395,7 +424,13 @@ void gw_route(hls::stream<pkt16>& s_axis_tcp_rx_meta,
                          // сессию закрываем, а её данные отбрасываем
                          // (длина в toServerLength не пишется, слова
                          // будут вычитаны ниже в FORWARD и выброшены).
-                         straySessionFifo.write(currentSession);
+                         //
+                         // Саму запись в straySessionFifo делаем не
+                         // здесь, а следующим тактом: иначе она
+                         // оказывается в конце длинной цепочки
+                         // сравнений сессий и ломает тайминг.
+                         strayToClose = currentSession;
+                         strayPending = true;
                          currentIsStray = true;
                     }
                }
@@ -657,56 +692,56 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
           }
           break;
 
+     // WRITE_DATA и DISCARD объединены: оба вычитывают слово из той же
+     // очереди, отличается только судьба слова (отправить или выбросить).
+     //
+     // РАЗДЕЛЯТЬ ИХ НЕЛЬЗЯ. Когда read() по toServerData/toClientData
+     // стоял в двух разных состояниях, HLS видел два обращения к одному
+     // порту и не мог уложить их в один такт:
+     //   [HLS 200-880] carried dependence between fifo read on port
+     //   'toServerData' (DISCARD) and fifo request (WRITE_DATA) => II=2
+     // А II=2 в передатчике — это половина пропускной способности.
+     // Теперь на каждый порт ровно одно место чтения.
      case WRITE_DATA:
-     {
-          bool dataReady = activeIsClient ? !toClientData.empty()
-                                          : !toServerData.empty();
-          if (dataReady && !m_axis_tcp_tx_data.full())
-          {
-               ap_uint<512> payload = activeIsClient ? toClientData.read()
-                                                     : toServerData.read();
-
-               pkt512 tx_word;
-               tx_word.data = payload;
-
-               // В последнем слове валидны только оставшиеся байты
-               ap_uint<7> validBytes = (bytesRemaining >= 64) ? (ap_uint<7>)64
-                                                              : (ap_uint<7>)bytesRemaining;
-               for (int i = 0; i < 64; i++)
-               {
-               #pragma HLS UNROLL
-                    tx_word.keep(i, i) = (i < validBytes) ? 1 : 0;
-               }
-               bytesRemaining = (bytesRemaining >= 64) ? (ap_uint<16>)(bytesRemaining - 64)
-                                                       : (ap_uint<16>)0;
-
-               wordsSent++;
-               tx_word.last = (wordsSent == wordsToSend);
-               m_axis_tcp_tx_data.write(tx_word);
-
-               if (tx_word.last)
-               {
-                    // транзакция завершена — уступаем очередь второму направлению
-                    serveClient = !serveClient;
-                    txState = SELECT;
-               }
-          }
-          break;
-     }
-
      case DISCARD:
      {
-          // Вычитываем данные, которые уже некому отправить
+          bool discarding = (txState == DISCARD);
+
           bool dataReady = activeIsClient ? !toClientData.empty()
                                           : !toServerData.empty();
-          if (dataReady)
+          // При отбрасывании выходной порт не нужен и не проверяется
+          bool sinkReady = discarding || !m_axis_tcp_tx_data.full();
+
+          if (dataReady && sinkReady)
           {
-               if (activeIsClient) toClientData.read();
-               else                toServerData.read();
+               ap_uint<512> payload = activeIsClient ? toClientData.read()
+                                                    : toServerData.read();
 
                wordsSent++;
+
+               if (!discarding)
+               {
+                    pkt512 tx_word;
+                    tx_word.data = payload;
+
+                    // В последнем слове валидны только оставшиеся байты
+                    ap_uint<7> validBytes = (bytesRemaining >= 64) ? (ap_uint<7>)64
+                                                                   : (ap_uint<7>)bytesRemaining;
+                    for (int i = 0; i < 64; i++)
+                    {
+                    #pragma HLS UNROLL
+                         tx_word.keep(i, i) = (i < validBytes) ? 1 : 0;
+                    }
+                    bytesRemaining = (bytesRemaining >= 64) ? (ap_uint<16>)(bytesRemaining - 64)
+                                                           : (ap_uint<16>)0;
+
+                    tx_word.last = (wordsSent == wordsToSend);
+                    m_axis_tcp_tx_data.write(tx_word);
+               }
+
                if (wordsSent >= wordsToSend)
                {
+                    // транзакция завершена — уступаем очередь второму направлению
                     serveClient = !serveClient;
                     txState = SELECT;
                }
