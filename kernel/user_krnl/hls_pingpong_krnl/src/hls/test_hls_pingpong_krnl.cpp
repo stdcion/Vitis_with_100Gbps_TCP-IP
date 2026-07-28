@@ -33,7 +33,8 @@ tx_meta и всегда успехом, то ветки error==1/error==2 ост
   7. tx_status error==1 — сообщение отбрасывается, ядро живо
   8. Сообщение больше PP_MAX_WORDS (усечение)
   9. Сообщение, разбитое на два уведомления (сегментация TCP)
- 10. Backpressure: стек не принимает tx_data
+ 10. Стек отдал меньше слов, чем обещал в уведомлении
+ 11. Backpressure: стек не принимает tx_data
 
 Сборка (на машине с Vitis HLS):
     vitis_hls -f run_csim.tcl
@@ -137,6 +138,11 @@ static bool        stk_awaitData  = false;
 static int         stk_strayWords = 0;
 static TxCapture   stk_cur;
 
+// Забранные стеком read request. Тесты, которым нужно посмотреть на
+// сам запрос, выключают drainReadPkg и читают поток напрямую.
+static std::deque<pkt32> readReqs;
+static bool drainReadPkg = true;
+
 static void stack_reset_cfg()
 {
      stk_statusDelay    = 0;
@@ -210,6 +216,19 @@ static void stack_tick()
 
      if (!m_axis_tcp_close_connection.empty()) m_axis_tcp_close_connection.read();
      if (!m_axis_tcp_open_connection.empty())  m_axis_tcp_open_connection.read();
+
+     // Read request: реальный стек всегда его забирает. Складываем в
+     // очередь, чтобы тесты могли проверить содержимое, но НЕ оставляем
+     // в hls::stream — иначе csim заканчивается предупреждением
+     //   [HLS SIM] hls::stream '...' contains leftover data, which may
+     //   result in RTL simulation hanging
+     // и cosim на этом действительно встанет.
+     if (drainReadPkg && !m_axis_tcp_read_pkg.empty())
+     {
+          pkt32 rr = m_axis_tcp_read_pkg.read();
+          readReqs.push_back(rr);
+          if (readReqs.size() > 64) readReqs.pop_front();  // не растём без предела
+     }
 }
 
 static void tick()
@@ -283,8 +302,7 @@ static void deliver(ap_uint<16> sessionID, ap_uint<16> length, int numWords,
                     ap_uint<32> seed)
 {
      push_notification(sessionID, length);
-     run(5);
-     if (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
+     run(5);   // stack_tick() сам забирает read request (см. drainReadPkg)
      push_rx_payload(sessionID, numWords, seed);
 }
 
@@ -321,13 +339,14 @@ int main()
      // -----------------------------------------------------------
      std::cout << "\n[2] Базовое эхо: 128 байт" << std::endl;
 
+     readReqs.clear();
      push_notification(SESSION_A, 128);
      run(5);
-     bool gotRead = !m_axis_tcp_read_pkg.empty();
+     bool gotRead = !readReqs.empty();
      check(gotRead, "ядро выставило read request");
      if (gotRead)
      {
-          pkt32 rr = m_axis_tcp_read_pkg.read();
+          pkt32 rr = readReqs.front(); readReqs.pop_front();
           check(rr.data(15, 0) == SESSION_A, "read request для нужной сессии");
           check(rr.data(31, 16) == 128, "запрошенная длина верна");
      }
@@ -440,18 +459,19 @@ int main()
           // запрашивать больше, чем способно сохранить. Иначе стек
           // отдаст лишние слова, которые придётся отбрасывать.
           //
-          // Сначала опустошаем очередь read request: предыдущие тесты
-          // могли оставить в ней запросы, и без этого проверка читала
-          // старый запрос (128 байт) вместо нужного.
-          while (!m_axis_tcp_read_pkg.empty()) m_axis_tcp_read_pkg.read();
+          // Сначала опустошаем накопленные запросы: предыдущие тесты
+          // оставляли в очереди свои, и без этого проверка читала
+          // старый запрос (128 байт) вместо нужного — из-за чего
+          // мутация «снять clamp» проходила незамеченной.
+          readReqs.clear();
 
           push_notification(SESSION_B, bigLen);
           run(5);
-          bool haveRR = !m_axis_tcp_read_pkg.empty();
+          bool haveRR = !readReqs.empty();
           check(haveRR, "read request выставлен для большого сообщения");
           if (haveRR)
           {
-               pkt32 rr = m_axis_tcp_read_pkg.read();
+               pkt32 rr = readReqs.front(); readReqs.pop_front();
                ap_uint<16> asked = rr.data(31, 16);
                check(asked <= (ap_uint<16>)(PP_MAX_WORDS_TB * 64),
                      "ядро запросило не больше размера буфера");
@@ -509,7 +529,37 @@ int main()
      }
 
      // -----------------------------------------------------------
-     std::cout << "\n[10] Backpressure: стек не принимает tx_data" << std::endl;
+     std::cout << "\n[10] Стек отдал МЕНЬШЕ слов, чем обещал" << std::endl;
+
+     {
+          // Уведомление обещает 128 байт (2 слова), а тело приходит
+          // одним словом с last. Ядро обязано отразить то, что реально
+          // приняло (64 байта), а не заявленные 128: иначе tx_meta
+          // просит у стека слова, которых ядро не отдаст, и передача
+          // повиснет.
+          readReqs.clear();
+          push_notification(SESSION_B, 128);
+          run(5);
+          push_rx_payload(SESSION_B, 1, 0x9900);   // 1 слово вместо 2
+
+          if (pop_captured(tx, 4000))
+          {
+               check(tx.words == 1, "отражено ровно одно принятое слово");
+               check(tx.length == 64,
+                     "заявлена фактическая длина (64), а не обещанная (128)");
+          }
+          else check(false, "ядро не отразило усечённое сообщение");
+     }
+
+     // Ядро должно остаться работоспособным
+     deliver(SESSION_B, 64, 1, 0x9A00);
+     if (pop_captured(tx, 4000))
+          check(tx.firstWordLo.size() == 1 && tx.firstWordLo[0] == 0x9A00,
+                "ядро живо после усечённого сообщения");
+     else check(false, "ядро зависло после усечённого сообщения");
+
+     // -----------------------------------------------------------
+     std::cout << "\n[11] Backpressure: стек не принимает tx_data" << std::endl;
 
      stk_stallData = true;
      const int BURST = 12;

@@ -93,7 +93,7 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
 #pragma HLS BIND_STORAGE variable=payload type=RAM_2P impl=BRAM
 
      static ap_uint<16> sessionID = 0;
-     static ap_uint<16> length = 0;       // обещано уведомлением
+     static ap_uint<16> msgLength = 0;       // обещано уведомлением
      static ap_uint<16> txLength = 0;     // фактически отражаем
      static ap_uint<16> wordCount = 0;    // сохранено в payload[]
      static ap_uint<16> wordIdx = 0;
@@ -125,11 +125,11 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
                     // Остаток стек отдаст следующим уведомлением —
                     // read request только подтверждает то, что заберём.
                     const ap_uint<16> maxBytes = PP_MAX_WORDS * 64;
-                    length = (notifLength > maxBytes) ? maxBytes : notifLength;
+                    msgLength = (notifLength > maxBytes) ? maxBytes : notifLength;
 
                     pkt32 readRequest_pkt;
                     readRequest_pkt.data(15, 0) = sessionID;
-                    readRequest_pkt.data(31, 16) = length;
+                    readRequest_pkt.data(31, 16) = msgLength;
                     m_axis_tcp_read_pkg.write(readRequest_pkt);
 
                     wordCount = 0;
@@ -169,13 +169,13 @@ void pp_echo(hls::stream<pkt128>& s_axis_tcp_notification,
      {
           // Отражаем ровно то, что реально приняли и сохранили.
           //
-          // length пришла из уведомления, wordCount — факт приёма.
+          // msgLength пришла из уведомления, wordCount — факт приёма.
           // Если стек отдал меньше слов, чем обещал (или больше, чем
           // вместил буфер), доверять надо факту: иначе tx_meta заявит
           // длину, под которую нет данных, и стек будет ждать слова,
           // которых ядро не отдаст.
           ap_uint<16> wordBytes = (ap_uint<16>)(wordCount * 64);
-          txLength = (length < wordBytes) ? length : wordBytes;
+          txLength = (msgLength < wordBytes) ? msgLength : wordBytes;
 
           pkt32 tx_meta_pkt;
           tx_meta_pkt.data(15, 0) = sessionID;
