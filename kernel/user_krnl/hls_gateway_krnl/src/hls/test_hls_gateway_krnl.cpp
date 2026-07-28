@@ -66,6 +66,33 @@ typedef ap_axiu<32, 0, 0, 0>  pkt32;
 typedef ap_axiu<16, 0, 0, 0>  pkt16;
 typedef ap_axiu<8, 0, 0, 0>   pkt8;
 
+// GW_COSIM_TOP — сборка против обёртки без скалярных портов.
+// Cosim не поддерживает ap_ctrl_none-дизайн со скалярами:
+//   [COSIM 212-345] Cosim only supports ... (3) designs with array
+//   streaming or hls_stream or AXI4 stream ports
+// Значения параметров в обёртке зашиты и должны совпадать с
+// константами ниже (LISTEN_PORT / SERVER_IP / SERVER_PORT /
+// RECONNECT_DELAY).
+#ifdef GW_COSIM_TOP
+extern "C" void hls_gateway_krnl_cosim(
+     hls::stream<pkt512>& s_axis_udp_rx,
+     hls::stream<pkt512>& m_axis_udp_tx,
+     hls::stream<pkt256>& s_axis_udp_rx_meta,
+     hls::stream<pkt256>& m_axis_udp_tx_meta,
+     hls::stream<pkt16>& m_axis_tcp_listen_port,
+     hls::stream<pkt8>& s_axis_tcp_port_status,
+     hls::stream<pkt64>& m_axis_tcp_open_connection,
+     hls::stream<pkt128>& s_axis_tcp_open_status,
+     hls::stream<pkt16>& m_axis_tcp_close_connection,
+     hls::stream<pkt128>& s_axis_tcp_notification,
+     hls::stream<pkt32>& m_axis_tcp_read_pkg,
+     hls::stream<pkt16>& s_axis_tcp_rx_meta,
+     hls::stream<pkt512>& s_axis_tcp_rx_data,
+     hls::stream<pkt32>& m_axis_tcp_tx_meta,
+     hls::stream<pkt512>& m_axis_tcp_tx_data,
+     hls::stream<pkt64>& s_axis_tcp_tx_status);
+#endif
+
 // Прототип тестируемого ядра
 extern "C" void hls_gateway_krnl(
      hls::stream<pkt512>& s_axis_udp_rx,
@@ -99,6 +126,17 @@ static const int SERVER_PORT   = 8080;
 // Пауза реконнекта — теперь обычный аргумент, а не -D.
 // Малое значение, чтобы симуляция не ждала 250e6 тактов.
 static const int RECONNECT_DELAY = 100;
+
+#ifdef GW_COSIM_TOP
+// Обёртка hls_gateway_krnl_cosim зашивает эти же значения внутри себя
+// (скалярных портов у неё нет). Если константы разойдутся, cosim будет
+// падать непонятным образом — поэтому проверяем на этапе компиляции.
+// Значения дублируются намеренно: заголовка, общего с ядром, здесь нет.
+static_assert(LISTEN_PORT      == 5001,       "разошлось с GW_COSIM_LISTEN_PORT");
+static_assert(SERVER_IP        == 0xC0A80114, "разошлось с GW_COSIM_SERVER_IP");
+static_assert(SERVER_PORT      == 8080,       "разошлось с GW_COSIM_SERVER_PORT");
+static_assert(RECONNECT_DELAY  == 100,        "разошлось с GW_COSIM_RECONNECT_DELAY");
+#endif
 
 static const ap_uint<16> SESSION_SERVER  = 7;   // выдаём при open
 static const ap_uint<16> SESSION_CLIENT  = 3;   // первый клиент
@@ -264,6 +302,18 @@ static void stack_tick()
 // Один такт: ядро + стек
 static void tick()
 {
+#ifdef GW_COSIM_TOP
+     // Обёртка без скалярных портов — параметры зашиты внутри неё
+     hls_gateway_krnl_cosim(s_axis_udp_rx, m_axis_udp_tx,
+                            s_axis_udp_rx_meta, m_axis_udp_tx_meta,
+                            m_axis_tcp_listen_port, s_axis_tcp_port_status,
+                            m_axis_tcp_open_connection, s_axis_tcp_open_status,
+                            m_axis_tcp_close_connection,
+                            s_axis_tcp_notification, m_axis_tcp_read_pkg,
+                            s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
+                            m_axis_tcp_tx_meta, m_axis_tcp_tx_data,
+                            s_axis_tcp_tx_status);
+#else
      hls_gateway_krnl(s_axis_udp_rx, m_axis_udp_tx,
                       s_axis_udp_rx_meta, m_axis_udp_tx_meta,
                       m_axis_tcp_listen_port, s_axis_tcp_port_status,
@@ -275,6 +325,7 @@ static void tick()
                       s_axis_tcp_tx_status,
                       LISTEN_PORT, SERVER_IP, SERVER_PORT,
                       RECONNECT_DELAY);
+#endif
      stack_tick();
 }
 

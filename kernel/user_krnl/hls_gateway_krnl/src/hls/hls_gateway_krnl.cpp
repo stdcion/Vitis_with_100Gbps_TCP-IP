@@ -824,61 +824,45 @@ void gw_close_stray(hls::stream<ap_uint<16> >& straySessionFifo,
      }
 }
 
-extern "C" {
-void hls_gateway_krnl(
-               // UDP (не используется, но интерфейс обязателен)
-               hls::stream<pkt512>& s_axis_udp_rx,
-               hls::stream<pkt512>& m_axis_udp_tx,
-               hls::stream<pkt256>& s_axis_udp_rx_meta,
-               hls::stream<pkt256>& m_axis_udp_tx_meta,
-
-               // TCP control
-               hls::stream<pkt16>& m_axis_tcp_listen_port,
-               hls::stream<pkt8>& s_axis_tcp_port_status,
-               hls::stream<pkt64>& m_axis_tcp_open_connection,
-               hls::stream<pkt128>& s_axis_tcp_open_status,
-               hls::stream<pkt16>& m_axis_tcp_close_connection,
-
-               // TCP rx
-               hls::stream<pkt128>& s_axis_tcp_notification,
-               hls::stream<pkt32>& m_axis_tcp_read_pkg,
-               hls::stream<pkt16>& s_axis_tcp_rx_meta,
-               hls::stream<pkt512>& s_axis_tcp_rx_data,
-
-               // TCP tx
-               hls::stream<pkt32>& m_axis_tcp_tx_meta,
-               hls::stream<pkt512>& m_axis_tcp_tx_data,
-               hls::stream<pkt64>& s_axis_tcp_tx_status,
-
-               // Скалярные аргументы (задаются с хоста)
-               int listenPort,         // порт, который слушаем для клиента
-               int serverIpAddress,    // IP upstream-сервера
-               int serverPort,         // порт upstream-сервера
-               int reconnectDelay      // пауза реконнекта, в тактах
-                      ) {
-
-#pragma HLS INTERFACE axis port = s_axis_udp_rx
-#pragma HLS INTERFACE axis port = m_axis_udp_tx
-#pragma HLS INTERFACE axis port = s_axis_udp_rx_meta
-#pragma HLS INTERFACE axis port = m_axis_udp_tx_meta
-#pragma HLS INTERFACE axis port = m_axis_tcp_listen_port
-#pragma HLS INTERFACE axis port = s_axis_tcp_port_status
-#pragma HLS INTERFACE axis port = m_axis_tcp_open_connection
-#pragma HLS INTERFACE axis port = s_axis_tcp_open_status
-#pragma HLS INTERFACE axis port = m_axis_tcp_close_connection
-#pragma HLS INTERFACE axis port = s_axis_tcp_notification
-#pragma HLS INTERFACE axis port = m_axis_tcp_read_pkg
-#pragma HLS INTERFACE axis port = s_axis_tcp_rx_meta
-#pragma HLS INTERFACE axis port = s_axis_tcp_rx_data
-#pragma HLS INTERFACE axis port = m_axis_tcp_tx_meta
-#pragma HLS INTERFACE axis port = m_axis_tcp_tx_data
-#pragma HLS INTERFACE axis port = s_axis_tcp_tx_status
-#pragma HLS INTERFACE s_axilite port=listenPort bundle = control
-#pragma HLS INTERFACE s_axilite port=serverIpAddress bundle = control
-#pragma HLS INTERFACE s_axilite port=serverPort bundle = control
-#pragma HLS INTERFACE s_axilite port=reconnectDelay bundle = control
-#pragma HLS INTERFACE ap_ctrl_none port = return
-
+/*
+ * Тело релея: все стадии и внутренние FIFO.
+ *
+ * Вынесено из top-функции, чтобы его могли использовать ДВА входа:
+ *   - hls_gateway_krnl      — то, что идёт в железо (скаляры по AXI-lite);
+ *   - hls_gateway_krnl_cosim — обёртка для co-simulation, где скаляры
+ *     зашиты константами.
+ *
+ * Причина раздвоения: cosim не поддерживает ap_ctrl_none-дизайн со
+ * скалярными портами без valid/ready —
+ *   [COSIM] found non-self-synchronizing top I/O listenPort
+ *   [COSIM 212-345] Cosim only supports ... (3) designs with array
+ *   streaming or hls_stream or AXI4 stream ports
+ * Убрав скаляры, дизайн попадает под пункт (3) и cosim становится
+ * возможен. Внутренняя логика и глубины FIFO при этом ровно те же,
+ * а именно их и нужно проверить на дедлок (UG1448, Data FIFO Sizing).
+ */
+static void gw_core(int listenPort,
+                    int serverIpAddress,
+                    int serverPort,
+                    ap_uint<32> reconnectDelay,
+                    hls::stream<pkt512>& s_axis_udp_rx,
+                    hls::stream<pkt512>& m_axis_udp_tx,
+                    hls::stream<pkt256>& s_axis_udp_rx_meta,
+                    hls::stream<pkt256>& m_axis_udp_tx_meta,
+                    hls::stream<pkt16>& m_axis_tcp_listen_port,
+                    hls::stream<pkt8>& s_axis_tcp_port_status,
+                    hls::stream<pkt64>& m_axis_tcp_open_connection,
+                    hls::stream<pkt128>& s_axis_tcp_open_status,
+                    hls::stream<pkt16>& m_axis_tcp_close_connection,
+                    hls::stream<pkt128>& s_axis_tcp_notification,
+                    hls::stream<pkt32>& m_axis_tcp_read_pkg,
+                    hls::stream<pkt16>& s_axis_tcp_rx_meta,
+                    hls::stream<pkt512>& s_axis_tcp_rx_data,
+                    hls::stream<pkt32>& m_axis_tcp_tx_meta,
+                    hls::stream<pkt512>& m_axis_tcp_tx_data,
+                    hls::stream<pkt64>& s_axis_tcp_tx_status)
+{
+#pragma HLS INLINE
 // DATAFLOW, а не PIPELINE: стадии становятся независимыми процессами,
 // и обратная связь gw_route -> gw_connect_upstream через
 // upstreamLostFifo перестаёт быть carried dependence (было II=10).
@@ -954,8 +938,7 @@ void hls_gateway_krnl(
      gw_listen(listenPort, m_axis_tcp_listen_port, s_axis_tcp_port_status);
 
      // 2. Держим соединение с upstream-сервером (с переподключением)
-     gw_connect_upstream(serverIpAddress, serverPort,
-                         (ap_uint<32>)reconnectDelay,
+     gw_connect_upstream(serverIpAddress, serverPort, reconnectDelay,
                          m_axis_tcp_open_connection, s_axis_tcp_open_status,
                          serverSessionToRoute, serverSessionToTx,
                          upstreamLostFifo, upstreamLostFromTx);
@@ -985,5 +968,141 @@ void hls_gateway_krnl(
 
      // 6. Закрываем лишние клиентские сессии
      gw_close_stray(straySessionFifo, strayFromTx, m_axis_tcp_close_connection);
+}
+
+extern "C" {
+void hls_gateway_krnl(
+               // UDP (не используется, но интерфейс обязателен)
+               hls::stream<pkt512>& s_axis_udp_rx,
+               hls::stream<pkt512>& m_axis_udp_tx,
+               hls::stream<pkt256>& s_axis_udp_rx_meta,
+               hls::stream<pkt256>& m_axis_udp_tx_meta,
+
+               // TCP control
+               hls::stream<pkt16>& m_axis_tcp_listen_port,
+               hls::stream<pkt8>& s_axis_tcp_port_status,
+               hls::stream<pkt64>& m_axis_tcp_open_connection,
+               hls::stream<pkt128>& s_axis_tcp_open_status,
+               hls::stream<pkt16>& m_axis_tcp_close_connection,
+
+               // TCP rx
+               hls::stream<pkt128>& s_axis_tcp_notification,
+               hls::stream<pkt32>& m_axis_tcp_read_pkg,
+               hls::stream<pkt16>& s_axis_tcp_rx_meta,
+               hls::stream<pkt512>& s_axis_tcp_rx_data,
+
+               // TCP tx
+               hls::stream<pkt32>& m_axis_tcp_tx_meta,
+               hls::stream<pkt512>& m_axis_tcp_tx_data,
+               hls::stream<pkt64>& s_axis_tcp_tx_status,
+
+               // Скалярные аргументы (задаются с хоста)
+               int listenPort,         // порт, который слушаем для клиента
+               int serverIpAddress,    // IP upstream-сервера
+               int serverPort,         // порт upstream-сервера
+               int reconnectDelay      // пауза реконнекта, в тактах
+                      ) {
+
+#pragma HLS INTERFACE axis port = s_axis_udp_rx
+#pragma HLS INTERFACE axis port = m_axis_udp_tx
+#pragma HLS INTERFACE axis port = s_axis_udp_rx_meta
+#pragma HLS INTERFACE axis port = m_axis_udp_tx_meta
+#pragma HLS INTERFACE axis port = m_axis_tcp_listen_port
+#pragma HLS INTERFACE axis port = s_axis_tcp_port_status
+#pragma HLS INTERFACE axis port = m_axis_tcp_open_connection
+#pragma HLS INTERFACE axis port = s_axis_tcp_open_status
+#pragma HLS INTERFACE axis port = m_axis_tcp_close_connection
+#pragma HLS INTERFACE axis port = s_axis_tcp_notification
+#pragma HLS INTERFACE axis port = m_axis_tcp_read_pkg
+#pragma HLS INTERFACE axis port = s_axis_tcp_rx_meta
+#pragma HLS INTERFACE axis port = s_axis_tcp_rx_data
+#pragma HLS INTERFACE axis port = m_axis_tcp_tx_meta
+#pragma HLS INTERFACE axis port = m_axis_tcp_tx_data
+#pragma HLS INTERFACE axis port = s_axis_tcp_tx_status
+#pragma HLS INTERFACE s_axilite port=listenPort bundle = control
+#pragma HLS INTERFACE s_axilite port=serverIpAddress bundle = control
+#pragma HLS INTERFACE s_axilite port=serverPort bundle = control
+#pragma HLS INTERFACE s_axilite port=reconnectDelay bundle = control
+#pragma HLS INTERFACE ap_ctrl_none port = return
+
+// Вся логика — в gw_core (см. пояснение там). Здесь только интерфейс.
+     gw_core(listenPort, serverIpAddress, serverPort,
+             (ap_uint<32>)reconnectDelay,
+             s_axis_udp_rx, m_axis_udp_tx,
+             s_axis_udp_rx_meta, m_axis_udp_tx_meta,
+             m_axis_tcp_listen_port, s_axis_tcp_port_status,
+             m_axis_tcp_open_connection, s_axis_tcp_open_status,
+             m_axis_tcp_close_connection,
+             s_axis_tcp_notification, m_axis_tcp_read_pkg,
+             s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
+             m_axis_tcp_tx_meta, m_axis_tcp_tx_data,
+             s_axis_tcp_tx_status);
+}
+
+/*
+ * Точка входа ТОЛЬКО для co-simulation.
+ *
+ * Отличается от hls_gateway_krnl единственным: скалярные параметры не
+ * являются портами, а зашиты константами. Все порты — AXI4-Stream,
+ * поэтому дизайн попадает под условие COSIM 212-345 (3) и cosim
+ * запускается. Внутри — тот же gw_core, те же стадии и те же глубины
+ * FIFO, так что проверка дедлока осмысленна.
+ *
+ * В железо этот вход НЕ идёт: config_sp/сборка используют
+ * hls_gateway_krnl. Значения должны совпадать с тем, что подаёт
+ * тестбенч (см. test_hls_gateway_krnl.cpp).
+ */
+#define GW_COSIM_LISTEN_PORT      5001
+#define GW_COSIM_SERVER_IP        0xC0A80114
+#define GW_COSIM_SERVER_PORT      8080
+#define GW_COSIM_RECONNECT_DELAY  100
+
+void hls_gateway_krnl_cosim(
+               hls::stream<pkt512>& s_axis_udp_rx,
+               hls::stream<pkt512>& m_axis_udp_tx,
+               hls::stream<pkt256>& s_axis_udp_rx_meta,
+               hls::stream<pkt256>& m_axis_udp_tx_meta,
+               hls::stream<pkt16>& m_axis_tcp_listen_port,
+               hls::stream<pkt8>& s_axis_tcp_port_status,
+               hls::stream<pkt64>& m_axis_tcp_open_connection,
+               hls::stream<pkt128>& s_axis_tcp_open_status,
+               hls::stream<pkt16>& m_axis_tcp_close_connection,
+               hls::stream<pkt128>& s_axis_tcp_notification,
+               hls::stream<pkt32>& m_axis_tcp_read_pkg,
+               hls::stream<pkt16>& s_axis_tcp_rx_meta,
+               hls::stream<pkt512>& s_axis_tcp_rx_data,
+               hls::stream<pkt32>& m_axis_tcp_tx_meta,
+               hls::stream<pkt512>& m_axis_tcp_tx_data,
+               hls::stream<pkt64>& s_axis_tcp_tx_status)
+{
+#pragma HLS INTERFACE axis port = s_axis_udp_rx
+#pragma HLS INTERFACE axis port = m_axis_udp_tx
+#pragma HLS INTERFACE axis port = s_axis_udp_rx_meta
+#pragma HLS INTERFACE axis port = m_axis_udp_tx_meta
+#pragma HLS INTERFACE axis port = m_axis_tcp_listen_port
+#pragma HLS INTERFACE axis port = s_axis_tcp_port_status
+#pragma HLS INTERFACE axis port = m_axis_tcp_open_connection
+#pragma HLS INTERFACE axis port = s_axis_tcp_open_status
+#pragma HLS INTERFACE axis port = m_axis_tcp_close_connection
+#pragma HLS INTERFACE axis port = s_axis_tcp_notification
+#pragma HLS INTERFACE axis port = m_axis_tcp_read_pkg
+#pragma HLS INTERFACE axis port = s_axis_tcp_rx_meta
+#pragma HLS INTERFACE axis port = s_axis_tcp_rx_data
+#pragma HLS INTERFACE axis port = m_axis_tcp_tx_meta
+#pragma HLS INTERFACE axis port = m_axis_tcp_tx_data
+#pragma HLS INTERFACE axis port = s_axis_tcp_tx_status
+#pragma HLS INTERFACE ap_ctrl_none port = return
+
+     gw_core(GW_COSIM_LISTEN_PORT, GW_COSIM_SERVER_IP, GW_COSIM_SERVER_PORT,
+             (ap_uint<32>)GW_COSIM_RECONNECT_DELAY,
+             s_axis_udp_rx, m_axis_udp_tx,
+             s_axis_udp_rx_meta, m_axis_udp_tx_meta,
+             m_axis_tcp_listen_port, s_axis_tcp_port_status,
+             m_axis_tcp_open_connection, s_axis_tcp_open_status,
+             m_axis_tcp_close_connection,
+             s_axis_tcp_notification, m_axis_tcp_read_pkg,
+             s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
+             m_axis_tcp_tx_meta, m_axis_tcp_tx_data,
+             s_axis_tcp_tx_status);
 }
 }
