@@ -24,7 +24,7 @@ open_project -reset gateway_csim_proj
 set_top hls_gateway_krnl
 
 add_files hls_gateway_krnl.cpp -cflags $CFLAGS
-add_files -tb test_hls_gateway_krnl.cpp -cflags $CFLAGS
+add_files -tb tb/test_hls_gateway_krnl.cpp -cflags $CFLAGS
 
 open_solution -reset "solution1" -flow_target vitis
 set_part {xcu200-fsgd2104-2-e}
@@ -72,7 +72,7 @@ if {$do_cosim} {
 
     set COSIM_FLAGS "$CFLAGS -DGW_COSIM_TOP"
     add_files hls_gateway_krnl.cpp -cflags $COSIM_FLAGS
-    add_files -tb test_hls_gateway_krnl.cpp -cflags $COSIM_FLAGS
+    add_files -tb tb/test_hls_gateway_krnl.cpp -cflags $COSIM_FLAGS
 
     open_solution -reset "solution1" -flow_target vitis
     set_part {xcu200-fsgd2104-2-e}

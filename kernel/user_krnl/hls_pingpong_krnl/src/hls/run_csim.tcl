@@ -24,7 +24,7 @@ open_project -reset pingpong_csim_proj
 set_top hls_pingpong_krnl
 
 add_files hls_pingpong_krnl.cpp -cflags $CFLAGS
-add_files -tb test_hls_pingpong_krnl.cpp -cflags $CFLAGS
+add_files -tb tb/test_hls_pingpong_krnl.cpp -cflags $CFLAGS
 
 open_solution -reset "solution1" -flow_target vitis
 set_part {xcu200-fsgd2104-2-e}

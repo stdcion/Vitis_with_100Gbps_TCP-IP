@@ -44,6 +44,18 @@ Probe-вариант вписывает в начало эха число так
 потратило на обработку — от прихода уведомления до отправки последнего
 слова. Основное ядро остаётся чистым эхом.
 
+Это **отдельные ядра в отдельных каталогах** — так требует Makefile:
+он собирает все `.cpp` из `kernel/user_krnl/${USER_KRNL}/src/hls/` в
+одну сборку и ищет host в `host/${USER_KRNL}/host.cpp`. Два top-модуля
+в одном каталоге дали бы конфликт.
+
+```
+kernel/user_krnl/hls_pingpong_krnl/          host/hls_pingpong_krnl/
+kernel/user_krnl/hls_pingpong_probe_krnl/    host/hls_pingpong_probe_krnl/
+```
+
+Каждое ядро несёт свой `config_sp_<имя>.txt` со связями портов.
+
 ---
 
 ## Запуск: базовый замер RTT
@@ -92,7 +104,22 @@ sudo ./pingpong_client 192.168.1.10 5001 64 100000 5000 --cpu 2 --rt
 
 ## Запуск: вклад ядра (probe)
 
-Собрать с `USER_KRNL=hls_pingpong_probe_krnl`, затем:
+Собрать отдельный битстрим:
+
+```bash
+make all TARGET=hw \
+  DEVICE=/opt/xilinx/platforms/<platform>/<platform>.xpfm \
+  USER_KRNL=hls_pingpong_probe_krnl USER_KRNL_MODE=hls
+```
+
+Запустить ядро (host тот же, что у основного, только ищет другое имя
+ядра в битстриме):
+
+```bash
+./host ./build_dir.hw.<platform>/network.xclbin 5001
+```
+
+Затем клиент с `--probe`:
 
 ```bash
 sudo ./pingpong_client 192.168.1.10 5001 64 100000 5000 --cpu 2 --rt --probe
