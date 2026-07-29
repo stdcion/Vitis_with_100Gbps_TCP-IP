@@ -39,6 +39,10 @@
     --cpu N     привязать процесс к CPU N (Linux)
     --rt        SCHED_FIFO приоритет 80 (Linux, нужен root или CAP_SYS_NICE)
     --verify    сверять содержимое эха (по умолчанию только на warmup)
+    --probe     читать счётчик тактов из первых 4 байт эха.
+                ТОЛЬКО с hls_pingpong_probe_krnl! С обычным ядром там
+                лежат данные клиента, и клиент напечатает ошибку.
+    --mhz F     частота ядра для пересчёта тактов в ns (по умолч. 195.9)
     --csv FILE  куда писать сырые сэмплы (по умолчанию rtt_ns.csv)
 
 Пример максимально точного запуска:
@@ -76,6 +80,9 @@
 #define PP_CLOCK CLOCK_MONOTONIC
 #define PP_CLOCK_NAME "CLOCK_MONOTONIC (RAW недоступен!)"
 #endif
+
+/* Размер счётчика тактов, который probe-ядро вписывает в начало эха */
+#define PROBE_HDR 4
 
 static int cmp_u64(const void *a, const void *b) {
     unsigned long long x = *(const unsigned long long *)a;
@@ -181,7 +188,14 @@ int main(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr,
                 "Usage: %s <fpga_ip> <port> <msg_bytes> <count> [warmup] [опции]\n"
-                "Опции: --cpu N  --rt  --verify  --csv FILE\n"
+                "Опции:\n"
+                "  --cpu N     привязать к CPU N (Linux)\n"
+                "  --rt        SCHED_FIFO 80 (нужен root)\n"
+                "  --verify    сверять содержимое всех сообщений\n"
+                "  --probe     читать счётчик тактов из первых 4 байт\n"
+                "              (только с hls_pingpong_probe_krnl!)\n"
+                "  --mhz F     частота ядра для пересчёта тактов в ns (по умолч. 195.9)\n"
+                "  --csv FILE  куда писать сырые сэмплы\n"
                 "Пример: sudo %s 192.168.1.10 5001 64 100000 5000 --cpu 2 --rt\n",
                 argv[0], argv[0]);
         return 1;
@@ -194,7 +208,8 @@ int main(int argc, char **argv) {
     /* warmup по умолчанию 2000: за 100 итераций TCP не выходит из slow
        start, а частотный governor не успевает поднять частоту */
     size_t warmup = 2000;
-    int cpu = -1, want_rt = 0, verify_all = 0;
+    int cpu = -1, want_rt = 0, verify_all = 0, probe = 0;
+    double kernel_mhz = 195.9;   /* фактическая частота после AUTO-FREQ-SCALING */
     const char *csv_path = "rtt_ns.csv";
 
     int argi = 5;
@@ -203,6 +218,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[argi], "--cpu") && argi + 1 < argc) cpu = atoi(argv[++argi]);
         else if (!strcmp(argv[argi], "--rt")) want_rt = 1;
         else if (!strcmp(argv[argi], "--verify")) verify_all = 1;
+        else if (!strcmp(argv[argi], "--probe")) probe = 1;
+        else if (!strcmp(argv[argi], "--mhz") && argi + 1 < argc) kernel_mhz = atof(argv[++argi]);
         else if (!strcmp(argv[argi], "--csv") && argi + 1 < argc) csv_path = argv[++argi];
         else { fprintf(stderr, "неизвестная опция: %s\n", argv[argi]); return 1; }
     }
@@ -212,6 +229,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (count == 0) { fprintf(stderr, "count must be > 0\n"); return 1; }
+    if (probe && msg_bytes < PROBE_HDR) {
+        fprintf(stderr, "--probe требует msg_bytes >= %d "
+                        "(в первых %d байтах ядро передаёт счётчик тактов)\n",
+                PROBE_HDR, PROBE_HDR);
+        return 1;
+    }
 
     /* Порядок важен: сначала приоритет и привязка, потом калибровка —
        чтобы калибровка измеряла те же условия, что и сам замер */
@@ -270,6 +293,14 @@ int main(int argc, char **argv) {
     size_t recorded = 0;
     size_t mismatches = 0;
 
+    /* Счётчики тактов из probe-ядра (только при --probe) */
+    unsigned long long *ticks = NULL;
+    size_t ticks_n = 0;
+    if (probe) {
+        ticks = malloc(count * sizeof(unsigned long long));
+        if (!ticks) { fprintf(stderr, "oom\n"); return 1; }
+    }
+
     for (size_t i = 0; i < total; i++) {
         unsigned long long t0 = now_ns();
 
@@ -286,12 +317,26 @@ int main(int argc, char **argv) {
 
         /* Сверка вне измеряемого интервала. По умолчанию только на
            warmup: memcmp на больших сообщениях вытесняет данные из L1
-           и добавляет шум СЛЕДУЮЩЕМУ сэмплу. */
+           и добавляет шум СЛЕДУЮЩЕМУ сэмплу.
+
+           В режиме --probe первые 4 байта заняты счётчиком тактов от
+           ядра, поэтому сверяется только хвост сообщения. */
         if (verify_all || i < warmup) {
-            if (memcmp(tx, rx, msg_bytes) != 0) mismatches++;
+            size_t off = probe ? PROBE_HDR : 0;
+            if (msg_bytes > off && memcmp(tx + off, rx + off, msg_bytes - off) != 0)
+                mismatches++;
         }
 
-        if (i >= warmup) samples[recorded++] = t1 - t0;
+        if (i >= warmup) {
+            samples[recorded++] = t1 - t0;
+            if (probe) {
+                /* Счётчик приходит в network byte order (big-endian).
+                   Ядро пишет старший байт первым — проверено на модели. */
+                uint32_t be;
+                memcpy(&be, rx, sizeof(be));
+                ticks[ticks_n++] = (unsigned long long)ntohl(be);
+            }
+        }
     }
 
     close(fd);
@@ -343,15 +388,69 @@ int main(int argc, char **argv) {
            p50 / 2000.0);
     printf("Погрешность измерителя ~ %llu ns (гранулярность таймера)\n", gran_ns);
 
+    /* --- статистика счётчика тактов из probe-ядра --- */
+    if (probe && ticks_n > 0) {
+        qsort(ticks, ticks_n, sizeof(unsigned long long), cmp_u64);
+        double tsum = 0.0;
+        for (size_t i = 0; i < ticks_n; i++) tsum += (double)ticks[i];
+        double tmean = tsum / ticks_n;
+        double tp50  = pct(ticks, ticks_n, 50);
+        double ns_per_tick = 1000.0 / kernel_mhz;
+
+        printf("\n=== Задержка ЯДРА (счётчик тактов из probe-ядра) ===\n");
+        printf("частота ядра : %.1f MHz  (такт = %.3f ns)\n", kernel_mhz, ns_per_tick);
+        printf("измерено     : от прихода уведомления до отправки последнего слова\n");
+        printf("\n");
+        printf("min   : %6llu тактов  (%7.1f ns)\n",
+               ticks[0], ticks[0] * ns_per_tick);
+        printf("p50   : %6.0f тактов  (%7.1f ns)\n", tp50, tp50 * ns_per_tick);
+        printf("p99   : %6.0f тактов  (%7.1f ns)\n",
+               pct(ticks, ticks_n, 99), pct(ticks, ticks_n, 99) * ns_per_tick);
+        printf("max   : %6llu тактов  (%7.1f ns)\n",
+               ticks[ticks_n - 1], ticks[ticks_n - 1] * ns_per_tick);
+        printf("mean  : %6.0f тактов  (%7.1f ns)\n", tmean, tmean * ns_per_tick);
+        printf("\n");
+        /* Главный вывод: какую долю RTT занимает ядро */
+        double kernel_ns = tp50 * ns_per_tick;
+        if (kernel_ns >= p50) {
+            /* Такого быть не должно: ядро не может занимать больше, чем
+               весь путь. Значит либо ядро не probe-вариант (в первых
+               4 байтах не счётчик, а данные), либо неверная --mhz. */
+            printf("ОШИБКА: счётчик ядра (%.1f ns) >= RTT (%.0f ns).\n", kernel_ns, p50);
+            printf("  Вероятные причины:\n");
+            printf("   - на FPGA запущено НЕ probe-ядро (тогда в первых 4 байтах\n");
+            printf("     данные клиента 0x00010203 = %u тактов, а не счётчик);\n",
+                   (unsigned)0x00010203);
+            printf("   - неверная частота в --mhz.\n");
+        } else {
+            printf("Ядро составляет %.3f%% от RTT (p50: %.1f ns из %.0f ns)\n",
+                   100.0 * kernel_ns / p50, kernel_ns, p50);
+            printf("Остальное (%.3f us) — стек TOE, CMAC, провод, NIC и хост\n",
+                   (p50 - kernel_ns) / 1000.0);
+        }
+    } else if (probe) {
+        printf("\nВНИМАНИЕ: --probe задан, но счётчики не собраны\n");
+    }
+
     FILE *f = fopen(csv_path, "w");
     if (f) {
-        fprintf(f, "rtt_ns\n");
-        for (size_t i = 0; i < recorded; i++)
-            fprintf(f, "%llu\n", samples[i]);
+        /* В probe-режиме пишем и такты: обе колонки отсортированы
+           независимо, поэтому строки НЕ соответствуют одному и тому же
+           сообщению — это сводка распределений, не парные данные. */
+        if (probe && ticks_n == recorded) {
+            fprintf(f, "rtt_ns,kernel_ticks\n");
+            for (size_t i = 0; i < recorded; i++)
+                fprintf(f, "%llu,%llu\n", samples[i], ticks[i]);
+        } else {
+            fprintf(f, "rtt_ns\n");
+            for (size_t i = 0; i < recorded; i++)
+                fprintf(f, "%llu\n", samples[i]);
+        }
         fclose(f);
         printf("\nraw samples written to %s (sorted)\n", csv_path);
     }
 
     free(tx); free(rx); free(samples);
+    if (ticks) free(ticks);
     return mismatches ? 2 : 0;
 }
