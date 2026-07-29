@@ -55,6 +55,19 @@ gw_tx_merged.
 // Значение по умолчанию для хоста, если регистр не записан.
 #define GW_RECONNECT_DELAY_DEFAULT 250000000
 
+// Пауза перед повтором tx_meta после tx_status error==2 (ERROR_NOSPACE),
+// в тактах. Стек отвечает этим кодом, пока окно получателя закрыто, и
+// без паузы ядро повторяет запрос на полной скорости (измерено: один
+// повтор каждые два такта).
+//
+// Растёт вдвое при каждом отказе подряд от MIN до MAX и сбрасывается
+// после первой успешной отправки. Значения — не биржевые константы, а
+// компромисс: 16 тактов при 250 МГц ≈ 64 нс (быстрая реакция, когда
+// окно вот-вот откроется), 4096 тактов ≈ 16 мкс (потолок, чтобы
+// надолго закрытое окно не съедало порт tx_meta).
+#define GW_NOSPACE_BACKOFF_MIN 16
+#define GW_NOSPACE_BACKOFF_MAX 4096
+
 /*
  * Открывает listen-порт для входящих подключений клиента.
  * Повторяет попытку, пока стек не подтвердит успех.
@@ -541,7 +554,17 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
      // ISSUE в следующем такте читает длину и выставляет tx_meta.
      // Раньше и арбитраж, и чтение длины, и (len+63)>>6 попадали в
      // один такт — критический путь 3.846 нс против бюджета 2.920 нс.
-     enum txStateType {SELECT, ISSUE, WAIT_STATUS, WRITE_DATA, DISCARD};
+     //
+     // NOSPACE_BACKOFF — пауза перед повтором tx_meta после
+     // tx_status error==2 (ERROR_NOSPACE). Без неё повтор шёл на полной
+     // скорости: измерено 1000 запросов за 2000 такта, то есть один
+     // раз в два такта. Это не только забивало порт tx_meta, но и
+     // полностью блокировало ВТОРОЕ направление: пока транзакция не
+     // завершится, txState не возвращается в SELECT, и порция, у
+     // которой получатель совершенно исправен, не отправлялась никогда
+     // (head-of-line blocking).
+     enum txStateType {SELECT, ISSUE, WAIT_STATUS, WRITE_DATA, DISCARD,
+                       NOSPACE_BACKOFF};
      static txStateType txState = SELECT;
 #pragma HLS RESET variable=txState
 
@@ -562,6 +585,30 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
      static bool issueDiscard = false;
      // Повтор tx_meta после error==2 (длину заново не читать)
      static bool retryMeta = false;
+
+     // --- Состояние для обработки error==2 (нет места у получателя) ---
+     //
+     // Отложенная порция: длина уже прочитана из FIFO, но отправить её
+     // сейчас нельзя. Держим её здесь, чтобы уступить очередь второму
+     // направлению и вернуться к ней позже. Без этого одно застрявшее
+     // направление блокировало оба.
+     static bool        parkedValid   = false;
+     static bool        parkedIsClient = false;
+     static ap_uint<16> parkedLength  = 0;
+
+     // Уведомления об обрыве, обнаруженном по tx_status error==1.
+     // Держатся как pending и повторяются, пока запись не пройдёт:
+     // потерянное уведомление означает навсегда мёртвый upstream или
+     // навсегда повисшую сессию в стеке (см. WAIT_STATUS).
+     static bool        upstreamLostPending = false;
+     static bool        txStrayPending      = false;
+     static ap_uint<16> txStrayToClose      = 0;
+
+     // Счётчик паузы перед повтором.
+     static ap_uint<16> nospaceCounter = 0;
+     // Сколько ждать. Растёт при повторных отказах (экспоненциально, с
+     // потолком), чтобы медленный получатель не съедал порт tx_meta.
+     static ap_uint<16> nospaceDelay  = GW_NOSPACE_BACKOFF_MIN;
 
      // Актуализируем sessionID (в т.ч. после переподключения)
      if (!serverSessionToTx.empty())
@@ -585,14 +632,37 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
           serverSessionValid = false;
      }
 
+     // Повтор отложенных уведомлений об обрыве. Выполняется на каждом
+     // вызове, независимо от состояния передатчика, поэтому уведомление
+     // не может пропасть из-за временно полного FIFO.
+     if (upstreamLostPending && !upstreamLostFromTx.full())
+     {
+          upstreamLostFromTx.write(true);
+          upstreamLostPending = false;
+     }
+     if (txStrayPending && !strayFromTx.full())
+     {
+          strayFromTx.write(txStrayToClose);
+          txStrayPending = false;
+     }
+
      switch (txState)
      {
      case SELECT:
      {
           // Отправлять можно только в живую сессию. Данные для
           // отвалившегося направления отбрасываем.
-          bool clientPending = !toClientLength.empty();
-          bool serverPending = !toServerLength.empty();
+          //
+          // Отложенная (parked) порция участвует в арбитраже как
+          // готовое к отправке направление: её длина уже прочитана из
+          // FIFO, поэтому empty() про неё ничего не знает.
+          bool parkedClientReady = parkedValid && parkedIsClient
+                                   && clientSessionValid;
+          bool parkedServerReady = parkedValid && !parkedIsClient
+                                   && serverSessionValid;
+
+          bool clientPending = !toClientLength.empty() || parkedClientReady;
+          bool serverPending = !toServerLength.empty() || parkedServerReady;
           bool clientReady = clientSessionValid && clientPending;
           bool serverReady = serverSessionValid && serverPending;
 
@@ -612,13 +682,25 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
 
           if (!pick)
           {
-               // Есть данные, но получатель отключён — сбрасываем их
-               if (clientPending && !clientSessionValid)
+               // Есть данные, но получатель отключён — сбрасываем их.
+               // Отложенная порция мёртвого направления тоже
+               // отбрасывается: иначе она заняла бы parked-слот навсегда.
+               if (parkedValid && parkedIsClient && !clientSessionValid)
                {
                     activeIsClient = true;
                     discard = true;
                }
-               else if (serverPending && !serverSessionValid)
+               else if (parkedValid && !parkedIsClient && !serverSessionValid)
+               {
+                    activeIsClient = false;
+                    discard = true;
+               }
+               else if (!toClientLength.empty() && !clientSessionValid)
+               {
+                    activeIsClient = true;
+                    discard = true;
+               }
+               else if (!toServerLength.empty() && !serverSessionValid)
                {
                     activeIsClient = false;
                     discard = true;
@@ -629,6 +711,10 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
           if (pick || discard)
           {
                issueDiscard = discard;
+               // Если выбрали направление, чья порция отложена, длину
+               // заново читать нельзя — она уже в parkedLength.
+               retryMeta = parkedValid
+                           && (parkedIsClient == activeIsClient);
                txState = ISSUE;
           }
           break;
@@ -640,9 +726,18 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
           // между вызовами направление не менялось, поэтому читаем
           // ровно из выбранной очереди.
           //
-          // retryMeta означает повтор после tx_status error==2: длина
-          // уже прочитана в прошлый раз, читать её снова нельзя.
-          if (!retryMeta)
+          // retryMeta означает повтор отложенной порции: её длина уже
+          // прочитана из FIFO (лежит в parkedLength), читать снова
+          // нельзя — в FIFO её больше нет.
+          if (retryMeta)
+          {
+               pendingLength = parkedLength;
+               wordsToSend = (pendingLength + 63) >> 6;
+               wordsSent = 0;
+               bytesRemaining = pendingLength;
+               parkedValid = false;
+          }
+          else
           {
                pendingLength = activeIsClient ? toClientLength.read()
                                               : toServerLength.read();
@@ -681,6 +776,8 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
 
                if (error == 0)
                {
+                    // Успех — сбрасываем накопленный backoff
+                    nospaceDelay = GW_NOSPACE_BACKOFF_MIN;
                     txState = WRITE_DATA;
                }
                else if (error == 1)
@@ -692,29 +789,64 @@ void gw_tx_merged(hls::stream<ap_uint<16> >& serverSessionToTx,
                     // разбудить того, кто переподключается (upstream)
                     // или закрыть повисшую клиентскую сессию.
                     // Иначе upstream остаётся мёртвым навсегда.
+                    //
+                    // ВАЖНО: раньше здесь стояло
+                    //   if (!fifo.full()) fifo.write(...)
+                    // и при полном FIFO уведомление ИСЧЕЗАЛО, а
+                    // локальный флаг уже был сброшен. Тогда
+                    // gw_connect_upstream навсегда оставался в
+                    // ESTABLISHED — ровно та беда, от которой этот код
+                    // и защищает. Теперь запись не теряется: она
+                    // ставится в очередь как pending и повторяется в
+                    // следующих вызовах, пока не пройдёт.
                     if (activeIsClient)
                     {
                          clientSessionValid = false;
-                         if (!strayFromTx.full())
-                              strayFromTx.write(clientSession);
+                         txStrayPending = true;
+                         txStrayToClose = clientSession;
                     }
                     else
                     {
                          serverSessionValid = false;
-                         if (!upstreamLostFromTx.full())
-                              upstreamLostFromTx.write(true);
+                         upstreamLostPending = true;
                     }
                     txState = DISCARD;
                }
                else
                {
-                    // Нет места в буфере получателя — повторяем запрос.
-                    // Длина и счётчики уже установлены и не меняются,
-                    // поэтому возвращаемся в ISSUE, но БЕЗ повторного
-                    // чтения длины из FIFO (её там уже нет).
-                    retryMeta = true;
-                    txState = ISSUE;
+                    // Нет места в буфере получателя (ERROR_NOSPACE).
+                    //
+                    // Раньше здесь был немедленный возврат в ISSUE, то
+                    // есть повтор на полной скорости и вечная блокировка
+                    // второго направления. Теперь порция откладывается
+                    // (parked), выдерживается пауза, и на время паузы
+                    // передатчик обслуживает другое направление.
+                    parkedValid    = true;
+                    parkedIsClient = activeIsClient;
+                    parkedLength   = pendingLength;
+
+                    nospaceCounter = 0;
+                    // Уступаем очередь второму направлению
+                    serveClient = !serveClient;
+                    txState = NOSPACE_BACKOFF;
                }
+          }
+          break;
+
+     // Пауза после ERROR_NOSPACE. Отложенная порция ждёт в parked-слоте,
+     // а SELECT в это время может обслужить второе направление.
+     //
+     // Выход по счётчику, а не сразу: повтор на полной скорости
+     // бессмысленен — окно получателя не открывается за такт.
+     case NOSPACE_BACKOFF:
+          nospaceCounter++;
+          if (nospaceCounter >= nospaceDelay)
+          {
+               // Экспоненциальный рост с потолком: если получатель
+               // молчит долго, запросы редеют.
+               if (nospaceDelay < GW_NOSPACE_BACKOFF_MAX)
+                    nospaceDelay = (ap_uint<16>)(nospaceDelay << 1);
+               txState = SELECT;
           }
           break;
 
@@ -803,20 +935,39 @@ void gw_close_stray(hls::stream<ap_uint<16> >& straySessionFifo,
 
      // Два источника (gw_route и gw_tx_merged), потому что один
      // hls::stream нельзя писать из двух функций. Обслуживаем по
-     // одному за вызов, приоритет не важен.
+     // одному за вызов.
      //
      // Одно место записи в m_axis_tcp_close_connection и без проверки
      // full() — раньше было два write() плюс full(), то есть три
      // обращения к одному AXIS-порту, что держало II=2
      // (UG1448, 200-1960: multiple reads/writes to AXIS => conflicts
      // across pipeline stages).
+     //
+     // ROUND-ROBIN, а не приоритет. Раньше было
+     //   haveStray ? straySessionFifo.read() : strayFromTx.read()
+     // то есть strayFromTx читался только когда первый пуст. При
+     // непрерывном потоке лишних подключений (а listen-порт принимает
+     // любые) strayFromTx не опустошался, заполнялся до depth=16, и
+     // gw_tx_merged начинал ТЕРЯТЬ закрытия: там стоит
+     // if (!strayFromTx.full()) write(...). Потерянное закрытие —
+     // это повисшая навсегда сессия в стеке.
+     static bool serveTxStray = false;
+#pragma HLS RESET variable=serveTxStray
+
      bool haveStray = !straySessionFifo.empty();
      bool haveTxStray = !strayFromTx.empty();
 
      if (haveStray || haveTxStray)
      {
-          ap_uint<16> session = haveStray ? straySessionFifo.read()
-                                         : strayFromTx.read();
+          // Берём из «своей» очереди, если там есть; иначе из другой.
+          bool takeTx = serveTxStray ? haveTxStray : !haveStray;
+
+          ap_uint<16> session = takeTx ? strayFromTx.read()
+                                       : straySessionFifo.read();
+
+          // Следующий раз начинаем с другого источника
+          serveTxStray = !takeTx;
+
           pkt16 close_pkt;
           close_pkt.data = 0;
           close_pkt.data(15, 0) = session;

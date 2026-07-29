@@ -45,6 +45,9 @@ co-simulation (cosim_design) или на плате. Мутационная пр
      переключения в середине транзакции
  10. Backpressure: много пакетов подряд без немедленного слива
  11. Лишняя клиентская сессия — закрывается через close_connection
+ 12. error==2 с постоянно закрытым окном — второе направление не
+     блокируется, а повтор идёт с паузой (регрессия на head-of-line
+     blocking и busy-wait)
 
 Сборка (на машине с Vitis HLS):
     vitis_hls -f run_csim.tcl
@@ -200,6 +203,12 @@ static int  stk_forceErrorOn  = -1;     // номер транзакции с о
 static int  stk_forceErrorCode= 0;      // 1 = обрыв, 2 = нет места
 static bool stk_stallData     = false;  // не принимать tx_data
 
+// Сессия, которой стек ПОСТОЯННО отвечает error==2 (нет места), т.е.
+// получатель с закрытым окном приёма. Остальные сессии обслуживаются
+// нормально. Нужно для теста [12]: одно застрявшее направление не
+// должно блокировать второе. 0 = выключено.
+static ap_uint<16> stk_refuseSession = 0;
+
 // Внутреннее состояние стека
 static int         stk_txCount     = 0;   // сколько meta принято всего
 static int         stk_strayWords  = 0;   // слова вне разрешённой транзакции
@@ -216,6 +225,7 @@ static void stack_reset_cfg()
      stk_forceErrorOn   = -1;
      stk_forceErrorCode = 0;
      stk_stallData      = false;
+     stk_refuseSession  = 0;
 }
 
 // Один такт работы модели стека
@@ -244,6 +254,10 @@ static void stack_tick()
                int err = 0;
                if (stk_forceErrorOn == stk_txCount)
                     err = stk_forceErrorCode;
+               // Получатель с наглухо закрытым окном приёма
+               if (stk_refuseSession != 0
+                   && stk_metaSession == stk_refuseSession)
+                    err = 2;
 
                pkt64 s;
                s.data = 0;
@@ -692,6 +706,55 @@ int main()
           check(tx.sessionID == SESSION_CLIENT2,
                 "основной клиент сохранён, ответ ушёл ему");
      else check(false, "основной клиент потерян после лишней сессии");
+
+     // -----------------------------------------------------------
+     std::cout << "\n[12] error==2 не блокирует второе направление"
+               << std::endl;
+
+     // Регрессия на head-of-line blocking. Раньше при закрытом окне
+     // получателя передатчик повторял tx_meta на полной скорости
+     // (измерено: 1000 запросов за 2000 такта) и НИКОГДА не возвращался
+     // в SELECT, поэтому второе направление — с полностью исправным
+     // получателем — не обслуживалось вообще.
+     //
+     // Здесь окно сервера закрыто навсегда, а клиент здоров: порция в
+     // сторону клиента обязана дойти.
+     {
+          stack_reset_cfg();
+          captured.clear();
+
+          stk_refuseSession = SESSION_SERVER;   // uplink отвергается всегда
+
+          deliver(SESSION_CLIENT2, 64, 1, 0x9900);  // uplink  -> отвергается
+          run(20);
+          deliver(SESSION_SERVER, 64, 1, 0x9A00);   // downlink -> жив
+
+          const int WINDOW = 3000;
+          int metaBefore = stk_txCount;
+
+          bool downlinkServed = false;
+          for (int i = 0; i < WINDOW; i++)
+          {
+               tick();
+               for (size_t k = 0; k < captured.size(); k++)
+                    if (captured[k].sessionID == SESSION_CLIENT2)
+                         downlinkServed = true;
+          }
+          int metas = stk_txCount - metaBefore;
+
+          check(downlinkServed,
+                "downlink обслужен, хотя uplink отвергается постоянно");
+          // Повтор должен быть с паузой, а не каждые два такта.
+          check(metas < WINDOW / 10,
+                "повтор tx_meta с паузой, а не busy-wait");
+
+          std::cout << "        запросов tx_meta за " << WINDOW
+                    << " такта: " << metas << std::endl;
+
+          stack_reset_cfg();
+          run(500);
+          captured.clear();
+     }
 
      // -----------------------------------------------------------
      std::cout << "\n=== Итог: " << (failures == 0 ? "ВСЕ ТЕСТЫ ПРОШЛИ"
