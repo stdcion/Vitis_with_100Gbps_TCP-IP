@@ -57,8 +57,25 @@ static_assert((PP_MAX_WORDS & (PP_MAX_WORDS - 1)) == 0,
 
 /*
  * Открывает listen-порт, повторяя запрос до подтверждения стека.
+ *
+ * ПРО enable. Ядро объявлено с ap_ctrl_none, то есть у него нет
+ * ap_start: оно исполняет своё тело каждый такт. Открытым остаётся
+ * вопрос, с какого момента — с загрузки битстрима или после того, как
+ * XRT снимет reset при enqueueTask. Если с загрузки, то возникает
+ * гонка: хост записывает listenPort через setArg на миллионы тактов
+ * позже, а ядро к тому времени уже запросило порт по нулевому
+ * регистру и защёлкнуло portRequested. Слушался бы порт 0, а клиент
+ * не смог бы подключиться.
+ *
+ * НА ПЛАТЕ ЭТО НЕ ПРОВЕРЕНО — поведение зависит от shell и версии XRT,
+ * из кода его не видно. Поэтому вопрос закрывается явным разрешением:
+ * пока хост не выставил enable=1, ядро не трогает ни один порт. Так
+ * правильно при любом ответе, и проверять ничего не нужно.
+ *
+ * Порядок записи на хосте: сначала listenPort, потом enable.
  */
-void ppp_listen(int listenPort,
+void ppp_listen(int enable,
+                int listenPort,
                 hls::stream<pkt16>& m_axis_tcp_listen_port,
                 hls::stream<pkt8>& s_axis_tcp_port_status)
 {
@@ -66,7 +83,14 @@ void ppp_listen(int listenPort,
 #pragma HLS INLINE off
 
      static bool portRequested = false;
+#pragma HLS RESET variable=portRequested
      static bool portOpened = false;
+#pragma HLS RESET variable=portOpened
+
+     // До разрешения хоста listenPort в регистре может быть ещё не
+     // записан — не начинаем.
+     if (!enable)
+          return;
 
      if (!portRequested)
      {
@@ -297,8 +321,17 @@ void hls_pingpong_probe_krnl(
                hls::stream<pkt512>& m_axis_tcp_tx_data,
                hls::stream<pkt64>& s_axis_tcp_tx_status,
 
-               // Порт, который слушаем
-               int listenPort
+               // ---- Скалярные аргументы (задаются с хоста) ----
+               // setArg() адресует аргументы ПОЗИЦИЕЙ в этой сигнатуре,
+               // считая с нуля и включая все 16 потоков:
+               //   listenPort -> 16,  enable -> 17.
+               // Новые параметры добавлять только между ними, иначе
+               // индексы на хосте молча разъедутся.
+               int listenPort,
+
+               // enable ВСЕГДА последний — разрешение начать работу,
+               // см. пояснение у ppp_listen.
+               int enable
                       ) {
 
 #pragma HLS INTERFACE axis port = s_axis_udp_rx
@@ -318,6 +351,7 @@ void hls_pingpong_probe_krnl(
 #pragma HLS INTERFACE axis port = m_axis_tcp_tx_data
 #pragma HLS INTERFACE axis port = s_axis_tcp_tx_status
 #pragma HLS INTERFACE s_axilite port = listenPort bundle = control
+#pragma HLS INTERFACE s_axilite port = enable bundle = control
 #pragma HLS INTERFACE ap_ctrl_none port = return
 
 // DATAFLOW, а не PIPELINE — см. пояснение в hls_pingpong_krnl.cpp
@@ -328,7 +362,8 @@ void hls_pingpong_probe_krnl(
      tie_off_tcp_open_connection(m_axis_tcp_open_connection, s_axis_tcp_open_status);
      tie_off_tcp_close_con(m_axis_tcp_close_connection);
 
-     ppp_listen(listenPort, m_axis_tcp_listen_port, s_axis_tcp_port_status);
+     ppp_listen(enable, listenPort,
+                m_axis_tcp_listen_port, s_axis_tcp_port_status);
 
      ppp_echo(s_axis_tcp_notification, m_axis_tcp_read_pkg,
               s_axis_tcp_rx_meta, s_axis_tcp_rx_data,

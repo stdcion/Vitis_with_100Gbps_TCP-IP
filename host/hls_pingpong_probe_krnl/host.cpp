@@ -123,8 +123,20 @@ int main(int argc, char **argv) {
     OCL_CHECK(err, err = q.enqueueTask(network_kernel));
     OCL_CHECK(err, err = q.finish());
 
-    // Единственный аргумент ядра идёт после 16 stream-портов
-    OCL_CHECK(err, err = user_kernel.setArg(16, listenPort));
+    // Аргументы ядра идут после 16 stream-портов:
+    //   16 = listenPort, 17 = enable
+    //
+    // ПОРЯДОК ВАЖЕН: сначала параметры, потом enable. Ядро объявлено с
+    // ap_ctrl_none и, возможно, уже исполняет своё тело — пока enable
+    // равен нулю, оно не трогает порты и поэтому увидит уже записанный
+    // listenPort. Выставить enable раньше — значит рискнуть тем, что
+    // ядро запросит listen-порт по нулевому регистру (см. пояснение у
+    // ppp_listen в ядре).
+    static const int ARG_LISTEN_PORT = 16;
+    static const int ARG_ENABLE      = 17;
+
+    OCL_CHECK(err, err = user_kernel.setArg(ARG_LISTEN_PORT, listenPort));
+    OCL_CHECK(err, err = user_kernel.setArg(ARG_ENABLE, (uint32_t)1));
 
     printf("enqueue pingpong kernel...\n");
     OCL_CHECK(err, err = q.enqueueTask(user_kernel));
