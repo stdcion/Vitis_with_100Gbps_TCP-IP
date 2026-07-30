@@ -32,24 +32,28 @@ set REPO_ROOT [file normalize [file dirname [info script]]/../..]
 set SRC_DIR   "$REPO_ROOT/kernel/user_krnl/$KRNL/src/hls"
 set PROJ_DIR  "$REPO_ROOT/build_hls"
 
+# Работаем ИЗ каталога исходников, как это делает рабочий run_csim.tcl.
+#
+# Иначе HLS не находит файл: он резолвит путь относительно каталога решения, а
+# не cwd, и абсолютный путь в add_files это не спасает — в логе появляется
+# "Cannot find source file ../kernel/..." и следом "Cannot find any design unit
+# to elaborate". Проект при этом создаётся в $PROJ_DIR по абсолютному пути,
+# так что результат от смены cwd не зависит.
+cd $SRC_DIR
+
 open_project -reset "$PROJ_DIR/$KRNL"
 set_top $KRNL
 
-# Единственный внешний заголовок ядра — communication.hpp, и он подключается
-# относительным путём от самого .cpp ("../../../../common/include/..."), так что
-# -I не нужен: v++ в Vitis-флоу тоже собирал это ядро без -I (см. config_hls.mk).
-#
-# Файлы добавляем по абсолютному пути. Относительный путь HLS резолвит от
-# каталога решения, а не от cwd, и файл "теряется": сначала
-# "Cannot find source file ../kernel/...", потом "Cannot find any design unit
-# to elaborate" — именно на этом упал первый прогон.
-foreach f [glob -nocomplain "$SRC_DIR/*.cpp"] {
-     # Тестбенч в синтез не идёт — он живёт в tb/ и собирается нативно
-     # (см. run_csim.tcl и ap_int/hls_stream шим).
-     if {[string match "*/tb/*" $f]} { continue }
-     set f [file normalize $f]
+# Те же cflags, что в run_csim.tcl: communication.hpp лежит вне каталога ядра.
+# (В самом .cpp include записан относительным путём, но HLS ищет его от
+# каталога компиляции, поэтому -I всё равно нужен.)
+set CFLAGS "-std=c++14 -I../../../../common/include"
+
+# Тестбенч в синтез не идёт — он в tb/ и собирается нативно (см. run_csim.tcl
+# и ap_int/hls_stream шим).
+foreach f [glob -nocomplain "*.cpp"] {
      puts "add_files: $f"
-     add_files $f
+     add_files $f -cflags $CFLAGS
 }
 
 open_solution -reset "sol1" -flow_target vivado
