@@ -39,23 +39,23 @@ source "$REPO_ROOT/scripts/vivado/gen_axis_connect.tcl"
 create_project $PROJ_NAME $PROJ_DIR -part $PART -force
 
 # DDR4 IP конфигурируется через board interfaces (C0_CLOCK_BOARD_INTERFACE,
-# C0_DDR4_BOARD_INTERFACE) — для этого проекту нужен board part, а не только
-# part. Board file au200 лежит внутри платформы (board/1.3 в hw.xsa) и в
-# каталоге Vivado; берём любой доступный.
+# C0_DDR4_BOARD_INTERFACE): так он сам берёт ~150 пинов DDR4 и параметры чипа
+# из board file, вместо того чтобы прописывать их вручную в XDC.
+#
+# Board file лежит в репозитории (scripts/vivado/board_files/au200/1.3),
+# поэтому сборка не зависит от того, установлены ли board files в Vivado —
+# в этой установке их нет. Файлы взяты из hw.xsa платформы
+# xilinx_u200_gen3x16_xdma_2_202110_1 (каталог board/1.3).
+set_param board.repoPaths [list "$REPO_ROOT/scripts/vivado/board_files"]
+
 set board_hits [get_board_parts -quiet -filter {NAME =~ *au200*}]
 if {[llength $board_hits] == 0} {
-     puts ""
-     puts "ВНИМАНИЕ: board part au200 не найден."
-     puts "DDR4 IP не сможет взять пины из board interface."
-     puts ""
-     puts "Поставить board files:"
-     puts "  Vivado GUI: Tools -> Vivado Store -> Boards -> Alveo U200"
-     puts "  либо: git clone https://github.com/Xilinx/XilinxBoardStore"
-     puts "        и скопировать boards/Xilinx/au200 в"
-     puts "        /opt/Xilinx/Vivado/2024.1/data/boards/board_files/"
-     error "нет board part au200 — DDR4 не сконфигурировать"
+     error "board part au200 не найден даже в $REPO_ROOT/scripts/vivado/board_files —\
+            проверь, что там лежит au200/1.3/board.xml"
 }
-set BOARD_PART [lindex $board_hits 0]
+
+# Берём максимальную версию, если их несколько (репозиторий + системная).
+set BOARD_PART [lindex [lsort -decreasing $board_hits] 0]
 puts "board part: $BOARD_PART"
 set_property board_part $BOARD_PART [current_project]
 
