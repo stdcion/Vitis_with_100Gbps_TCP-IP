@@ -38,6 +38,27 @@ source "$REPO_ROOT/scripts/vivado/gen_axis_connect.tcl"
 
 create_project $PROJ_NAME $PROJ_DIR -part $PART -force
 
+# DDR4 IP конфигурируется через board interfaces (C0_CLOCK_BOARD_INTERFACE,
+# C0_DDR4_BOARD_INTERFACE) — для этого проекту нужен board part, а не только
+# part. Board file au200 лежит внутри платформы (board/1.3 в hw.xsa) и в
+# каталоге Vivado; берём любой доступный.
+set board_hits [get_board_parts -quiet -filter {NAME =~ *au200*}]
+if {[llength $board_hits] == 0} {
+     puts ""
+     puts "ВНИМАНИЕ: board part au200 не найден."
+     puts "DDR4 IP не сможет взять пины из board interface."
+     puts ""
+     puts "Поставить board files:"
+     puts "  Vivado GUI: Tools -> Vivado Store -> Boards -> Alveo U200"
+     puts "  либо: git clone https://github.com/Xilinx/XilinxBoardStore"
+     puts "        и скопировать boards/Xilinx/au200 в"
+     puts "        /opt/Xilinx/Vivado/2024.1/data/boards/board_files/"
+     error "нет board part au200 — DDR4 не сконфигурировать"
+}
+set BOARD_PART [lindex $board_hits 0]
+puts "board part: $BOARD_PART"
+set_property board_part $BOARD_PART [current_project]
+
 # Каталоги с IP: и packaged_kernel_* от make, и ip_repo, и то, что положил HLS.
 set ip_repos {}
 foreach d [glob -nocomplain "$REPO_ROOT/packaged_kernel_*"] {
@@ -136,15 +157,19 @@ connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M01_AXI] \
 # --- клоки и сбросы -----------------------------------------------------------
 #
 # Шелл давал ap_clk (kernel clock) и free-running clock готовыми. Здесь строим
-# сами из 300 МГц входа: 250 МГц для ядер (столько же было в шелле по
-# умолчанию) и 100 МГц free-running для CMAC.
+# сами из 300 МГц входа:
+#   clk_out1 = 200 МГц — ap_clk ядер. Ровно та частота, с которой ядро
+#              собиралось в Vitis-флоу (Makefile: --kernel_frequency 200) и на
+#              которую рассчитан export_hls_ip.tcl.
+#   clk_out2 = 100 МГц — free-running для CMAC; в шелле это был
+#              ulp_m_aclk_freerun_ref_00 (см. ветку frc1 в post_sys_link.tcl.in).
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:6.0 clk_wiz_0
 set_property -dict [list \
      CONFIG.PRIM_SOURCE {Differential_clock_capable_pin} \
      CONFIG.PRIM_IN_FREQ {300.000} \
      CONFIG.CLKOUT1_USED {true} \
-     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {250.000} \
+     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {200.000} \
      CONFIG.CLKOUT2_USED {true} \
      CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {100.000} \
      CONFIG.USE_RESET {false} \
@@ -196,46 +221,91 @@ connect_bd_net [get_bd_ports qsfp0_refclk_n] [get_bd_pins cmac_krnl_1/gt_refclk0
 # стека, они обязательны. В Vitis их привязывал sp= из
 # scripts/network_krnl_mem.txt.in; шелл предоставлял memory subsystem.
 #
-# TODO: выбрать между DDR4 MIG и BRAM/URAM.
-#   - DDR4 MIG: как в шелле, полный объём, но требует конфигурации MIG под
-#     U200 (пины c0_ddr4_* / c1_ddr4_* есть в board/1.3/part0_pins.xml) и
-#     заметно усложняет timing closure.
-#   - axi_bram_ctrl: сильно проще поднять и достаточно для первого bring-up,
-#     если число одновременных сессий невелико. Начать разумно с этого:
-#     цель первого шага — увидеть, что порт слушается и счётчики растут.
+# Воспроизводим ровно то, что делала XRT-сборка, а не подбираем свой вариант.
+# CMakeLists.txt для FDEV_NAME=u200 задаёт:
+#     NETWORK_KRNL_MEM = DDR[3]      -> банк ddr4_sdram_c3
+#     CMAC_SLR         = SLR2
+# и scripts/network_krnl_mem.txt.in привязывал ОБА мастера (m00_axi и m01_axi)
+# к одному и тому же банку. board.xml подтверждает: ddr4_sdram_c3 — 16 ГБ,
+# SLR2, тактируется от default_300mhz_clk3. То есть память и CMAC жили в одном
+# SLR — сохраняем и это.
 #
-# Ниже — вариант на BRAM как стартовый. Объём заведомо меньше, чем DDR;
-# при упоре в лимит сессий заменить на MIG.
+# Оба мастера идут в один контроллер через smartconnect, как и при sp= на один
+# банк в Vitis-флоу.
 
-foreach {idx port} {0 m00_axi 1 m01_axi} {
-     create_bd_cell -type ip -vlnv xilinx.com:ip:axi_bram_ctrl:4.1 bram_ctrl_$idx
-     set_property -dict [list \
-          CONFIG.DATA_WIDTH {512} \
-          CONFIG.SINGLE_PORT_BRAM {1} \
-     ] [get_bd_cells bram_ctrl_$idx]
+create_bd_cell -type ip -vlnv xilinx.com:ip:ddr4:2.2 ddr4_c3
+set_property -dict [list \
+     CONFIG.C0_CLOCK_BOARD_INTERFACE {default_300mhz_clk3} \
+     CONFIG.C0_DDR4_BOARD_INTERFACE {ddr4_sdram_c3} \
+     CONFIG.RESET_BOARD_INTERFACE {resetn} \
+     CONFIG.C0.DDR4_AxiDataWidth {512} \
+     CONFIG.C0.DDR4_AxiAddressWidth {34} \
+     CONFIG.C0.DDR4_AxiSelection {true} \
+] [get_bd_cells ddr4_c3]
 
-     create_bd_cell -type ip -vlnv xilinx.com:ip:blk_mem_gen:8.4 bram_$idx
-     set_property -dict [list CONFIG.Memory_Type {True_Dual_Port_RAM}] [get_bd_cells bram_$idx]
+create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
+set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells mem_interconnect]
 
-     connect_bd_intf_net [get_bd_intf_pins network_krnl_1/$port] \
-                         [get_bd_intf_pins bram_ctrl_$idx/S_AXI]
-     connect_bd_intf_net [get_bd_intf_pins bram_ctrl_$idx/BRAM_PORTA] \
-                         [get_bd_intf_pins bram_$idx/BRAM_PORTA]
+connect_bd_intf_net [get_bd_intf_pins network_krnl_1/m00_axi] \
+                    [get_bd_intf_pins mem_interconnect/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins network_krnl_1/m01_axi] \
+                    [get_bd_intf_pins mem_interconnect/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins mem_interconnect/M00_AXI] \
+                    [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI]
 
-     connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] [get_bd_pins bram_ctrl_$idx/s_axi_aclk]
-     connect_bd_net [get_bd_pins rst_gen/peripheral_aresetn] [get_bd_pins bram_ctrl_$idx/s_axi_aresetn]
-}
+# Мастера network_krnl тактируются ap_clk (200 МГц), а контроллер отдаёт свой
+# ui_clk (обычно 300 МГц): smartconnect разводит домены сам, но клоки ему нужно
+# подать оба.
+connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] [get_bd_pins mem_interconnect/aclk]
+connect_bd_net [get_bd_pins rst_gen/peripheral_aresetn] [get_bd_pins mem_interconnect/aresetn]
+connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk] [get_bd_pins mem_interconnect/aclk1]
+
+# Сброс AXI-интерфейса контроллера — в его собственном домене ui_clk,
+# отпускается по его же ui_clk_sync_rst.
+create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ddr4
+connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk]          [get_bd_pins rst_ddr4/slowest_sync_clk]
+connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk_sync_rst] [get_bd_pins rst_ddr4/ext_reset_in]
+connect_bd_net [get_bd_pins rst_ddr4/peripheral_aresetn]     [get_bd_pins ddr4_c3/c0_ddr4_aresetn]
 
 # --- адреса -------------------------------------------------------------------
-# Смещения должны совпасть с OUCH_BASE_* в jtag_ctrl.tcl.
+#
+# Базовые адреса задаём явно, а не полагаемся на assign_bd_address: тот
+# распределяет по порядку обхода и уже один раз выдал network_krnl по 0x10000,
+# а user-ядро по 0x0 — то есть наоборот относительно jtag_ctrl.tcl. Молчаливое
+# расхождение здесь означает запись параметров не в те регистры, поэтому
+# фиксируем адреса и сверяем их в конце.
 
-assign_bd_address
+set ADDR_NETWORK 0x00000000
+set ADDR_USER    0x00010000
+
+# Сначала — автоматически всё, что не назначено (память для m0*_axi).
+assign_bd_address -quiet
+
+# Затем принудительно переназначаем control-сегменты на нужные адреса.
+set seg_net  [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+                  -filter "NAME =~ *network_krnl*"]
+set seg_user [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+                  -filter "NAME =~ *${USER_KRNL}*"]
+
+set_property offset $ADDR_NETWORK $seg_net
+set_property offset $ADDR_USER    $seg_user
 
 puts ""
-puts "=== карта адресов (сверить с jtag_ctrl.tcl) ==="
+puts "=== карта адресов ==="
 foreach seg [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data]] {
      puts [format "  %-52s %s" $seg [get_property OFFSET $seg]]
 }
+
+# Проверяем, что получилось именно то, что прописано в jtag_ctrl.tcl —
+# иначе управление пойдёт не в те регистры, а на железе это выглядит как
+# "ядро не реагирует", без всякой диагностики.
+if {[get_property OFFSET $seg_net] ne $ADDR_NETWORK ||
+    [get_property OFFSET $seg_user] ne $ADDR_USER} {
+     error "адреса не совпали с ожидаемыми — сверь OUCH_BASE_* в scripts/vivado/jtag_ctrl.tcl"
+}
+puts ""
+puts "  network_krnl s_axi_control -> $ADDR_NETWORK  (OUCH_BASE_NETWORK)"
+puts "  ${USER_KRNL} s_axi_control -> $ADDR_USER  (OUCH_BASE_USER)"
 
 # --- финал --------------------------------------------------------------------
 
@@ -247,6 +317,19 @@ add_files -norecurse "$PROJ_DIR/$PROJ_NAME.gen/sources_1/bd/$BD_NAME/hdl/${BD_NA
 set_property top ${BD_NAME}_wrapper [current_fileset]
 
 add_files -fileset constrs_1 -norecurse $PINS_XDC
+
+# CMAC в SLR2 — как задавал scripts/cmac_krnl_slr.txt.in в Vitis-флоу
+# (CMakeLists.txt: CMAC_SLR=SLR2 для u200). Это не косметика: GT-квады QSFP0
+# физически в SLR2, и размещение ядра в другом SLR ломает timing на GT-путях.
+# DDR4 c3 по board.xml тоже в SLR2, так что весь сетевой путь остаётся локальным.
+set slr_xdc "$PROJ_DIR/cmac_slr.xdc"
+set fh [open $slr_xdc w]
+puts $fh "# сгенерировано build_bd.tcl из CMAC_SLR=SLR2 (CMakeLists.txt, u200)"
+puts $fh "create_pblock pblock_cmac"
+puts $fh "resize_pblock \[get_pblocks pblock_cmac\] -add {SLR2}"
+puts $fh "add_cells_to_pblock \[get_pblocks pblock_cmac\] \[get_cells -hierarchical -filter {NAME =~ *cmac_krnl_1*}\]"
+close $fh
+add_files -fileset constrs_1 -norecurse $slr_xdc
 
 puts ""
 puts "BD собран. Дальше:"

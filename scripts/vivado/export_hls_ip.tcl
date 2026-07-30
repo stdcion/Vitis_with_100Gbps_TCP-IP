@@ -22,9 +22,11 @@
 set KRNL      "hls_ouch_krnl"
 set PART      "xcu200-fsgd2104-2-e"
 
-# 250 МГц — столько же, сколько kernel clock в Vitis-сборке и в clk_wiz
-# из build_bd.tcl. Если менять здесь, менять и там.
-set PERIOD_NS 4.0
+# 200 МГц — ровно то, с чем ядро собиралось в Vitis-флоу
+# (Makefile: CLFLAGS += --kernel_frequency 200). Держим ту же частоту, чтобы
+# результат синтеза был сопоставим с рабочей сборкой; clk_wiz в build_bd.tcl
+# настроен на неё же.
+set PERIOD_NS 5.0
 
 set REPO_ROOT [file normalize [file dirname [info script]]/../..]
 set SRC_DIR   "$REPO_ROOT/kernel/user_krnl/$KRNL/src/hls"
@@ -33,12 +35,21 @@ set PROJ_DIR  "$REPO_ROOT/build_hls"
 open_project -reset "$PROJ_DIR/$KRNL"
 set_top $KRNL
 
-foreach f [glob "$SRC_DIR/*.cpp"] {
+# Единственный внешний заголовок ядра — communication.hpp, и он подключается
+# относительным путём от самого .cpp ("../../../../common/include/..."), так что
+# -I не нужен: v++ в Vitis-флоу тоже собирал это ядро без -I (см. config_hls.mk).
+#
+# Файлы добавляем по абсолютному пути. Относительный путь HLS резолвит от
+# каталога решения, а не от cwd, и файл "теряется": сначала
+# "Cannot find source file ../kernel/...", потом "Cannot find any design unit
+# to elaborate" — именно на этом упал первый прогон.
+foreach f [glob -nocomplain "$SRC_DIR/*.cpp"] {
      # Тестбенч в синтез не идёт — он живёт в tb/ и собирается нативно
      # (см. run_csim.tcl и ap_int/hls_stream шим).
      if {[string match "*/tb/*" $f]} { continue }
+     set f [file normalize $f]
      puts "add_files: $f"
-     add_files $f -cflags "-I$REPO_ROOT/kernel/common -I$SRC_DIR -std=c++14"
+     add_files $f
 }
 
 open_solution -reset "sol1" -flow_target vivado

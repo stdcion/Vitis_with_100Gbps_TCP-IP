@@ -72,6 +72,11 @@ set_property PACKAGE_PIN K6  [get_ports {qsfp0_gtx_n[3]}]
 # В шелле cmac_krnl получал clk_gt_freerun с ulp_m_aclk_freerun_ref_00 (100 МГц,
 # см. ветку frc1 в scripts/post_sys_link.tcl.in). Здесь берём 300 МГц с пина
 # и делим MMCM до 100 МГц — источника на 100 МГц на плате нет.
+#
+# clk0 (AY37/AY38) — для нашей clk_wiz. DDR4-контроллер тактируется отдельно от
+# default_300mhz_clk3 (J16/H16), но его пины приходят из board interface
+# (CONFIG.C0_CLOCK_BOARD_INTERFACE), поэтому здесь их прописывать не нужно —
+# иначе получим двойное назначение.
 
 set_property PACKAGE_PIN AY37 [get_ports {default_300mhz_clk0_p}]
 set_property PACKAGE_PIN AY38 [get_ports {default_300mhz_clk0_n}]

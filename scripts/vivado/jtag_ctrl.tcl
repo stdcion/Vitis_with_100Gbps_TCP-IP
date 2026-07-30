@@ -28,10 +28,9 @@
 #   работу: см. комментарий у ouch_listen в hls_ouch_krnl.cpp про гонку.
 # -----------------------------------------------------------------------------
 
-# Базовые адреса s_axi_control. Должны совпадать с тем, что назначил address
-# editor в BD — сверить после build_bd.tcl командой:
-#     puts [get_property OFFSET [get_bd_addr_segs -of_objects \
-#           [get_bd_addr_spaces jtag_axi_0/Data]]]
+# Базовые адреса s_axi_control. build_bd.tcl задаёт их явно (ADDR_NETWORK /
+# ADDR_USER) и проверяет результат, поэтому здесь просто те же значения.
+# Если менять — менять в обоих файлах.
 set ::OUCH_BASE_NETWORK 0x00000000
 set ::OUCH_BASE_USER    0x00010000
 
@@ -130,8 +129,13 @@ proc network_configure {ip_str mac_str {arp 1}} {
 }
 
 # Буферы для TCP session tables. В Vitis это были cl::Buffer, которые XRT
-# размещал в DDR сам; здесь адреса задаём вручную — они должны попадать в
-# диапазон, который address editor отвёл под DDR4 для m00_axi/m01_axi.
+# размещал в DDR сам (host.cpp: buffer_r1/buffer_r2 по 8 КБ каждый); здесь
+# адреса задаём вручную.
+#
+# Значения по умолчанию — начало и середина диапазона DDR4 c3 (16 ГБ, банк
+# DDR[3] — тот же, что задавал NETWORK_KRNL_MEM в CMakeLists.txt для u200).
+# Точный базовый адрес печатает build_bd.tcl в карте адресов; если он не 0,
+# сдвинуть оба значения.
 proc network_set_buffers {{ptr0 0x00000000} {ptr1 0x40000000}} {
      set base $::OUCH_BASE_NETWORK
 
