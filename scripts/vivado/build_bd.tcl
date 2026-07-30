@@ -152,7 +152,14 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:jtag_axi:1.2 jtag_axi_0
 set_property CONFIG.PROTOCOL {2} [get_bd_cells jtag_axi_0]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 ctrl_interconnect
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2}] [get_bd_cells ctrl_interconnect]
+
+# Здесь всё в одном домене (jtag_axi и оба s_axi_control — на ap_clk), поэтому
+# NUM_CLKS=1. Задаём явно, чтобы не зависеть от значения по умолчанию.
+set_property -dict [list \
+     CONFIG.NUM_SI {1} \
+     CONFIG.NUM_MI {2} \
+     CONFIG.NUM_CLKS {1} \
+] [get_bd_cells ctrl_interconnect]
 
 connect_bd_intf_net [get_bd_intf_pins jtag_axi_0/M_AXI] \
                     [get_bd_intf_pins ctrl_interconnect/S00_AXI]
@@ -251,7 +258,17 @@ set_property -dict [list \
 ] [get_bd_cells ddr4_c3]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
-set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells mem_interconnect]
+
+# NUM_CLKS=2 обязателен: мастера network_krnl работают на ap_clk (200 МГц), а
+# контроллер отдаёт свой ui_clk (300 МГц). Без этого параметра у smartconnect
+# просто нет пина aclk1, и подключение падает с "No pins matched .../aclk1" —
+# число тактовых входов задаётся конфигурацией, а не появляется само при
+# подключении разнодоменных портов.
+set_property -dict [list \
+     CONFIG.NUM_SI {2} \
+     CONFIG.NUM_MI {1} \
+     CONFIG.NUM_CLKS {2} \
+] [get_bd_cells mem_interconnect]
 
 connect_bd_intf_net [get_bd_intf_pins network_krnl_1/m00_axi] \
                     [get_bd_intf_pins mem_interconnect/S00_AXI]
@@ -260,9 +277,8 @@ connect_bd_intf_net [get_bd_intf_pins network_krnl_1/m01_axi] \
 connect_bd_intf_net [get_bd_intf_pins mem_interconnect/M00_AXI] \
                     [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI]
 
-# Мастера network_krnl тактируются ap_clk (200 МГц), а контроллер отдаёт свой
-# ui_clk (обычно 300 МГц): smartconnect разводит домены сам, но клоки ему нужно
-# подать оба.
+# aclk — домен слейв-портов (ap_clk ядер), aclk1 — домен мастер-порта (ui_clk
+# контроллера). Пересечение доменов smartconnect берёт на себя.
 connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] [get_bd_pins mem_interconnect/aclk]
 connect_bd_net [get_bd_pins rst_gen/peripheral_aresetn] [get_bd_pins mem_interconnect/aresetn]
 connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk] [get_bd_pins mem_interconnect/aclk1]
