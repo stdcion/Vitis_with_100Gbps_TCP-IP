@@ -21,6 +21,11 @@
 # -----------------------------------------------------------------------------
 
 set PART        "xcu200-fsgd2104-2-e"
+
+# Board part задаётся строкой: DDR4 IP берёт из него пины и параметры чипа
+# памяти. Версия 1.3 — та, что лежит в scripts/vivado/board_files (из hw.xsa
+# платформы). При обновлении board file поменять и здесь.
+set BOARD_PART  "xilinx.com:au200:part0:1.3"
 set PROJ_NAME   "ouch_vivado"
 set PROJ_DIR    "./build_vivado"
 set BD_NAME     "ouch_bd"
@@ -45,24 +50,34 @@ source "$REPO_ROOT/scripts/vivado/gen_axis_connect.tcl"
 # в этой установке их нет. Файлы взяты из hw.xsa платформы
 # xilinx_u200_gen3x16_xdma_2_202110_1 (каталог board/1.3).
 #
-# ВАЖНО: repoPaths задаётся ДО create_project. После создания проекта Vivado
-# список board parts уже зафиксировал, и та же самая настройка не подхватывается
-# (проверено: в отдельном скрипте до создания проекта плата находится, после —
-# нет).
+# repoPaths задаётся ДО create_project — иначе плата не попадёт в каталог
+# проекта.
 set_param board.repoPaths [list "$REPO_ROOT/scripts/vivado/board_files"]
 
-set board_hits [get_board_parts -quiet -filter {NAME =~ *au200*}]
-if {[llength $board_hits] == 0} {
-     error "board part au200 не найден в $REPO_ROOT/scripts/vivado/board_files —\
-            проверь, что там лежит au200/1.3/board.xml"
-}
-
-# Берём максимальную версию, если их несколько (репозиторий + системная).
-set BOARD_PART [lindex [lsort -decreasing $board_hits] 0]
-puts "board part: $BOARD_PART"
-
 create_project $PROJ_NAME $PROJ_DIR -part $PART -force
+
+# board_part задаём ИМЕНЕМ (строкой), а не объектом из get_board_parts,
+# полученным до create_project: такой объект принадлежит другому контексту,
+# set_property тихо не применяется, board_part остаётся пустым — и дальше
+# у DDR4 IP нет ни одного board interface (единственное допустимое значение
+# C0_*_BOARD_INTERFACE становится "Custom"), что выглядит как проблема с
+# board file, хотя дело только в способе присваивания.
 set_property board_part $BOARD_PART [current_project]
+
+if {[get_property board_part [current_project]] ne $BOARD_PART} {
+     error "board_part не применился (пусто вместо $BOARD_PART).\
+            Проверь, что $REPO_ROOT/scripts/vivado/board_files/au200/1.3/board.xml на месте."
+}
+puts "board part: [get_property board_part [current_project]]"
+
+# Проверяем, что интерфейсы платы реально видны: без них DDR4 придётся
+# конфигурировать вручную (~150 пинов + параметры чипа), и лучше узнать об этом
+# здесь, а не по невнятной ошибке DDR4 IP.
+foreach need {ddr4_sdram_c3 default_300mhz_clk3} {
+     if {[llength [get_board_part_interfaces -quiet -filter "NAME == $need"]] == 0} {
+          error "board interface '$need' не найден — DDR4 не сконфигурировать из board file"
+     }
+}
 
 # Каталоги с IP: и packaged_kernel_* от make, и ip_repo, и то, что положил HLS.
 set ip_repos {}
@@ -249,16 +264,14 @@ connect_bd_net [get_bd_ports qsfp0_refclk_n] [get_bd_pins cmac_krnl_1/gt_refclk0
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:ddr4:2.2 ddr4_c3
 
-# Параметры взяты из ulp.bd — BD пользовательского региона самой платформы
-# (bd/202110_1_dev.srcs/sources_1/bd/ulp/ulp.bd в hw.xsa), то есть из дизайна,
-# который на этой плате работал. Не подобраны.
+# Всё, что описывает саму память (деталь, тип, тайминги, ~150 пинов), приходит
+# из board interface — так же, как это делает Block Automation в GUI. Своих
+# значений не подставляем: board file для au200 уже содержит верные (сверено с
+# ulp.bd платформы: MTA18ASF2G72PZ-2G3, RDIMM, 72 бита, TIMEPERIOD_PS=833).
 #
-# AxiAddressWidth здесь НЕ задаём: он выводится из объёма памяти, а
-# принудительное значение заставляет IP переконфигурироваться и добавляет
-# интерфейс C0_DDR4_S_AXI_CTRL, который потом требует подключения
-# ("A connection to the interface 'C0_DDR4_S_AXI_CTRL' is required").
-# В базовой конфигурации (проверено probe) интерфейсов ровно три:
-# C0_DDR4, C0_DDR4_S_AXI, C0_SYS_CLK.
+# Если board_part не применился, эти два параметра принимают только "Custom",
+# контроллер остаётся в конфигурации по умолчанию и требует подключить
+# C0_DDR4_S_AXI_CTRL. Поэтому board_part проверяется выше явной ошибкой.
 set_property -dict [list \
      CONFIG.C0_CLOCK_BOARD_INTERFACE {default_300mhz_clk3} \
      CONFIG.C0_DDR4_BOARD_INTERFACE {ddr4_sdram_c3} \
