@@ -248,49 +248,52 @@ connect_bd_net [get_bd_ports qsfp0_refclk_n] [get_bd_pins cmac_krnl_1/gt_refclk0
 # банк в Vitis-флоу.
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:ddr4:2.2 ddr4_c3
+
+# Параметры взяты из ulp.bd — BD пользовательского региона самой платформы
+# (bd/202110_1_dev.srcs/sources_1/bd/ulp/ulp.bd в hw.xsa), то есть из дизайна,
+# который на этой плате работал. Не подобраны.
+#
+# AxiAddressWidth здесь НЕ задаём: он выводится из объёма памяти, а
+# принудительное значение заставляет IP переконфигурироваться и добавляет
+# интерфейс C0_DDR4_S_AXI_CTRL, который потом требует подключения
+# ("A connection to the interface 'C0_DDR4_S_AXI_CTRL' is required").
+# В базовой конфигурации (проверено probe) интерфейсов ровно три:
+# C0_DDR4, C0_DDR4_S_AXI, C0_SYS_CLK.
 set_property -dict [list \
      CONFIG.C0_CLOCK_BOARD_INTERFACE {default_300mhz_clk3} \
      CONFIG.C0_DDR4_BOARD_INTERFACE {ddr4_sdram_c3} \
-     CONFIG.C0.DDR4_AxiDataWidth {512} \
-     CONFIG.C0.DDR4_AxiAddressWidth {34} \
      CONFIG.C0.DDR4_AxiSelection {true} \
+     CONFIG.C0.DDR4_AxiDataWidth {512} \
 ] [get_bd_cells ddr4_c3]
 
-# Внешние порты контроллера. CONFIG.*_BOARD_INTERFACE только указывает, ОТКУДА
-# брать пины и параметры; сами порты и их подключение — отдельный шаг, иначе
-# validate_bd_design жалуется "clock pins are not connected to a valid clock
-# source: /ddr4_c3/C0_SYS_CLK".
+# Внешние порты контроллера: CONFIG.*_BOARD_INTERFACE задаёт, ОТКУДА брать
+# пины и параметры памяти, но сами порты и их подключение — отдельный шаг
+# (иначе validate жалуется "C0_SYS_CLK is not connected to a valid clock
+# source").
 #
-# make_bd_intf_pins_external создаёт порт по образу пина и сохраняет привязку к
-# board interface, поэтому пины DDR4 (~150 штук) и sys_clk3 приходят из board
-# file — прописывать их в XDC не нужно.
-# C0_SYS_CLK — вход (Slave), C0_DDR4 — выход к чипам памяти (Master).
-foreach {pin port mode} {
-     C0_SYS_CLK   sys_clk3        Slave
-     C0_DDR4      ddr4_sdram_c3   Master
-} {
-     set ext [create_bd_intf_port -mode $mode \
-                  -vlnv [get_property VLNV [get_bd_intf_pins ddr4_c3/$pin]] $port]
-     connect_bd_intf_net $ext [get_bd_intf_pins ddr4_c3/$pin]
-}
+# make_bd_intf_pins_external сам создаёт порт нужного режима и переносит
+# привязку к board interface. Это важно: атрибут BOARD_INTERFACE живёт в
+# hdl_attributes порта, а не в CONFIG.* — попытка задать его через
+# set_property CONFIG.BOARD_INTERFACE даёт "It is read-only".
+# (В ulp.bd платформы у порта io_ddr4_00 он тоже в hdl_attributes.)
+make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_SYS_CLK]
+make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_DDR4]
 
-# Привязка портов к board interface — по ней Vivado подставит пины при
-# генерации выходных продуктов.
-set_property CONFIG.BOARD_INTERFACE {default_300mhz_clk3} [get_bd_intf_ports sys_clk3]
-set_property CONFIG.BOARD_INTERFACE {ddr4_sdram_c3}       [get_bd_intf_ports ddr4_sdram_c3]
-
-# sys_rst контроллера НЕ берём из board interface resetn: по board.xml это
-# "CPU Reset Push Button, Active Low" — физическая кнопка на пине AL20. Плата
-# стоит в корпусе, кнопку никто не нажмёт, и контроллер остался бы в сбросе.
+# sys_rst НЕ берём из board interface resetn: по board.xml это "CPU Reset Push
+# Button, Active Low" — физическая кнопка на пине AL20. Плата в корпусе, кнопку
+# никто не нажмёт, и контроллер остался бы в сбросе.
 #
-# Вместо этого держим контроллер в сбросе, пока не поднялся MMCM: сам сброс
-# отпускается по locked, дальше DDR4 калибруется самостоятельно.
-#
-# Полярность sys_rst у DDR4 IP настраиваемая; ACTIVE_LOW позволяет подключить
-# locked напрямую (locked=1 -> сброс снят), без инвертора.
-set_property CONFIG.SYSTEM_RESET_POLARITY {ACTIVE_LOW} [get_bd_cells ddr4_c3]
+# Держим контроллер в сбросе, пока не поднялся MMCM. Полярность sys_rst у
+# ddr4:2.2 фиксированная (активный ВЫСОКИЙ; параметра SYSTEM_RESET_POLARITY у
+# IP нет — проверено), поэтому locked нужно инвертировать: locked=1 -> sys_rst=0.
+create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 ddr4_rst_inv
+set_property -dict [list \
+     CONFIG.C_SIZE {1} \
+     CONFIG.C_OPERATION {not} \
+] [get_bd_cells ddr4_rst_inv]
 
-connect_bd_net [get_bd_pins clk_wiz_0/locked] [get_bd_pins ddr4_c3/sys_rst]
+connect_bd_net [get_bd_pins clk_wiz_0/locked]  [get_bd_pins ddr4_rst_inv/Op1]
+connect_bd_net [get_bd_pins ddr4_rst_inv/Res]  [get_bd_pins ddr4_c3/sys_rst]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
 
