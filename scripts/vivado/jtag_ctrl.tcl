@@ -45,22 +45,21 @@ set ::NET_OFF_AXI01_PTR 0x038
 
 # Смещения регистров hls_ouch_krnl.
 #
-# ВНИМАНИЕ: это значения по умолчанию для текущей сигнатуры ядра. HLS
-# раскладывает s_axilite-аргументы сам, и порядок в C++ НЕ определяет
-# смещения напрямую. После export_design проверить фактические значения:
+# Взяты из xhls_ouch_krnl_hw.h, который сгенерировал export_design
+# (ouch_ip_proj/sol1/impl/ip/drivers/hls_ouch_krnl_v1_0/src/) — не угаданы.
+# export_hls_ip.tcl печатает их в конце прогона; при изменении сигнатуры ядра
+# сверить заново.
 #
-#     grep -A2 "listenPort" <hls_proj>/impl/ip/hdl/verilog/*_control_s_axi.v
+# Порядок в C++ смещения НЕ задаёт: между аргументами HLS вставляет
+# ap_vld-регистры для выходных значений (0x20 для rxByteCount, 0x34 для
+# rxPacketCount), поэтому enable оказался на 0x40, а не сразу за счётчиками.
 #
-# либо в отчёте <hls_proj>/impl/ip/drivers/*/src/*_hw.h — там смещения
-# перечислены как XHLS_OUCH_KRNL_CONTROL_ADDR_*.
-#
-# Поскольку ядро ap_ctrl_none, регистра 0x000 у него нет, и первый аргумент
-# начинается с 0x010.
-set ::USR_OFF_LISTEN_PORT   0x010
-set ::USR_OFF_RX_BYTE_LO    0x018
-set ::USR_OFF_RX_BYTE_HI    0x01c
-set ::USR_OFF_RX_PKT        0x024
-set ::USR_OFF_ENABLE        0x02c
+# Ядро ap_ctrl_none, поэтому регистра ap_ctrl (0x00) у него нет вовсе.
+set ::USR_OFF_LISTEN_PORT   0x10
+set ::USR_OFF_RX_BYTE_LO    0x18
+set ::USR_OFF_RX_BYTE_HI    0x1c
+set ::USR_OFF_RX_PKT        0x30
+set ::USR_OFF_ENABLE        0x40
 
 # --- низкоуровневый доступ -----------------------------------------------------
 

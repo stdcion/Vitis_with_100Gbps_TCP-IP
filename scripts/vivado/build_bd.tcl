@@ -36,8 +36,6 @@ source "$REPO_ROOT/scripts/vivado/gen_axis_connect.tcl"
 
 # --- проект -------------------------------------------------------------------
 
-create_project $PROJ_NAME $PROJ_DIR -part $PART -force
-
 # DDR4 IP конфигурируется через board interfaces (C0_CLOCK_BOARD_INTERFACE,
 # C0_DDR4_BOARD_INTERFACE): так он сам берёт ~150 пинов DDR4 и параметры чипа
 # из board file, вместо того чтобы прописывать их вручную в XDC.
@@ -46,17 +44,24 @@ create_project $PROJ_NAME $PROJ_DIR -part $PART -force
 # поэтому сборка не зависит от того, установлены ли board files в Vivado —
 # в этой установке их нет. Файлы взяты из hw.xsa платформы
 # xilinx_u200_gen3x16_xdma_2_202110_1 (каталог board/1.3).
+#
+# ВАЖНО: repoPaths задаётся ДО create_project. После создания проекта Vivado
+# список board parts уже зафиксировал, и та же самая настройка не подхватывается
+# (проверено: в отдельном скрипте до создания проекта плата находится, после —
+# нет).
 set_param board.repoPaths [list "$REPO_ROOT/scripts/vivado/board_files"]
 
 set board_hits [get_board_parts -quiet -filter {NAME =~ *au200*}]
 if {[llength $board_hits] == 0} {
-     error "board part au200 не найден даже в $REPO_ROOT/scripts/vivado/board_files —\
+     error "board part au200 не найден в $REPO_ROOT/scripts/vivado/board_files —\
             проверь, что там лежит au200/1.3/board.xml"
 }
 
 # Берём максимальную версию, если их несколько (репозиторий + системная).
 set BOARD_PART [lindex [lsort -decreasing $board_hits] 0]
 puts "board part: $BOARD_PART"
+
+create_project $PROJ_NAME $PROJ_DIR -part $PART -force
 set_property board_part $BOARD_PART [current_project]
 
 # Каталоги с IP: и packaged_kernel_* от make, и ip_repo, и то, что положил HLS.
