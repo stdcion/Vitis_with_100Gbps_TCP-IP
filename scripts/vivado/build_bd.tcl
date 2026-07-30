@@ -46,9 +46,8 @@ foreach d [glob -nocomplain "$REPO_ROOT/packaged_kernel_*"] {
 foreach d [glob -nocomplain "$REPO_ROOT/build/ip_repo"] {
      lappend ip_repos $d
 }
-# HLS export_design кладёт IP сюда — путь зависит от того, как назван проект
-# в run_csim.tcl / скрипте синтеза.
-foreach d [glob -nocomplain "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/**/impl/ip"] {
+# IP пользовательского ядра от export_hls_ip.tcl.
+foreach d [glob -nocomplain "$REPO_ROOT/build_hls/$USER_KRNL/*/impl/ip"] {
      lappend ip_repos $d
 }
 
@@ -66,11 +65,47 @@ update_ip_catalog -rebuild
 
 create_bd_design $BD_NAME
 
-# Ядра. Имена экземпляров ДОЛЖНЫ быть <kernel>_1: под них написан
-# config_sp_*.txt, из которого генерируются соединения.
-create_bd_cell -type ip -vlnv [get_ipdefs -filter {NAME == cmac_krnl}]    cmac_krnl_1
-create_bd_cell -type ip -vlnv [get_ipdefs -filter {NAME == network_krnl}] network_krnl_1
-create_bd_cell -type ip -vlnv [get_ipdefs -filter "NAME == $USER_KRNL"]   ${USER_KRNL}_1
+# Разрешаем VLNV явно: create_bd_cell без него выдаёт лишь "Please specify
+# VLNV", по которому не понять, какого именно IP не хватает.
+proc _find_ipdef {name args} {
+     # Фактические VLNV в этом репозитории (проверено на component.xml):
+     #   xilinx.com:RTLKernel:cmac_krnl:1.0
+     #   xilinx.com:RTLKernel:network_krnl:1.0
+     # HLS-ядра при упаковке через package_*.tcl получают родовое имя
+     # "user_krnl", а не имя ядра — поэтому принимаем список альтернатив.
+     set candidates [concat [list $name] $args]
+
+     foreach cand $candidates {
+          set hits [get_ipdefs -all -filter "NAME == $cand"]
+          if {[llength $hits] == 0} {
+               set hits [get_ipdefs -all -filter "VLNV =~ *:${cand}:*"]
+          }
+          if {[llength $hits] > 0} {
+               set vlnv [lindex $hits 0]
+               puts "  $name -> $vlnv"
+               return $vlnv
+          }
+     }
+
+     puts ""
+     puts "Доступные user-IP в каталоге:"
+     foreach d [get_ipdefs -all] {
+          if {![string match "xilinx.com:ip:*" $d]} { puts "  $d" }
+     }
+     error "IP '$name' не найден (искал: $candidates). Собран ли он? См. заголовок скрипта."
+}
+
+puts ""
+puts "=== разрешение VLNV ==="
+set VLNV_CMAC [_find_ipdef cmac_krnl]
+set VLNV_NET  [_find_ipdef network_krnl]
+set VLNV_USER [_find_ipdef $USER_KRNL user_krnl]
+
+# Имена экземпляров ДОЛЖНЫ быть <kernel>_1: под них написан config_sp_*.txt,
+# из которого генерируются соединения.
+create_bd_cell -type ip -vlnv $VLNV_CMAC cmac_krnl_1
+create_bd_cell -type ip -vlnv $VLNV_NET  network_krnl_1
+create_bd_cell -type ip -vlnv $VLNV_USER ${USER_KRNL}_1
 
 # --- 18 stream-соединений из config_sp ----------------------------------------
 # Это ровно то, что v++ делал по тому же файлу.
