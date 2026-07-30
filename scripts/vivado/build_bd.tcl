@@ -67,8 +67,10 @@ foreach d [glob -nocomplain "$REPO_ROOT/packaged_kernel_*"] {
 foreach d [glob -nocomplain "$REPO_ROOT/build/ip_repo"] {
      lappend ip_repos $d
 }
-# IP пользовательского ядра от export_hls_ip.tcl.
-foreach d [glob -nocomplain "$REPO_ROOT/build_hls/$USER_KRNL/*/impl/ip"] {
+# IP пользовательского ядра от export_hls_ip.tcl. Проект лежит в каталоге
+# исходников ядра (HLS резолвит пути от каталога проекта — см. комментарий
+# в export_hls_ip.tcl).
+foreach d [glob -nocomplain "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hls/*/*/impl/ip"] {
      lappend ip_repos $d
 }
 

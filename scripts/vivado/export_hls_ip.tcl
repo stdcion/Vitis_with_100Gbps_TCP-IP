@@ -30,18 +30,20 @@ set PERIOD_NS 5.0
 
 set REPO_ROOT [file normalize [file dirname [info script]]/../..]
 set SRC_DIR   "$REPO_ROOT/kernel/user_krnl/$KRNL/src/hls"
-set PROJ_DIR  "$REPO_ROOT/build_hls"
 
-# Работаем ИЗ каталога исходников, как это делает рабочий run_csim.tcl.
+# Проект создаём В каталоге исходников и оттуда же работаем — ровно как рабочий
+# run_csim.tcl.
 #
-# Иначе HLS не находит файл: он резолвит путь относительно каталога решения, а
-# не cwd, и абсолютный путь в add_files это не спасает — в логе появляется
-# "Cannot find source file ../kernel/..." и следом "Cannot find any design unit
-# to elaborate". Проект при этом создаётся в $PROJ_DIR по абсолютному пути,
-# так что результат от смены cwd не зависит.
+# Это не косметика. HLS резолвит пути файлов относительно каталога ПРОЕКТА, а не
+# cwd. Проект в build_hls/ + файл hls_ouch_krnl.cpp давали
+# build_hls/hls_ouch_krnl/../kernel/... — мимо, отсюда "Cannot find source file"
+# и следом "Cannot find any design unit to elaborate". Абсолютный путь в
+# add_files это тоже не лечит: HLS всё равно приводит его к относительному.
+set PROJ_NAME "ouch_ip_proj"
+
 cd $SRC_DIR
 
-open_project -reset "$PROJ_DIR/$KRNL"
+open_project -reset $PROJ_NAME
 set_top $KRNL
 
 # Те же cflags, что в run_csim.tcl: communication.hpp лежит вне каталога ядра.
@@ -72,14 +74,39 @@ export_design -format ip_catalog -rtl verilog \
      -description "OUCH gateway kernel (Vivado flow, no XRT)" \
      -vendor "user" -library "kernel" -version "1.0"
 
+set IP_DIR "$SRC_DIR/$PROJ_NAME/sol1/impl/ip"
+
+if {![file isdirectory $IP_DIR]} {
+     puts "*** export_design не создал каталог IP: $IP_DIR"
+     exit 1
+}
+
 puts ""
 puts "=========================================================="
-puts "IP: $PROJ_DIR/$KRNL/sol1/impl/ip"
+puts "IP готов: $IP_DIR"
 puts ""
-puts "ТЕПЕРЬ обязательно перенеси смещения регистров в jtag_ctrl.tcl."
-puts "Они здесь:"
-puts "  grep -E 'ADDR_(LISTENPORT|ENABLE|RXBYTE|RXPACKET)' \\"
-puts "    $PROJ_DIR/$KRNL/sol1/impl/ip/drivers/*/src/*_hw.h"
+
+# Смещения регистров печатаем сразу: их всё равно нужно перенести в
+# jtag_ctrl.tcl (USR_OFF_*), а искать их потом по дереву проекта неудобно.
+# HLS назначает их сам, порядок аргументов в C++ адреса НЕ задаёт — поэтому
+# значения в jtag_ctrl.tcl без этой сверки остаются догадкой.
+set hw_headers [glob -nocomplain "$IP_DIR/drivers/*/src/*_hw.h"]
+if {[llength $hw_headers] == 0} {
+     puts "ПРЕДУПРЕЖДЕНИЕ: не найден *_hw.h — смещения регистров придётся искать вручную в"
+     puts "  $IP_DIR/hdl/verilog/*_control_s_axi.v"
+} else {
+     set hdr [lindex $hw_headers 0]
+     puts "СМЕЩЕНИЯ РЕГИСТРОВ (перенести в USR_OFF_* в scripts/vivado/jtag_ctrl.tcl):"
+     puts "  источник: $hdr"
+     puts ""
+     set fh [open $hdr r]
+     foreach line [split [read $fh] "\n"] {
+          if {[regexp -nocase {(listenport|enable|rxbyte|rxpacket|ap_ctrl)} $line]} {
+               puts "  [string trim $line]"
+          }
+     }
+     close $fh
+}
 puts "=========================================================="
 
 exit
