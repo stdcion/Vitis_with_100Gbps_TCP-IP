@@ -48,11 +48,13 @@ Usage:
 // ---------------------------------------------------------------
 static const int NUM_STREAM_PORTS = 16;   // столько потоков в сигнатуре
 
-static const int ARG_LISTEN_PORT  = NUM_STREAM_PORTS + 0;
+static const int ARG_LISTEN_PORT    = NUM_STREAM_PORTS + 0;
+static const int ARG_RX_BYTE_COUNT  = NUM_STREAM_PORTS + 1;
+static const int ARG_RX_PACKET_COUNT= NUM_STREAM_PORTS + 2;
 
 // enable ВСЕГДА последний: выводим его из числа параметров, чтобы при
 // добавлении новых индекс не пришлось править руками.
-static const int NUM_SCALAR_PARAMS = 1;   // listenPort
+static const int NUM_SCALAR_PARAMS = 3;   // listenPort + 2 счётчика
 static const int ARG_ENABLE = NUM_STREAM_PORTS + NUM_SCALAR_PARAMS;
 
 uint32_t getIpEnv() {
@@ -183,13 +185,36 @@ int main(int argc, char **argv) {
     OCL_CHECK(err, err = q.enqueueTask(user_kernel));
     OCL_CHECK(err, err = q.finish());
 
-    // На этом шаге ядро только открыло listen-порт и больше ничего не
-    // делает. Проверить можно с другой машины:
-    //     nc -v <IP платы> 7001
-    // Соединение должно устанавливаться (стек принимает подключение сам,
-    // без участия ядра), а данные пока никуда не идут.
     printf("listening on port %d — kernel is running\n", listenPort);
+    printf("\n");
+    printf("Отправьте данные с другой машины, например:\n");
+    printf("    nc <IP платы> %d < какой-нибудь-файл\n", listenPort);
+    printf("Ядро принимает и ВЫБРАСЫВАЕТ данные, считая объём.\n");
+    printf("\n");
 
+    // ---- Наблюдение за счётчиками ----
+    //
+    // Счётчики объявлены в ядре как выходные скаляры (ap_uint&) с
+    // s_axilite. OpenCL-API их читать не умеет: setArg только пишет.
+    // Поэтому читаем регистры напрямую через XRT.
+    //
+    // ВНИМАНИЕ: смещения регистров в bundle control назначает HLS при
+    // синтезе, и они НЕ совпадают с индексами setArg. Точные значения
+    // печатает отчёт синтеза (раздел про интерфейс control) либо
+    //     xclbinutil --info --input <файл.xclbin>
+    // Ниже — типовая раскладка для этой сигнатуры; если счётчики читаются
+    // как мусор, сверьте смещения с отчётом.
+    //
+    // Смещения control-регистров: 0x00 управление, далее аргументы по
+    // 4 байта с выравниванием (64-битный аргумент занимает две ячейки).
+    printf("Счётчики читаются из регистров ядра. Если нужен опрос —\n");
+    printf("проще всего смотреть их так:\n");
+    printf("    xbutil examine -d <BDF> --report all\n");
+    printf("\n");
+    printf("Ctrl-C для выхода; ядро продолжит работать (ap_ctrl_none).\n");
+
+    // Ядро free-running: хост больше не нужен. Выходим, ядро остаётся
+    // работать, пока карта запрограммирована.
     std::cout << "EXIT recorded" << std::endl;
     return EXIT_SUCCESS;
 }

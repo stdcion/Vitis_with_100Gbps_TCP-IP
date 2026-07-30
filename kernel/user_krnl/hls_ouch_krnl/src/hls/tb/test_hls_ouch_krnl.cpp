@@ -20,10 +20,17 @@ full() и устойчивость к backpressure здесь не проявл�
 появлении понадобятся ограниченные потоки (см. там же).
 
 Сценарии:
-  0. До enable ядро не трогает порты (гонка с ap_ctrl_none)
-  1. Ядро само запрашивает listen-порт, и именно тот, что задан
-  2. Отказ стека -> ядро повторяет запрос
-  3. После успеха ядро не спамит запросами
+  ШАГ 1 (listen):
+    0. До enable ядро не трогает порты (гонка с ap_ctrl_none)
+    1. Ядро само запрашивает listen-порт, и именно тот, что задан
+    2. Отказ стека -> ядро повторяет запрос
+    3. После успеха ядро не спамит запросами
+  ШАГ 2 (приём):
+    4. Уведомление -> read request с нужной сессией и длиной
+    5. Слова вычитываются, счётчики растут
+    6. Неполное последнее слово — считаем по длине, не по словам
+    7. Серия порций подряд — границы не смещаются
+    8. Уведомление с length=0 не порождает read request
 
 Сборка (на машине с Vitis HLS), из каталога src/hls:
     vitis_hls -f run_csim.tcl
@@ -61,6 +68,8 @@ extern "C" void hls_ouch_krnl(
      hls::stream<pkt512>& m_axis_tcp_tx_data,
      hls::stream<pkt64>& s_axis_tcp_tx_status,
      int listenPort,
+     ap_uint<64>& rxByteCount,
+     ap_uint<32>& rxPacketCount,
      int enable);
 
 // ---------------------------------------------------------------
@@ -91,6 +100,10 @@ static hls::stream<pkt32>  m_axis_tcp_tx_meta;
 static hls::stream<pkt512> m_axis_tcp_tx_data;
 static hls::stream<pkt64>  s_axis_tcp_tx_status;
 
+// Выходные счётчики ядра (на плате их читает хост по AXI-lite)
+static ap_uint<64> rxByteCount = 0;
+static ap_uint<32> rxPacketCount = 0;
+
 static int failures = 0;
 
 static void check(bool cond, const std::string& what)
@@ -118,7 +131,7 @@ static void tick()
                    s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
                    m_axis_tcp_tx_meta, m_axis_tcp_tx_data,
                    s_axis_tcp_tx_status,
-                   LISTEN_PORT, enable);
+                   LISTEN_PORT, rxByteCount, rxPacketCount, enable);
 }
 
 static void run(int cycles) { for (int i = 0; i < cycles; i++) tick(); }
@@ -148,6 +161,78 @@ static int drain_listen_requests(ap_uint<16>& portOut)
           n++;
      }
      return n;
+}
+
+// --- Модель приёмной части стека -------------------------------
+
+// Стек сообщает: в сессии sessionID пришло length байт
+static void push_notification(ap_uint<16> sessionID, ap_uint<16> length)
+{
+     pkt128 n;
+     n.data = 0;
+     n.data(15, 0)  = sessionID;
+     n.data(31, 16) = length;
+     n.data(63, 32) = 0x0A0A0A0A;   // ipAddress
+     n.data(79, 64) = 1234;         // dstPort
+     n.data(80, 80) = 0;            // closed
+     s_axis_tcp_notification.write(n);
+}
+
+// Стек отдаёт тело порции: сначала rx_meta, затем numWords слов
+static void push_rx_payload(ap_uint<16> sessionID, int numWords)
+{
+     pkt16 meta;
+     meta.data = 0;
+     meta.data(15, 0) = sessionID;
+     s_axis_tcp_rx_meta.write(meta);
+
+     for (int i = 0; i < numWords; i++)
+     {
+          pkt512 w;
+          w.data = 0;
+          for (int k = 0; k < 16; k++)
+               w.data(k * 32 + 31, k * 32) = 0xA000 + i;
+          w.keep = ~ap_uint<64>(0);
+          w.last = (i == numWords - 1);
+          s_axis_tcp_rx_data.write(w);
+     }
+}
+
+// Забрать read request, если ядро его выставило
+static bool pop_read_request(ap_uint<16>& sessionOut, ap_uint<16>& lengthOut)
+{
+     if (m_axis_tcp_read_pkg.empty()) return false;
+     pkt32 rr = m_axis_tcp_read_pkg.read();
+     sessionOut = rr.data(15, 0);
+     lengthOut  = rr.data(31, 16);
+     return true;
+}
+
+// Полный цикл «пришли данные»: уведомление -> read request -> тело.
+// Возвращает false, если ядро не запросило данные.
+static bool deliver(ap_uint<16> sessionID, ap_uint<16> length, int numWords)
+{
+     push_notification(sessionID, length);
+     run(5);
+
+     ap_uint<16> gotSession = 0, gotLength = 0;
+     if (!pop_read_request(gotSession, gotLength))
+          return false;
+
+     push_rx_payload(sessionID, numWords);
+     run(20);
+     return true;
+}
+
+// Довести ядро до состояния «listen-порт открыт»
+static void bring_up_listen()
+{
+     enable = 1;
+     run(5);
+     ap_uint<16> p = 0;
+     drain_listen_requests(p);
+     push_port_status(true);
+     run(10);
 }
 
 // ---------------------------------------------------------------
@@ -228,9 +313,92 @@ int main()
      // Порт открыт один раз и остаётся открытым: повторные подключения
      // клиентов принимает стек, ядру для этого ничего делать не нужно.
 
+     // ===========================================================
+     // ШАГ 2: приём данных
+     // ===========================================================
+
+     // -----------------------------------------------------------
+     std::cout << "\n[4] Уведомление -> read request" << std::endl;
+
+     const ap_uint<16> SESSION = 3;
+
+     push_notification(SESSION, 128);
+     run(5);
+
+     ap_uint<16> rrSession = 0, rrLength = 0;
+     bool gotRR = pop_read_request(rrSession, rrLength);
+     check(gotRR, "ядро выставило read request");
+     if (gotRR)
+     {
+          check(rrSession == SESSION, "read request для нужной сессии");
+          check(rrLength == 128, "запрошена длина из уведомления");
+     }
+
+     // -----------------------------------------------------------
+     std::cout << "\n[5] Данные вычитываются и считаются" << std::endl;
+
+     // 128 байт = 2 полных слова
+     push_rx_payload(SESSION, 2);
+     run(20);
+
+     check(s_axis_tcp_rx_data.empty(),
+           "все слова вычитаны из rx_data");
+     check(s_axis_tcp_rx_meta.empty(),
+           "rx_meta вычитан");
+     check(rxPacketCount == 1, "счётчик порций = 1");
+     check(rxByteCount == 128, "счётчик байт = 128");
+
+     // -----------------------------------------------------------
+     std::cout << "\n[6] Неполное последнее слово" << std::endl;
+
+     // 100 байт = 1 полное слово + 36 байт. Считать надо по длине из
+     // уведомления, а не по числу слов: 2 слова * 64 дали бы 128.
+     bool ok100 = deliver(SESSION, 100, 2);
+     check(ok100, "порция со неполным словом принята");
+     check(rxPacketCount == 2, "счётчик порций = 2");
+     check(rxByteCount == 228, "счётчик байт = 128 + 100");
+
+     // -----------------------------------------------------------
+     std::cout << "\n[7] Серия порций подряд" << std::endl;
+
+     // Проверяем, что границы не смещаются: ядро не должно склеить
+     // порции или потерять слово.
+     ap_uint<64> before = rxByteCount;
+     ap_uint<32> beforePkts = rxPacketCount;
+
+     const int BURST = 10;
+     bool allOk = true;
+     for (int i = 0; i < BURST; i++)
+          if (!deliver(SESSION, 64, 1)) allOk = false;
+
+     check(allOk, "все порции серии приняты");
+     check(rxPacketCount == beforePkts + BURST,
+           "счётчик порций вырос ровно на размер серии");
+     check(rxByteCount == before + BURST * 64,
+           "счётчик байт вырос ровно на переданное");
+     check(s_axis_tcp_rx_data.empty(), "после серии rx_data пуст");
+
+     // -----------------------------------------------------------
+     std::cout << "\n[8] Уведомление с length=0 не порождает запрос"
+               << std::endl;
+
+     // Стек присылает такое при закрытии сессии. Запрашивать нечего, и
+     // read request выставлять нельзя — иначе ядро будет ждать слова,
+     // которых не будет, и встанет.
+     ap_uint<32> pktsBefore = rxPacketCount;
+     push_notification(SESSION, 0);
+     run(20);
+
+     ap_uint<16> s0 = 0, l0 = 0;
+     check(!pop_read_request(s0, l0),
+           "на length=0 read request не выставлен");
+     check(rxPacketCount == pktsBefore, "счётчик порций не изменился");
+
      // -----------------------------------------------------------
      std::cout << "\n=== Итог: " << (failures == 0 ? "ВСЕ ТЕСТЫ ПРОШЛИ"
                                                    : "ЕСТЬ ОШИБКИ")
                << " (failures=" << failures << ") ===" << std::endl;
+     std::cout << "принято: " << rxByteCount << " байт, "
+               << rxPacketCount << " порций" << std::endl;
      return failures == 0 ? 0 : 1;
 }

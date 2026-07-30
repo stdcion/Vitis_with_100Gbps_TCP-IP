@@ -1,15 +1,21 @@
 /************************************************
 OUCH gateway kernel.
 
-СТРОИТСЯ ПОЭТАПНО. Сейчас реализован ШАГ 1 и только он:
+СТРОИТСЯ ПОЭТАПНО. Сейчас реализованы шаги 1 и 2:
 
     ШАГ 1: открыть listen-порт для входящих подключений.
+    ШАГ 2: принимать данные от клиента и ВЫБРАСЫВАТЬ их, считая
+           байты и порции (ouch_rx_notify + ouch_rx_drain).
 
-Всё остальное — приём данных, upstream-соединение к бирже,
-реассемблер SoupBinTCP, разбор OUCH — будет добавляться отдельными
-шагами. Пока эти интерфейсы объявлены (иначе сборка hw не пройдёт:
-стек требует, чтобы все его порты были подключены), но заглушены
-через tie_off_*.
+Шаг 2 ничего не разбирает — он только надёжно поглощает поток, не
+теряя границ порций. Это основа будущего реассемблера SoupBinTCP, и
+первый шаг, который можно проверить на плате: клиент подключается,
+отправляет данные, счётчики через AXI-lite растут.
+
+Всё остальное — upstream-соединение к бирже, реассемблер SoupBinTCP,
+разбор OUCH, передача — будет добавляться отдельными шагами. Пока эти
+интерфейсы объявлены (иначе сборка hw не пройдёт: стек требует, чтобы
+все его порты были подключены), но заглушены через tie_off_*.
 
 ПОЧЕМУ ВСЕ ПОРТЫ СРАЗУ. Набор портов ядра и файл config_sp жёстко
 связаны: config_sp перечисляет соединения ядра со network_krnl. Если
@@ -131,6 +137,155 @@ void ouch_listen(int enable,
 }
 
 /*
+ * ШАГ 2а: приём уведомлений от стека.
+ *
+ * Стек сообщает о событиях в сессиях через s_axis_tcp_notification:
+ *   - length != 0  -> пришли данные, надо запросить их read-request'ом;
+ *   - closed == 1  -> сессия закрыта.
+ * Одно уведомление может нести и то и другое сразу (rx_engine.cpp
+ * формирует appNotification(..., length, ..., true) при FIN с данными),
+ * поэтому это не else-if.
+ *
+ * Выставив read request, стадия сообщает следующей (sessionID, length)
+ * через FIFO — та вычитает сами слова.
+ *
+ * ПОЧЕМУ ДВЕ СТАДИИ, А НЕ ОДНА. Пока идёт длинная передача, уведомления
+ * копятся: шина rx_data одна, и следующая порция не начнётся, пока не
+ * вычитаны все слова текущей. Если совместить приём уведомлений с
+ * чтением данных в одной стадии, то на время передачи она перестанет
+ * обслуживать notification, и стек упрётся в backpressure.
+ *
+ * ПРО full(). Запись в FIFO блокирующая: если он полон, стадия встанет
+ * на write, перестанет читать notification — и приедет дедлок. Поэтому
+ * уведомление ЗАБИРАЕТСЯ из входного потока только когда оба выходных
+ * FIFO готовы принять запись. Иначе оно остаётся в потоке до следующего
+ * такта: стек применит backpressure, но ядро не встанет.
+ *
+ * ВНИМАНИЕ: в csim этот guard бесполезен — там hls::stream неограничен
+ * и full() всегда false (UG1448, Data FIFO Sizing). Проверить его можно
+ * только ограниченными потоками в тестбенче или на плате.
+ */
+void ouch_rx_notify(hls::stream<pkt128>& s_axis_tcp_notification,
+                    hls::stream<pkt32>& m_axis_tcp_read_pkg,
+                    hls::stream<ap_uint<16> >& rxSessionFifo,
+                    hls::stream<ap_uint<16> >& rxLengthFifo)
+{
+#pragma HLS PIPELINE II=1
+#pragma HLS INLINE off
+
+     if (s_axis_tcp_notification.empty())
+          return;
+
+     // Не забираем уведомление, пока не ясно, что его можно обработать
+     // без блокировки.
+     if (rxSessionFifo.full() || rxLengthFifo.full())
+          return;
+
+     pkt128 notification_pkt = s_axis_tcp_notification.read();
+     ap_uint<16> sessionID = notification_pkt.data(15, 0);
+     ap_uint<16> length    = notification_pkt.data(31, 16);
+
+     // closed (бит 80) на этом шаге не обрабатывается: пока сессия
+     // никак не запоминается, реагировать на её закрытие нечем.
+     // Появится вместе с таблицей сессий.
+
+     if (length != 0)
+     {
+          pkt32 readRequest_pkt;
+          readRequest_pkt.data = 0;
+          readRequest_pkt.data(15, 0)  = sessionID;
+          readRequest_pkt.data(31, 16) = length;
+          m_axis_tcp_read_pkg.write(readRequest_pkt);
+
+          rxSessionFifo.write(sessionID);
+          rxLengthFifo.write(length);
+     }
+}
+
+/*
+ * ШАГ 2б: вычитывает пришедшие данные и ВЫБРАСЫВАЕТ их, считая байты.
+ *
+ * На этом шаге ядро ещё ничего не разбирает — задача только в том,
+ * чтобы надёжно поглощать поток, не теряя границ порций. Это основа
+ * будущего реассемблера SoupBinTCP.
+ *
+ * ВЫБРАСЫВАТЬ ОБЯЗАТЕЛЬНО, а не игнорировать: если запросить данные
+ * read-request'ом и не вычитать их из rx_data, шина заполнится и стек
+ * встанет. Поэтому «слив» — это не заглушка, а полноценная работа.
+ *
+ * Машина состояний из двух состояний, и выйти из FORWARD на полпути
+ * НЕЛЬЗЯ: слова одной порции идут непрерывно до last, и если начать
+ * читать следующую порцию, границы сместятся.
+ */
+void ouch_rx_drain(hls::stream<pkt16>& s_axis_tcp_rx_meta,
+                   hls::stream<pkt512>& s_axis_tcp_rx_data,
+                   hls::stream<ap_uint<16> >& rxSessionFifo,
+                   hls::stream<ap_uint<16> >& rxLengthFifo,
+                   ap_uint<64>& rxByteCount,
+                   ap_uint<32>& rxPacketCount)
+{
+#pragma HLS PIPELINE II=1
+#pragma HLS INLINE off
+
+     enum drainStateType {IDLE, FORWARD};
+     static drainStateType drainState = IDLE;
+#pragma HLS RESET variable=drainState
+
+     // Счётчики — наблюдаемость на плате. Без них шаг невозможно
+     // проверить иначе как «не зависло».
+     static ap_uint<64> byteCount = 0;
+#pragma HLS RESET variable=byteCount
+     static ap_uint<32> packetCount = 0;
+#pragma HLS RESET variable=packetCount
+
+     // Длина текущей порции, обещанная уведомлением
+     static ap_uint<16> currentLength = 0;
+
+     switch (drainState)
+     {
+     case IDLE:
+          // Ждём и уведомление (через FIFO), и метаданные от стека.
+          // rx_meta приходит на каждую порцию и содержит sessionID; на
+          // этом шаге он не нужен, но вычитать его обязательно, иначе
+          // поток забьётся.
+          if (!rxSessionFifo.empty() && !rxLengthFifo.empty()
+              && !s_axis_tcp_rx_meta.empty())
+          {
+               s_axis_tcp_rx_meta.read();
+               rxSessionFifo.read();
+               currentLength = rxLengthFifo.read();
+               drainState = FORWARD;
+          }
+          break;
+
+     case FORWARD:
+          if (!s_axis_tcp_rx_data.empty())
+          {
+               pkt512 rx_word = s_axis_tcp_rx_data.read();
+
+               // HOOK: здесь появится реассемблер SoupBinTCP —
+               // rx_word.data надо будет накапливать и разбирать на
+               // сообщения. Пока слово просто отбрасывается.
+
+               if (rx_word.last)
+               {
+                    // Считаем по длине из уведомления, а не по числу
+                    // слов: последнее слово почти всегда неполное, и
+                    // wordCount * 64 дал бы завышенный результат.
+                    byteCount += currentLength;
+                    packetCount++;
+                    drainState = IDLE;
+               }
+          }
+          break;
+     }
+
+     // Публикуем наружу (AXI-lite, хост читает)
+     rxByteCount = byteCount;
+     rxPacketCount = packetCount;
+}
+
+/*
  * Тело ядра: стадии и внутренние FIFO.
  *
  * Отделено от топ-функции, потому что DATAFLOW и объявление интерфейса
@@ -139,6 +294,8 @@ void ouch_listen(int enable,
  */
 void ouch_core(int enable,
                int listenPort,
+               ap_uint<64>& rxByteCount,
+               ap_uint<32>& rxPacketCount,
                hls::stream<pkt512>& s_axis_udp_rx,
                hls::stream<pkt512>& m_axis_udp_tx,
                hls::stream<pkt256>& s_axis_udp_rx_meta,
@@ -163,23 +320,52 @@ void ouch_core(int enable,
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
+     // ---- Внутренние FIFO между стадиями ----
+     //
+     // ouch_rx_notify -> ouch_rx_drain: что за порцию ждать.
+     //
+     // Глубина с запасом: notify обслуживает уведомления каждый такт, а
+     // drain занят приёмом слов текущей порции и вычитывает следующую
+     // запись только между порциями. То есть при потоке коротких
+     // сообщений уведомления копятся. Переполнение не приводит к
+     // дедлоку (notify проверяет full() перед чтением уведомления), но
+     // лишний backpressure на стек нежелателен.
+     //
+     // Два отдельных FIFO, а не один со структурой: так проще, и это
+     // ровно та же идиома, что в gateway. Пишутся и читаются они всегда
+     // парой, поэтому рассинхрона быть не может.
+     static hls::stream<ap_uint<16> > rxSessionFifo("rxSessionFifo");
+     #pragma HLS STREAM variable=rxSessionFifo depth=512
+     static hls::stream<ap_uint<16> > rxLengthFifo("rxLengthFifo");
+     #pragma HLS STREAM variable=rxLengthFifo depth=512
+
      // ---- Стадии ----
 
      // ШАГ 1: слушаем порт
      ouch_listen(enable, listenPort,
                  m_axis_tcp_listen_port, s_axis_tcp_port_status);
 
+     // ШАГ 2а: принимаем уведомления, запрашиваем данные
+     ouch_rx_notify(s_axis_tcp_notification, m_axis_tcp_read_pkg,
+                    rxSessionFifo, rxLengthFifo);
+
+     // ШАГ 2б: вычитываем данные и выбрасываем, считая байты
+     ouch_rx_drain(s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
+                   rxSessionFifo, rxLengthFifo,
+                   rxByteCount, rxPacketCount);
+
      // ---- Пока не реализованные интерфейсы ----
      // Заглушки обязательны: неподключённый порт стека ломает сборку hw.
      // По мере добавления шагов соответствующие tie_off_* будут
      // заменяться на настоящие стадии.
+     //
+     // tie_off_tcp_rx больше НЕ нужен: notification/read_pkg/rx_meta/
+     // rx_data обслуживают стадии выше.
      tie_off_udp(s_axis_udp_rx, m_axis_udp_tx,
                  s_axis_udp_rx_meta, m_axis_udp_tx_meta);
      tie_off_tcp_open_connection(m_axis_tcp_open_connection,
                                  s_axis_tcp_open_status);
      tie_off_tcp_close_con(m_axis_tcp_close_connection);
-     tie_off_tcp_rx(s_axis_tcp_notification, m_axis_tcp_read_pkg,
-                    s_axis_tcp_rx_meta, s_axis_tcp_rx_data);
      tie_off_tcp_tx(m_axis_tcp_tx_meta, m_axis_tcp_tx_data,
                     s_axis_tcp_tx_status);
 }
@@ -226,6 +412,13 @@ void hls_ouch_krnl(
                // и ядро получит значения не в те регистры.
                int listenPort,         // порт, который слушаем
 
+               // Счётчики принятого — ВЫХОДНЫЕ, хост их читает.
+               // Единственная наблюдаемость на этом шаге: ядро данные
+               // выбрасывает, и без счётчиков «работает» не отличить от
+               // «молчит».
+               ap_uint<64>& rxByteCount,
+               ap_uint<32>& rxPacketCount,
+
                // enable ВСЕГДА ПОСЛЕДНИЙ. Хост пишет его после всех
                // остальных параметров, и это разрешение начать работу
                // (см. пояснение у ouch_listen про гонку с ap_ctrl_none).
@@ -249,11 +442,14 @@ void hls_ouch_krnl(
 #pragma HLS INTERFACE axis port = m_axis_tcp_tx_data
 #pragma HLS INTERFACE axis port = s_axis_tcp_tx_status
 #pragma HLS INTERFACE s_axilite port=listenPort bundle = control
+#pragma HLS INTERFACE s_axilite port=rxByteCount bundle = control
+#pragma HLS INTERFACE s_axilite port=rxPacketCount bundle = control
 #pragma HLS INTERFACE s_axilite port=enable bundle = control
 #pragma HLS INTERFACE ap_ctrl_none port = return
 
 // Вся логика — в ouch_core. Здесь только интерфейс.
      ouch_core(enable, listenPort,
+               rxByteCount, rxPacketCount,
                s_axis_udp_rx, m_axis_udp_tx,
                s_axis_udp_rx_meta, m_axis_udp_tx_meta,
                m_axis_tcp_listen_port, s_axis_tcp_port_status,
