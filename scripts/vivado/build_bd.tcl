@@ -251,11 +251,46 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:ddr4:2.2 ddr4_c3
 set_property -dict [list \
      CONFIG.C0_CLOCK_BOARD_INTERFACE {default_300mhz_clk3} \
      CONFIG.C0_DDR4_BOARD_INTERFACE {ddr4_sdram_c3} \
-     CONFIG.RESET_BOARD_INTERFACE {resetn} \
      CONFIG.C0.DDR4_AxiDataWidth {512} \
      CONFIG.C0.DDR4_AxiAddressWidth {34} \
      CONFIG.C0.DDR4_AxiSelection {true} \
 ] [get_bd_cells ddr4_c3]
+
+# Внешние порты контроллера. CONFIG.*_BOARD_INTERFACE только указывает, ОТКУДА
+# брать пины и параметры; сами порты и их подключение — отдельный шаг, иначе
+# validate_bd_design жалуется "clock pins are not connected to a valid clock
+# source: /ddr4_c3/C0_SYS_CLK".
+#
+# make_bd_intf_pins_external создаёт порт по образу пина и сохраняет привязку к
+# board interface, поэтому пины DDR4 (~150 штук) и sys_clk3 приходят из board
+# file — прописывать их в XDC не нужно.
+# C0_SYS_CLK — вход (Slave), C0_DDR4 — выход к чипам памяти (Master).
+foreach {pin port mode} {
+     C0_SYS_CLK   sys_clk3        Slave
+     C0_DDR4      ddr4_sdram_c3   Master
+} {
+     set ext [create_bd_intf_port -mode $mode \
+                  -vlnv [get_property VLNV [get_bd_intf_pins ddr4_c3/$pin]] $port]
+     connect_bd_intf_net $ext [get_bd_intf_pins ddr4_c3/$pin]
+}
+
+# Привязка портов к board interface — по ней Vivado подставит пины при
+# генерации выходных продуктов.
+set_property CONFIG.BOARD_INTERFACE {default_300mhz_clk3} [get_bd_intf_ports sys_clk3]
+set_property CONFIG.BOARD_INTERFACE {ddr4_sdram_c3}       [get_bd_intf_ports ddr4_sdram_c3]
+
+# sys_rst контроллера НЕ берём из board interface resetn: по board.xml это
+# "CPU Reset Push Button, Active Low" — физическая кнопка на пине AL20. Плата
+# стоит в корпусе, кнопку никто не нажмёт, и контроллер остался бы в сбросе.
+#
+# Вместо этого держим контроллер в сбросе, пока не поднялся MMCM: сам сброс
+# отпускается по locked, дальше DDR4 калибруется самостоятельно.
+#
+# Полярность sys_rst у DDR4 IP настраиваемая; ACTIVE_LOW позволяет подключить
+# locked напрямую (locked=1 -> сброс снят), без инвертора.
+set_property CONFIG.SYSTEM_RESET_POLARITY {ACTIVE_LOW} [get_bd_cells ddr4_c3]
+
+connect_bd_net [get_bd_pins clk_wiz_0/locked] [get_bd_pins ddr4_c3/sys_rst]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
 
