@@ -170,10 +170,12 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 ctrl_interconnect
 
 # Здесь всё в одном домене (jtag_axi и оба s_axi_control — на ap_clk), поэтому
 # NUM_CLKS=1. Задаём явно, чтобы не зависеть от значения по умолчанию.
+# Три мастера: network_krnl, user-ядро и ECC-регистры DDR4
+# (C0_DDR4_S_AXI_CTRL — см. секцию памяти ниже).
 set_property -dict [list \
      CONFIG.NUM_SI {1} \
-     CONFIG.NUM_MI {2} \
-     CONFIG.NUM_CLKS {1} \
+     CONFIG.NUM_MI {3} \
+     CONFIG.NUM_CLKS {2} \
 ] [get_bd_cells ctrl_interconnect]
 
 connect_bd_intf_net [get_bd_intf_pins jtag_axi_0/M_AXI] \
@@ -307,6 +309,19 @@ set_property -dict [list \
 
 connect_bd_net [get_bd_pins clk_wiz_0/locked]  [get_bd_pins ddr4_rst_inv/Op1]
 connect_bd_net [get_bd_pins ddr4_rst_inv/Res]  [get_bd_pins ddr4_c3/sys_rst]
+
+# C0_DDR4_S_AXI_CTRL — AXI-Lite для ECC-регистров контроллера. Появляется
+# штатно, потому что банк ddr4_sdram_c3 на U200 — ECC-память (в ulp.bd
+# платформы DATA_WIDTH=72, деталь MTA18ASF2G72PZ-2G3), и контроллер с ECC
+# обязан отдавать этот интерфейс. Отключать ECC не станем: XRT-сборка работала
+# с ним, а расхождение с рабочей конфигурацией — лишний источник отказа.
+#
+# Вешаем его на тот же управляющий интерконнект: ECC-статус (счётчики
+# исправленных/неисправимых ошибок) будет читаться через JTAG, как и остальные
+# регистры. Домен здесь ui_clk контроллера, отсюда NUM_CLKS=2 у ctrl_interconnect.
+connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M02_AXI] \
+                    [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI_CTRL]
+connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk] [get_bd_pins ctrl_interconnect/aclk1]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
 
