@@ -87,3 +87,23 @@ create_clock -period 3.333 -name default_300mhz_clk0 [get_ports {default_300mhz_
 
 # GT refclk объявляем как часовой вход; CMAC внутри строит из него свои домены.
 create_clock -period 6.400 -name qsfp0_refclk [get_ports {qsfp0_refclk_p}]
+
+# ==================== ресет дизайна ==========================================
+# Кнопка CPU_RESET (board.xml: "CPU Reset Push Button, Active Low"). Нужна для
+# ext_reset_in у proc_sys_reset — иначе сброс происходит только при подаче
+# питания, и после JTAG-перепрошивки логика остаётся в неопределённом состоянии.
+#
+# Пины DDR4 и её sys_clk здесь НЕ прописаны: они приходят из board interface
+# (C0_DDR4_BOARD_INTERFACE / C0_CLOCK_BOARD_INTERFACE), и дублировать их в XDC
+# нельзя — получим двойное назначение.
+
+set_property PACKAGE_PIN AL20    [get_ports {resetn}]
+set_property IOSTANDARD LVCMOS12 [get_ports {resetn}]
+
+# ==================== индикация ==============================================
+# GPIO_LED_0 = калибровка DDR4 завершена. Единственная наблюдаемость этого
+# сигнала: c0_init_calib_complete — пин, а не регистр, через JTAG его не
+# прочитать. Если светодиод не горит, разбираться со стеком бессмысленно.
+
+set_property PACKAGE_PIN BC21    [get_ports {ddr4_calib_done}]
+set_property IOSTANDARD LVCMOS12 [get_ports {ddr4_calib_done}]

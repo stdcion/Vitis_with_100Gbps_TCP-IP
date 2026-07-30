@@ -214,6 +214,18 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_gen
 connect_bd_net [get_bd_pins clk_wiz_0/clk_out1]   [get_bd_pins rst_gen/slowest_sync_clk]
 connect_bd_net [get_bd_pins clk_wiz_0/locked]     [get_bd_pins rst_gen/dcm_locked]
 
+# ext_reset_in обязателен: без него proc_sys_reset выдаёт сброс ТОЛЬКО при подаче
+# питания ("Core will generate resets only on POWER ON"). После JTAG-перепрошивки
+# логика не сбросилась бы — на отладке это выглядит как случайные залипания,
+# причину которых искать долго.
+#
+# Берём кнопку CPU_RESET с платы (board interface resetn, пин AL20, активный
+# низкий). Здесь она уместна, в отличие от sys_rst контроллера памяти: нажатие
+# кнопки — это осознанный ресет дизайна, а не условие старта.
+create_bd_port -dir I -type rst resetn
+set_property CONFIG.POLARITY {ACTIVE_LOW} [get_bd_ports resetn]
+connect_bd_net [get_bd_ports resetn] [get_bd_pins rst_gen/ext_reset_in]
+
 # ap_clk всех ядер + управляющая шина — на 250 МГц.
 foreach pin {cmac_krnl_1/ap_clk network_krnl_1/ap_clk jtag_axi_0/aclk
              ctrl_interconnect/aclk} {
@@ -291,8 +303,22 @@ set_property -dict [list \
 # hdl_attributes порта, а не в CONFIG.* — попытка задать его через
 # set_property CONFIG.BOARD_INTERFACE даёт "It is read-only".
 # (В ulp.bd платформы у порта io_ddr4_00 он тоже в hdl_attributes.)
-make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_SYS_CLK]
-make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_DDR4]
+# Имена созданных портов берём из возвращаемого значения, а не угадываем:
+# make_bd_intf_pins_external добавляет суффикс (C0_SYS_CLK_0 и т.п.).
+set port_sys_clk [make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_SYS_CLK]]
+set port_ddr4    [make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_DDR4]]
+
+# Частоту на созданном порте надо задать явно: make_bd_intf_pins_external
+# оставляет FREQ_HZ по умолчанию (100 МГц), а контроллер ждёт свои ~300.12 МГц
+# ("Clock frequency of the connected clock is 100.000000 MHz while Reference
+# Input Clock Speed is 300.120 MHz"). С неверной частотой DDR не откалибруется.
+#
+# Значение считаем из DDR4_InputClockPeriod самого IP, чтобы не разойтись с ним:
+# 300.12 МГц — не круглое число, оно следует из периода в пикосекундах.
+set ddr4_ref_ps [get_property CONFIG.C0.DDR4_InputClockPeriod [get_bd_cells ddr4_c3]]
+set ddr4_ref_hz [expr {round(1.0e12 / $ddr4_ref_ps)}]
+puts "DDR4 sys_clk: $ddr4_ref_hz Hz (период $ddr4_ref_ps пс)"
+set_property CONFIG.FREQ_HZ $ddr4_ref_hz [get_bd_intf_ports [file tail $port_sys_clk]]
 
 # sys_rst НЕ берём из board interface resetn: по board.xml это "CPU Reset Push
 # Button, Active Low" — физическая кнопка на пине AL20. Плата в корпусе, кнопку
@@ -322,6 +348,13 @@ connect_bd_net [get_bd_pins ddr4_rst_inv/Res]  [get_bd_pins ddr4_c3/sys_rst]
 connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M02_AXI] \
                     [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI_CTRL]
 connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk] [get_bd_pins ctrl_interconnect/aclk1]
+
+# Калибровка памяти на светодиод. На bring-up это главный диагностический
+# сигнал: если DDR не откалибровалась, network_krnl не сможет держать сессии, и
+# без этого индикатора "стек молчит из-за памяти" не отличить от "стек молчит
+# из-за CMAC". Читать через JTAG нельзя — это не регистр, а пин.
+create_bd_port -dir O ddr4_calib_done
+connect_bd_net [get_bd_pins ddr4_c3/c0_init_calib_complete] [get_bd_ports ddr4_calib_done]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
 
