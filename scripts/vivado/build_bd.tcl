@@ -415,11 +415,20 @@ set ADDR_USER    0x00010000
 # Сначала — автоматически всё, что не назначено (память для m0*_axi).
 assign_bd_address -quiet
 
-# Затем принудительно переназначаем control-сегменты на нужные адреса.
 set seg_net  [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
                   -filter "NAME =~ *network_krnl*"]
 set seg_user [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
                   -filter "NAME =~ *${USER_KRNL}*"]
+
+# Переназначаем в два прохода: сперва уводим оба сегмента в свободную область,
+# потом ставим на целевые адреса.
+#
+# В один проход нельзя: автораспределение раскладывает сегменты в порядке
+# обхода, и он зависит от имени ядра (для hls_echo_krnl user-сегмент попал на
+# 0x0, для hls_ouch_krnl — на 0x10000). Если целевой адрес занят другим
+# сегментом, set_property offset молча не применяется, и проверка ниже падает.
+set_property offset 0x10000000 $seg_net
+set_property offset 0x20000000 $seg_user
 
 set_property offset $ADDR_NETWORK $seg_net
 set_property offset $ADDR_USER    $seg_user
@@ -433,9 +442,13 @@ foreach seg [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data]] 
 # Проверяем, что получилось именно то, что прописано в jtag_ctrl.tcl —
 # иначе управление пойдёт не в те регистры, а на железе это выглядит как
 # "ядро не реагирует", без всякой диагностики.
-if {[get_property OFFSET $seg_net] ne $ADDR_NETWORK ||
-    [get_property OFFSET $seg_user] ne $ADDR_USER} {
-     error "адреса не совпали с ожидаемыми — сверь OUCH_BASE_* в scripts/vivado/jtag_ctrl.tcl"
+set got_net  [get_property OFFSET $seg_net]
+set got_user [get_property OFFSET $seg_user]
+if {$got_net ne $ADDR_NETWORK || $got_user ne $ADDR_USER} {
+     error "адреса не совпали: network_krnl=$got_net (ждали $ADDR_NETWORK),\
+            ${USER_KRNL}=$got_user (ждали $ADDR_USER).\
+            Либо целевой адрес занят другим сегментом, либо правь OUCH_BASE_*\
+            в scripts/vivado/jtag_ctrl.tcl под фактические значения."
 }
 puts ""
 puts "  network_krnl s_axi_control -> $ADDR_NETWORK  (OUCH_BASE_NETWORK)"
