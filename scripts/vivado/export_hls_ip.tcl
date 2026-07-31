@@ -46,7 +46,7 @@ set SRC_DIR   "$REPO_ROOT/kernel/user_krnl/$KRNL/src/hls"
 # build_hls/hls_ouch_krnl/../kernel/... — мимо, отсюда "Cannot find source file"
 # и следом "Cannot find any design unit to elaborate". Абсолютный путь в
 # add_files это тоже не лечит: HLS всё равно приводит его к относительному.
-set PROJ_NAME "ouch_ip_proj"
+set PROJ_NAME "${KRNL}_ip_proj"
 
 cd $SRC_DIR
 
