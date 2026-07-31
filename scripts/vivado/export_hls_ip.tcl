@@ -19,7 +19,10 @@
 # USR_OFF_* в scripts/vivado/jtag_ctrl.tcl.
 # -----------------------------------------------------------------------------
 
-set KRNL      "hls_ouch_krnl"
+# Имя ядра. Первым аргументом -tclargs, иначе hls_ouch_krnl:
+#     vitis_hls -f scripts/vivado/export_hls_ip.tcl -tclargs hls_echo_krnl
+set KRNL [expr {$::argc > 0 ? [lindex $::argv 0] : "hls_ouch_krnl"}]
+puts "ядро: $KRNL"
 set PART      "xcu200-fsgd2104-2-e"
 
 # 200 МГц — ровно то, с чем ядро собиралось в Vitis-флоу

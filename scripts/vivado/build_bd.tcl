@@ -30,8 +30,13 @@ set PROJ_NAME   "ouch_vivado"
 set PROJ_DIR    "./build_vivado"
 set BD_NAME     "ouch_bd"
 
-# Имя user-ядра. Меняется вместе с USER_KRNL в Makefile.
-set USER_KRNL   "hls_ouch_krnl"
+# Имя user-ядра. Первым аргументом -tclargs, иначе hls_ouch_krnl:
+#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs hls_echo_krnl
+#
+# То же имя надо передать export_hls_ip.tcl — иначе соберётся IP одного
+# ядра, а BD будет искать другое.
+set USER_KRNL [expr {$::argc > 0 ? [lindex $::argv 0] : "hls_ouch_krnl"}]
+puts "user-ядро: $USER_KRNL"
 
 set REPO_ROOT   [file normalize [file dirname [info script]]/../..]
 set CONFIG_SP   "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/config_sp_$USER_KRNL.txt"
