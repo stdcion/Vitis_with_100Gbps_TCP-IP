@@ -173,13 +173,22 @@ set_property CONFIG.PROTOCOL {2} [get_bd_cells jtag_axi_0]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 ctrl_interconnect
 
-# Здесь всё в одном домене (jtag_axi и оба s_axi_control — на ap_clk), поэтому
-# NUM_CLKS=1. Задаём явно, чтобы не зависеть от значения по умолчанию.
-# Три мастера: network_krnl, user-ядро и ECC-регистры DDR4
-# (C0_DDR4_S_AXI_CTRL — см. секцию памяти ниже).
+# У user-ядра s_axi_control есть НЕ всегда: hls_ouch_krnl объявляет
+# s_axilite-аргументы (listenPort/enable/счётчики) и получает порт, а
+# hls_echo_krnl обходится без них — порт слушания зашит константой, управлять
+# нечем. Поэтому число мастеров зависит от ядра.
+set USER_HAS_CTRL [expr {[llength [get_bd_intf_pins -quiet ${USER_KRNL}_1/s_axi_control]] > 0}]
+
+# Мастера: network_krnl, ECC-регистры DDR4 (C0_DDR4_S_AXI_CTRL, см. секцию
+# памяти ниже) и, если есть, s_axi_control user-ядра.
+set n_mi [expr {$USER_HAS_CTRL ? 3 : 2}]
+puts "ctrl_interconnect: $n_mi мастеров (user-ядро [expr {$USER_HAS_CTRL ? {со} : {без}}] s_axi_control)"
+
+# NUM_CLKS=2: управляющие порты ядер на ap_clk, ECC-регистры DDR4 — на ui_clk
+# контроллера.
 set_property -dict [list \
      CONFIG.NUM_SI {1} \
-     CONFIG.NUM_MI {3} \
+     CONFIG.NUM_MI $n_mi \
      CONFIG.NUM_CLKS {2} \
 ] [get_bd_cells ctrl_interconnect]
 
@@ -187,8 +196,10 @@ connect_bd_intf_net [get_bd_intf_pins jtag_axi_0/M_AXI] \
                     [get_bd_intf_pins ctrl_interconnect/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M00_AXI] \
                     [get_bd_intf_pins network_krnl_1/s_axi_control]
-connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M01_AXI] \
-                    [get_bd_intf_pins ${USER_KRNL}_1/s_axi_control]
+if {$USER_HAS_CTRL} {
+     connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M01_AXI] \
+                         [get_bd_intf_pins ${USER_KRNL}_1/s_axi_control]
+}
 
 # --- клоки и сбросы -----------------------------------------------------------
 #
@@ -357,7 +368,9 @@ connect_bd_net [get_bd_pins ddr4_rst_inv/Res]  [get_bd_pins ddr4_c3/sys_rst]
 # Вешаем его на тот же управляющий интерконнект: ECC-статус (счётчики
 # исправленных/неисправимых ошибок) будет читаться через JTAG, как и остальные
 # регистры. Домен здесь ui_clk контроллера, отсюда NUM_CLKS=2 у ctrl_interconnect.
-connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M02_AXI] \
+# Номер мастера зависит от того, занял ли M01 user-ядро (см. USER_HAS_CTRL).
+set mi_ddr [format "M%02d_AXI" [expr {$USER_HAS_CTRL ? 2 : 1}]]
+connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/$mi_ddr] \
                     [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI_CTRL]
 connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk] [get_bd_pins ctrl_interconnect/aclk1]
 
@@ -417,21 +430,24 @@ assign_bd_address -quiet
 
 set seg_net  [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
                   -filter "NAME =~ *network_krnl*"]
-set seg_user [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+set seg_user [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
                   -filter "NAME =~ *${USER_KRNL}*"]
 
-# Переназначаем в два прохода: сперва уводим оба сегмента в свободную область,
+# Переназначаем в два прохода: сперва уводим сегменты в свободную область,
 # потом ставим на целевые адреса.
 #
 # В один проход нельзя: автораспределение раскладывает сегменты в порядке
-# обхода, и он зависит от имени ядра (для hls_echo_krnl user-сегмент попал на
-# 0x0, для hls_ouch_krnl — на 0x10000). Если целевой адрес занят другим
+# обхода, и он зависит от состава дизайна. Если целевой адрес занят другим
 # сегментом, set_property offset молча не применяется, и проверка ниже падает.
 set_property offset 0x10000000 $seg_net
-set_property offset 0x20000000 $seg_user
+if {[llength $seg_user] > 0} {
+     set_property offset 0x20000000 $seg_user
+}
 
 set_property offset $ADDR_NETWORK $seg_net
-set_property offset $ADDR_USER    $seg_user
+if {[llength $seg_user] > 0} {
+     set_property offset $ADDR_USER $seg_user
+}
 
 puts ""
 puts "=== карта адресов ==="
@@ -442,17 +458,27 @@ foreach seg [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data]] 
 # Проверяем, что получилось именно то, что прописано в jtag_ctrl.tcl —
 # иначе управление пойдёт не в те регистры, а на железе это выглядит как
 # "ядро не реагирует", без всякой диагностики.
-set got_net  [get_property OFFSET $seg_net]
-set got_user [get_property OFFSET $seg_user]
-if {$got_net ne $ADDR_NETWORK || $got_user ne $ADDR_USER} {
-     error "адреса не совпали: network_krnl=$got_net (ждали $ADDR_NETWORK),\
-            ${USER_KRNL}=$got_user (ждали $ADDR_USER).\
-            Либо целевой адрес занят другим сегментом, либо правь OUCH_BASE_*\
-            в scripts/vivado/jtag_ctrl.tcl под фактические значения."
+set got_net [get_property OFFSET $seg_net]
+if {$got_net ne $ADDR_NETWORK} {
+     error "адрес network_krnl=$got_net, ждали $ADDR_NETWORK.\
+            Либо он занят другим сегментом, либо правь OUCH_BASE_NETWORK\
+            в scripts/vivado/jtag_ctrl.tcl."
 }
 puts ""
 puts "  network_krnl s_axi_control -> $ADDR_NETWORK  (OUCH_BASE_NETWORK)"
-puts "  ${USER_KRNL} s_axi_control -> $ADDR_USER  (OUCH_BASE_USER)"
+
+if {[llength $seg_user] > 0} {
+     set got_user [get_property OFFSET $seg_user]
+     if {$got_user ne $ADDR_USER} {
+          error "адрес ${USER_KRNL}=$got_user, ждали $ADDR_USER —\
+                 сверь OUCH_BASE_USER в scripts/vivado/jtag_ctrl.tcl."
+     }
+     puts "  ${USER_KRNL} s_axi_control -> $ADDR_USER  (OUCH_BASE_USER)"
+} else {
+     puts "  ${USER_KRNL}: без s_axi_control — управлять нечем,"
+     puts "               порт слушания зашит в ядре. Из jtag_ctrl.tcl нужны"
+     puts "               только network_configure и network_start."
+}
 
 # --- финал --------------------------------------------------------------------
 
