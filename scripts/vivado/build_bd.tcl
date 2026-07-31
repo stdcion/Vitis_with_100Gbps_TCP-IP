@@ -205,9 +205,11 @@ if {$USER_HAS_CTRL} {
 #
 # Шелл давал ap_clk (kernel clock) и free-running clock готовыми. Здесь строим
 # сами из 300 МГц входа:
-#   clk_out1 = 200 МГц — ap_clk ядер. Ровно та частота, с которой ядро
-#              собиралось в Vitis-флоу (Makefile: --kernel_frequency 200) и на
-#              которую рассчитан export_hls_ip.tcl.
+#   clk_out1 = 170 МГц — ap_clk ядер. НЕ 200 из Makefile: те 200 МГц никогда не
+#              достигались, v++ сам снижал частоту до 192.9. У нас на 5 нс вышло
+#              WNS=-0.616 (критический путь — finalize_ipv4_checksum_32 внутри
+#              network_krnl), достижимый предел ~178 МГц. Подробнее — в
+#              export_hls_ip.tcl, там же PERIOD_NS; менять надо в обоих местах.
 #   clk_out2 = 100 МГц — free-running для CMAC; в шелле это был
 #              ulp_m_aclk_freerun_ref_00 (см. ветку frc1 в post_sys_link.tcl.in).
 
@@ -216,7 +218,7 @@ set_property -dict [list \
      CONFIG.PRIM_SOURCE {Differential_clock_capable_pin} \
      CONFIG.PRIM_IN_FREQ {300.000} \
      CONFIG.CLKOUT1_USED {true} \
-     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {200.000} \
+     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {170.000} \
      CONFIG.CLKOUT2_USED {true} \
      CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {100.000} \
      CONFIG.USE_RESET {false} \
@@ -506,8 +508,12 @@ add_files -fileset constrs_1 -norecurse $slr_xdc
 
 puts ""
 puts "BD собран. Дальше:"
-puts "  launch_runs impl_1 -to_step write_bitstream -jobs 8"
+puts "  launch_runs impl_1 -to_step write_bitstream -jobs 2"
 puts "  wait_on_run impl_1"
+puts ""
+puts "  jobs=2, а не больше: на 30 ГБ памяти параллельные синтезы Vivado"
+puts "  (~3 ГБ каждый) плюс имплементация 100G-дизайна уводят машину в свап."
+puts "  Имплементация всё равно последовательная — по времени теряется мало."
 puts ""
 puts "Битстрим: $PROJ_DIR/$PROJ_NAME.runs/impl_1/${BD_NAME}_wrapper.bit"
 puts "Грузить: Hardware Manager -> Program Device (flash НЕ трогается)"

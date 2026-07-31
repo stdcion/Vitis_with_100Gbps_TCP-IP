@@ -29,11 +29,27 @@ set KRNL [expr {[info exists ::env(USER_KRNL)] ? $::env(USER_KRNL) : "hls_ouch_k
 puts "ядро: $KRNL"
 set PART      "xcu200-fsgd2104-2-e"
 
-# 200 МГц — ровно то, с чем ядро собиралось в Vitis-флоу
-# (Makefile: CLFLAGS += --kernel_frequency 200). Держим ту же частоту, чтобы
-# результат синтеза был сопоставим с рабочей сборкой; clk_wiz в build_bd.tcl
-# настроен на неё же.
-set PERIOD_NS 5.0
+# 170 МГц (5.88 нс). Число выбрано по факту, а не по Makefile.
+#
+# В Makefile стоит --kernel_frequency 200, но 200 МГц там НИКОГДА не
+# достигались: v++ при недоборе сам снижает kernel clock и продолжает сборку
+#     "timing paths failed targeting 200 MHz ... frequency is being
+#      automatically changed to 192.9 MHz"
+# то есть рабочая XRT-сборка шла на 192.9 МГц.
+#
+# Vivado так не делает: он оставляет отрицательный WNS и выдаёт битстрим с
+# нарушенным таймингом — а такой битстрим грузится и работает НЕСТАБИЛЬНО
+# (случайная порча пакетов, залипания стека). Поэтому частоту здесь надо
+# задавать заведомо достижимую.
+#
+# Оценка достижимого: на 5 нс получили WNS=-0.616, значит реальный предел
+# около 5.62 нс (~178 МГц). Критический путь — finalize_ipv4_checksum_32 внутри
+# network_krnl, HLS-логика стека. 5.88 нс даёт запас ~0.26 нс.
+# (192.9 МГц у v++ достигались, вероятно, за счёт floorplanning шелла, которого
+# в этом флоу нет.)
+#
+# clk_wiz в build_bd.tcl настроен на ту же частоту — менять в обоих местах.
+set PERIOD_NS 5.88
 
 set REPO_ROOT [file normalize [file dirname [info script]]/../..]
 set SRC_DIR   "$REPO_ROOT/kernel/user_krnl/$KRNL/src/hls"

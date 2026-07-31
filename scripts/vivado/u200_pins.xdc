@@ -78,15 +78,20 @@ set_property PACKAGE_PIN K6  [get_ports {qsfp0_gtx_n[3]}]
 # (CONFIG.C0_CLOCK_BOARD_INTERFACE), поэтому здесь их прописывать не нужно —
 # иначе получим двойное назначение.
 
-set_property PACKAGE_PIN AY37 [get_ports {default_300mhz_clk0_p}]
-set_property PACKAGE_PIN AY38 [get_ports {default_300mhz_clk0_n}]
-set_property IOSTANDARD LVDS  [get_ports {default_300mhz_clk0_p}]
-set_property IOSTANDARD LVDS  [get_ports {default_300mhz_clk0_n}]
+# Имена с суффиксом _clk_: это интерфейсный порт (diff_clock_rtl), и Vivado
+# разворачивает его в <имя>_clk_p / <имя>_clk_n. Без суффикса пины молча не
+# назначаются ("No ports matched 'default_300mhz_clk0_p'"), а MMCM остаётся без
+# входа — сверено с ouch_bd_wrapper.v.
+set_property PACKAGE_PIN AY37 [get_ports {default_300mhz_clk0_clk_p}]
+set_property PACKAGE_PIN AY38 [get_ports {default_300mhz_clk0_clk_n}]
+set_property IOSTANDARD LVDS  [get_ports {default_300mhz_clk0_clk_p}]
+set_property IOSTANDARD LVDS  [get_ports {default_300mhz_clk0_clk_n}]
 
-create_clock -period 3.333 -name default_300mhz_clk0 [get_ports {default_300mhz_clk0_p}]
+create_clock -period 3.333 -name default_300mhz_clk0 [get_ports {default_300mhz_clk0_clk_p}]
 
-# GT refclk объявляем как часовой вход; CMAC внутри строит из него свои домены.
-create_clock -period 6.400 -name qsfp0_refclk [get_ports {qsfp0_refclk_p}]
+# GT refclk НЕ объявляем: cmac_usplus_axis.xdc внутри CMAC IP уже создаёт этот
+# клок с тем же периодом 6.4 нс, и второй create_clock даёт
+# "Clock 'qsfp0_refclk' completely overrides clock 'qsfp0_refclk_p'".
 
 # ==================== ресет дизайна ==========================================
 # Кнопка CPU_RESET (board.xml: "CPU Reset Push Button, Active Low"). Нужна для

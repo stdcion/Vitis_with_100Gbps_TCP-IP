@@ -125,6 +125,31 @@ proc network_configure {ip_str mac_str {arp 1}} {
      axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]   [expr {($mac >> 32) & 0xffffffff}]
 
      axi_write32 [expr {$base + $::NET_OFF_ARP}] $arp
+
+     # Читаем обратно. Регистры ip_addr/mac_addr/arp в network_control_s_axi —
+     # обычные read/write, поэтому прочитанное значение подтверждает, что запись
+     # по JTAG дошла. Без этой проверки "стек не отвечает" не отличить от
+     # "адреса не записались".
+     set rd_ip  [axi_read32 [expr {$base + $::NET_OFF_IP_ADDR}]]
+     set rd_lo  [axi_read32 [expr {$base + $::NET_OFF_MAC_ADDR}]]
+     set rd_hi  [axi_read32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]]
+     set rd_mac [expr {($rd_hi << 32) | $rd_lo}]
+
+     puts "  прочитано:  ip=0x[format %08x $rd_ip] mac=0x[format %012x $rd_mac]"
+
+     if {$rd_ip != $ip || $rd_mac != $mac} {
+          puts "  *** ЗАПИСЬ НЕ ПОДТВЕРДИЛАСЬ — проверь OUCH_BASE_NETWORK и что"
+          puts "      устройство запрограммировано этим битстримом"
+          return 0
+     }
+     puts "  запись подтверждена"
+
+     # ВАЖНО: сами адреса стек защёлкивает не сейчас, а по фронту ap_start —
+     # в network_stack.sv это
+     #     assign set_ip_addr_valid  = ap_start_pulse;
+     #     assign set_mac_addr_valid = ap_start_pulse;
+     # Поэтому network_configure ОБЯЗАТЕЛЬНО вызывать ДО network_start.
+     return 1
 }
 
 # Буферы для TCP session tables. В Vitis это были cl::Buffer, которые XRT
