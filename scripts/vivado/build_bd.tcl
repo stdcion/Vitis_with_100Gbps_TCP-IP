@@ -303,22 +303,29 @@ set_property -dict [list \
 # hdl_attributes порта, а не в CONFIG.* — попытка задать его через
 # set_property CONFIG.BOARD_INTERFACE даёт "It is read-only".
 # (В ulp.bd платформы у порта io_ddr4_00 он тоже в hdl_attributes.)
-# Имена созданных портов берём из возвращаемого значения, а не угадываем:
-# make_bd_intf_pins_external добавляет суффикс (C0_SYS_CLK_0 и т.п.).
-set port_sys_clk [make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_SYS_CLK]]
-set port_ddr4    [make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_DDR4]]
+make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_SYS_CLK]
+make_bd_intf_pins_external [get_bd_intf_pins ddr4_c3/C0_DDR4]
 
-# Частоту на созданном порте надо задать явно: make_bd_intf_pins_external
-# оставляет FREQ_HZ по умолчанию (100 МГц), а контроллер ждёт свои ~300.12 МГц
+# Частоту на созданном порте задаём явно: make_bd_intf_pins_external оставляет
+# FREQ_HZ по умолчанию (100 МГц), а контроллер ждёт свои ~300.12 МГц
 # ("Clock frequency of the connected clock is 100.000000 MHz while Reference
 # Input Clock Speed is 300.120 MHz"). С неверной частотой DDR не откалибруется.
 #
-# Значение считаем из DDR4_InputClockPeriod самого IP, чтобы не разойтись с ним:
-# 300.12 МГц — не круглое число, оно следует из периода в пикосекундах.
+# Имя порта ищем по факту — через сеть, которой он соединён с пином C0_SYS_CLK.
+# make_bd_intf_pins_external имя не возвращает (даёт пустую строку) и добавляет
+# суффикс к имени пина, так что ни угадывать, ни брать из результата нельзя.
+set sys_clk_net [get_bd_intf_nets -of_objects [get_bd_intf_pins ddr4_c3/C0_SYS_CLK]]
+set sys_clk_port [get_bd_intf_ports -of_objects $sys_clk_net]
+if {[llength $sys_clk_port] != 1} {
+     error "не нашёл внешний порт для ddr4_c3/C0_SYS_CLK (получил: '$sys_clk_port')"
+}
+
+# Значение считаем из DDR4_InputClockPeriod самого IP: 300.12 МГц — не круглое
+# число, оно следует из периода в пикосекундах, и расхождение снова даст warning.
 set ddr4_ref_ps [get_property CONFIG.C0.DDR4_InputClockPeriod [get_bd_cells ddr4_c3]]
 set ddr4_ref_hz [expr {round(1.0e12 / $ddr4_ref_ps)}]
-puts "DDR4 sys_clk: $ddr4_ref_hz Hz (период $ddr4_ref_ps пс)"
-set_property CONFIG.FREQ_HZ $ddr4_ref_hz [get_bd_intf_ports [file tail $port_sys_clk]]
+puts "DDR4 sys_clk: порт $sys_clk_port, $ddr4_ref_hz Hz (период $ddr4_ref_ps пс)"
+set_property CONFIG.FREQ_HZ $ddr4_ref_hz $sys_clk_port
 
 # sys_rst НЕ берём из board interface resetn: по board.xml это "CPU Reset Push
 # Button, Active Low" — физическая кнопка на пине AL20. Плата в корпусе, кнопку
