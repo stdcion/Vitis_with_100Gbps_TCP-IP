@@ -481,6 +481,55 @@ for {set n 1} {$n <= $NUM_QSFP} {incr n} {
      create_bd_port -dir I ${qsfp_port}_refclk_n
      connect_bd_net [get_bd_ports ${qsfp_port}_refclk_p] [get_bd_pins cmac_krnl_$n/gt_refclk0_p]
      connect_bd_net [get_bd_ports ${qsfp_port}_refclk_n] [get_bd_pins cmac_krnl_$n/gt_refclk0_n]
+
+     # --- сайдбенд QSFP: держим трансивер во включённом состоянии -------------
+     #
+     # Без этого модуль остаётся в том состоянии, которое задают подтяжки платы,
+     # а они не описаны НИ В ОДНОМ доступном документе (UG1289 только называет
+     # сигналы, board file и официальный XDC дают пины и полярности, но не
+     # подтяжки). Симптом при неудачных подтяжках — stat_rx_aligned = 0 при
+     # полностью исправной прошивке, то есть худший вид отказа: ищешь в логике,
+     # а причина в том, что оптика выключена.
+     #
+     # LPMODE и RESETL — как в ЗАВОДСКОМ шелле (hw.xsa: board/1.3/preset.xml,
+     # преcет qsfp{0,1}_lowspeed_preset), где пины висели на axi_gpio:
+     #     C_TRI_DEFAULT  = 0xFFFFFFF8  -> биты 0..2 выходы, 3..4 входы
+     #     C_DOUT_DEFAULT = 0x00000002  -> бит1 = 1, остальные 0
+     # Соответствие бит->сигнал установлено ПО НОМЕРУ ПИНА, а не по порядку:
+     # part0_pins.xml (U200) даёт lowspeed_0..4 = BD18/BE17/BE16/BE20/BE21,
+     # официальный alveo XDC для тех же пинов даёт LPMODE/RESETL/MODSELL/
+     # MODPRSL/INTL. Оттуда же полярности («Active Low Reset output from FPGA
+     # to QSFP Module», «Active High ... low power mode (Optics Off)»).
+     #     LPMODE = 0  -> полная мощность, оптика включена
+     #     RESETL = 1  -> НЕ в сбросе
+     #
+     # MODSELL — ОТЛИЧАЕТСЯ от шелла осознанно (там 0, у нас 1).
+     #
+     # Этот сигнал на линк не влияет вовсе: он только адресует модуль на общей
+     # I2C-шине платы (её же использует сателлитный контроллер через
+     # IIC_SCL_MAIN/IIC_SDA_MAIN). В шелле 0 был осмыслен: XRT дальше читал
+     # EEPROM трансивера, и для этого модуль должен быть выбран, а gpio-дефолт
+     # там — лишь значение до вмешательства драйвера. У нас I2C-обвязки нет и
+     # не будет, значение зашито навсегда, поэтому берём пассивное 1
+     # (active low -> не выбран): держать модуль выбранным, никогда с ним не
+     # разговаривая, смысла не имеет.
+     #
+     # MODPRSL (бит3) и INTL (бит4) НЕ подключаем: в шелле они входы
+     # (TRI=1), их драйвит сам трансивер. Объявить их выходами — это два
+     # драйвера на одной линии, то есть реальная ошибка, а пользы ноль:
+     # читать их без I2C-обвязки незачем.
+     foreach {sig val} {lpmode 0 resetl 1 modsell 1} {
+          set cell "${qsfp_port}_${sig}_const"
+          create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 $cell
+          set_property -dict [list \
+               CONFIG.CONST_WIDTH {1} \
+               CONFIG.CONST_VAL   $val \
+          ] [get_bd_cells $cell]
+
+          create_bd_port -dir O ${qsfp_port}_${sig}
+          connect_bd_net [get_bd_pins $cell/dout] [get_bd_ports ${qsfp_port}_${sig}]
+     }
+     puts "  ${qsfp_port}: lpmode=0 resetl=1 (как в шелле), modsell=1 (пассивное)"
 }
 
 # --- память для TCP session tables -------------------------------------------

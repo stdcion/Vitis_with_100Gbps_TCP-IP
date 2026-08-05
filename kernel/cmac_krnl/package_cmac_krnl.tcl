@@ -191,6 +191,8 @@ if {[string compare -nocase $board "u280"] == 0} {
 
 } elseif {[string compare -nocase $board "u200"] == 0} {
 	# QSFP0 -> CMACE4_X0Y6 (X1Y48~X1Y51); QSFP1 -> CMACE4_X0Y7 (X1Y44~X1Y47).
+	# Физически: QSFP0 — ВЕРХНЯЯ клетка на планке, QSFP1 — нижняя, ближе к
+	# краевым контактам PCIe (UG1289, «QSFP28 Module Connector»).
 	# Оба квада в SLR2 (см. devices/u200/device.tcl.in) — второй порт не требует
 	# другого pblock.
 	#

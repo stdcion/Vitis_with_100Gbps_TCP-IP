@@ -67,6 +67,46 @@ set_property PACKAGE_PIN R8  [get_ports {qsfp1_gtx_n[2]}]
 set_property PACKAGE_PIN P7  [get_ports {qsfp1_gtx_p[3]}]
 set_property PACKAGE_PIN P6  [get_ports {qsfp1_gtx_n[3]}]
 
+# ==================== сайдбенд QSFP (low-speed IO) ===========================
+#
+# Три выхода на порт, которыми надо УДЕРЖИВАТЬ трансивер во включённом
+# состоянии. В XRT-шелле они висели на axi_gpio (hw.xsa: board/1.3/board.xml,
+# интерфейсы qsfp{0,1}_lowspeed, пины qsfp{N}_lowspeed_0..4); в bare-metal их
+# не драйвит никто, и модуль остаётся в состоянии подтяжек платы — а они не
+# описаны ни в UG1289, ни в board file, ни в официальном XDC. Поэтому задаём
+# явно, константами из BD (см. build_bd.tcl).
+#
+# Полярности — из официального alveo XDC (страница продукта U200/U250):
+#     LPMODE  active high -> 0 = полная мощность (оптика включена)
+#     RESETL  active low  -> 1 = не в сбросе
+#     MODSELL active low  -> 1 = НЕ выбран для I2C
+# LPMODE/RESETL совпадают с преcетом заводского шелла (hw.xsa:
+# board/1.3/preset.xml, C_TRI_DEFAULT=0xFFFFFFF8, C_DOUT_DEFAULT=0x2).
+# MODSELL у нас 1, а в шелле 0 — на линк он не влияет (только I2C-адресация),
+# и без I2C-обвязки пассивное состояние правильнее; подробности в build_bd.tcl.
+#
+# Пины сверены по ТРЁМ независимым источникам и совпадают:
+#   devices/u200/board_files/au200/1.3/part0_pins.xml (qsfp{N}_lowspeed_0..4),
+#   официальный alveo XDC, OpenNIC constr/au200/pins.xdc.
+#
+# MODPRSL (BE20 / BC19) и INTL (BE21 / AV21) СОЗНАТЕЛЬНО не заведены: это
+# входы, их драйвит трансивер (в шелле TRI=1). Объявить их выходами — два
+# драйвера на линии; читать без I2C-обвязки нечего.
+#
+# DRIVE 8 — как в part0_pins.xml. Банк 64, VCCO = VCC1V2, отсюда LVCMOS12.
+
+set_property -dict {PACKAGE_PIN BD18 IOSTANDARD LVCMOS12 DRIVE 8} [get_ports {qsfp0_lpmode}]
+set_property -dict {PACKAGE_PIN BE17 IOSTANDARD LVCMOS12 DRIVE 8} [get_ports {qsfp0_resetl}]
+set_property -dict {PACKAGE_PIN BE16 IOSTANDARD LVCMOS12 DRIVE 8} [get_ports {qsfp0_modsell}]
+
+# Как и все остальные qsfp1_*-строки в этом файле, при NUM_QSFP=1 они не найдут
+# портов: BD их не создаёт. Это даёт предупреждение и Common 17-55 на
+# set_property, но не ошибку — пины отсутствующего порта и не должны
+# назначаться. Все сборки идут с NUM_QSFP=2, где порты есть.
+set_property -dict {PACKAGE_PIN AV22 IOSTANDARD LVCMOS12 DRIVE 8} [get_ports {qsfp1_lpmode}]
+set_property -dict {PACKAGE_PIN BC18 IOSTANDARD LVCMOS12 DRIVE 8} [get_ports {qsfp1_resetl}]
+set_property -dict {PACKAGE_PIN AY20 IOSTANDARD LVCMOS12 DRIVE 8} [get_ports {qsfp1_modsell}]
+
 # ==================== free-running clock =====================================
 # В шелле cmac_krnl получал clk_gt_freerun с ulp_m_aclk_freerun_ref_00 (100 МГц,
 # см. ветку frc1 в scripts/post_sys_link.tcl.in). Здесь берём 300 МГц с пина
