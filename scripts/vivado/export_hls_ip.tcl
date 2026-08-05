@@ -27,31 +27,48 @@
 # -tclargs отсекает свои аргументы, и build_bd.tcl читает их напрямую.)
 set KRNL [expr {[info exists ::env(USER_KRNL)] ? $::env(USER_KRNL) : "hls_ouch_krnl"}]
 puts "ядро: $KRNL"
-set PART      "xcu200-fsgd2104-2-e"
 
-# 170 МГц (5.88 нс). Число выбрано по факту, а не по Makefile.
+# Плата — тоже через окружение, по той же причине.
+set BOARD [expr {[info exists ::env(BOARD)] ? $::env(BOARD) : "u200"}]
+
+set REPO_ROOT [file normalize [file dirname [info script]]/../..]
+
+# --- параметры платы ----------------------------------------------------------
 #
-# В Makefile стоит --kernel_frequency 200, но 200 МГц там НИКОГДА не
-# достигались: v++ при недоборе сам снижает kernel clock и продолжает сборку
+# Part и частота приходят из того же devices/<плата>/device.tcl, который читает
+# build_bd.tcl. Раньше период жил здесь отдельным числом (5.88) и мог разойтись
+# с CLKOUT1_REQUESTED_OUT_FREQ у clk_wiz — тогда HLS синтезировал бы под одну
+# частоту, а дизайн тактировался другой.
+#
+# Про сами 170 МГц: в Makefile стоит --kernel_frequency 200, но 200 МГц там
+# НИКОГДА не достигались — v++ при недоборе сам снижает kernel clock:
 #     "timing paths failed targeting 200 MHz ... frequency is being
 #      automatically changed to 192.9 MHz"
 # то есть рабочая XRT-сборка шла на 192.9 МГц.
 #
 # Vivado так не делает: он оставляет отрицательный WNS и выдаёт битстрим с
 # нарушенным таймингом — а такой битстрим грузится и работает НЕСТАБИЛЬНО
-# (случайная порча пакетов, залипания стека). Поэтому частоту здесь надо
-# задавать заведомо достижимую.
+# (случайная порча пакетов, залипания стека). Поэтому в device.tcl должна стоять
+# заведомо достижимая частота.
 #
 # Оценка достижимого: на 5 нс получили WNS=-0.616, значит реальный предел
 # около 5.62 нс (~178 МГц). Критический путь — finalize_ipv4_checksum_32 внутри
-# network_krnl, HLS-логика стека. 5.88 нс даёт запас ~0.26 нс.
+# network_krnl, HLS-логика стека. На 170 МГц достигнуто WNS=+0.123.
 # (192.9 МГц у v++ достигались, вероятно, за счёт floorplanning шелла, которого
 # в этом флоу нет.)
-#
-# clk_wiz в build_bd.tcl настроен на ту же частоту — менять в обоих местах.
-set PERIOD_NS 5.88
+set DEVICE_TCL "$REPO_ROOT/build/devices/$BOARD/device.tcl"
+if {![file exists $DEVICE_TCL]} {
+     puts "*** нет $DEVICE_TCL"
+     puts "    Его генерирует cmake:"
+     puts "        cd build && cmake .. -DFDEV_NAME=$BOARD -DTCP_STACK_EN=1"
+     exit 1
+}
+source $DEVICE_TCL
 
-set REPO_ROOT [file normalize [file dirname [info script]]/../..]
+set PART      $DEV_PART
+set PERIOD_NS $DEV_PERIOD_NS
+puts "плата: $BOARD ($PART), период $PERIOD_NS нс ($DEV_FREQ_MHZ МГц)"
+
 set SRC_DIR   "$REPO_ROOT/kernel/user_krnl/$KRNL/src/hls"
 
 # Проект создаём В каталоге исходников и оттуда же работаем — ровно как рабочий

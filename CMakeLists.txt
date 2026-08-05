@@ -82,4 +82,24 @@ configure_file(${CMAKE_SOURCE_DIR}/scripts/cmac_krnl_slr.txt.in ${CMAKE_SOURCE_D
 configure_file(${CMAKE_SOURCE_DIR}/scripts/post_sys_link.tcl.in ${CMAKE_SOURCE_DIR}/scripts/post_sys_link.tcl)
 configure_file(${CMAKE_SOURCE_DIR}/kernel/common/types/network_types.svh.in ${CMAKE_SOURCE_DIR}/kernel/common/types/network_types.svh)
 
+#
+# Vivado bare-metal флоу: параметры платы
+#
+# device.tcl генерируется из шаблона в devices/<плата>/, чтобы part, банк
+# памяти и SLR приходили из блока FDEV_NAME выше — то есть чтобы Vivado-флоу и
+# XRT-флоу не могли разъехаться. Всё остальное (пины, board part, refclk) в
+# CMakeLists отсутствует: в XRT-флоу это приходит из шелла платформы, а в
+# bare-metal взять негде, поэтому задано прямо в шаблоне.
+#
+# Результат кладём в build/, а не рядом с шаблоном: сгенерированные файлы не
+# должны попадать в git.
+set(DEVICE_TCL_IN ${CMAKE_SOURCE_DIR}/devices/${DEVICE_NAME}/device.tcl.in)
+if (EXISTS ${DEVICE_TCL_IN})
+    configure_file(${DEVICE_TCL_IN} ${CMAKE_BINARY_DIR}/devices/${DEVICE_NAME}/device.tcl @ONLY)
+    message(STATUS "Vivado флоу: ${CMAKE_BINARY_DIR}/devices/${DEVICE_NAME}/device.tcl")
+else()
+    message(WARNING "Нет ${DEVICE_TCL_IN} — Vivado-флоу для платы '${DEVICE_NAME}' \
+не настроен (доступен только XRT-флоу). Как добавить плату: devices/README.md")
+endif()
+
 

@@ -6,12 +6,14 @@
 # GT-порты), и управление через JTAG вместо PCIe/XRT.
 #
 # Запуск:
-#     vivado -mode batch -source scripts/vivado/build_bd.tcl
+#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs <user_krnl> [плата]
 #
 # Что должно быть готово до запуска:
-#   1. packaged_kernel_cmac_krnl_hw_*    — IP от make (Vitis-флоу его уже собрал)
-#   2. packaged_kernel_network_krnl_hw_* — то же
-#   3. IP пользовательского ядра из vitis_hls export_design -format ip_catalog
+#   1. build/devices/<плата>/device.tcl — параметры платы, генерирует cmake
+#      (cd build && cmake .. -DFDEV_NAME=u200 -DTCP_STACK_EN=1)
+#   2. packaged_kernel_cmac_krnl_hw_*    — IP от make (Vitis-флоу его уже собрал)
+#   3. packaged_kernel_network_krnl_hw_* — то же
+#   4. IP пользовательского ядра из vitis_hls export_design -format ip_catalog
 #      (Vitis-флоу его НЕ создаёт — там v++ -c делает сразу .xo)
 #
 # ВАЖНО: скрипт доводит дизайн до валидного BD с управлением по JTAG, но
@@ -20,12 +22,6 @@
 # распределение по SLR. Они помечены явно, а не оставлены молча.
 # -----------------------------------------------------------------------------
 
-set PART        "xcu200-fsgd2104-2-e"
-
-# Board part задаётся строкой: DDR4 IP берёт из него пины и параметры чипа
-# памяти. Версия 1.3 — та, что лежит в scripts/vivado/board_files (из hw.xsa
-# платформы). При обновлении board file поменять и здесь.
-set BOARD_PART  "xilinx.com:au200:part0:1.3"
 set PROJ_NAME   "ouch_vivado"
 set PROJ_DIR    "./build_vivado"
 set BD_NAME     "ouch_bd"
@@ -38,9 +34,61 @@ set BD_NAME     "ouch_bd"
 set USER_KRNL [expr {$::argc > 0 ? [lindex $::argv 0] : "hls_ouch_krnl"}]
 puts "user-ядро: $USER_KRNL"
 
+# Плата. Вторым аргументом, иначе u200.
+set BOARD [expr {$::argc > 1 ? [lindex $::argv 1] : "u200"}]
+
 set REPO_ROOT   [file normalize [file dirname [info script]]/../..]
 set CONFIG_SP   "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/config_sp_$USER_KRNL.txt"
-set PINS_XDC    "$REPO_ROOT/scripts/vivado/u200_pins.xdc"
+
+# --- параметры платы ----------------------------------------------------------
+#
+# Всё, что зависит от платы, приходит из devices/<плата>/device.tcl.in через
+# cmake: part, board part, банк памяти, SLR для CMAC, частота. Часть значений
+# cmake подставляет из блока FDEV_NAME в CMakeLists.txt, то есть реестр плат
+# один и Vivado-флоу не может разъехаться с XRT-флоу.
+#
+# Сгенерированный файл лежит в build/, а не рядом с шаблоном.
+set DEVICE_DIR "$REPO_ROOT/devices/$BOARD"
+set DEVICE_TCL "$REPO_ROOT/build/devices/$BOARD/device.tcl"
+
+if {![file exists $DEVICE_TCL]} {
+     error "нет $DEVICE_TCL\n\
+            Его генерирует cmake. Прогони:\n\
+            \    cd build && cmake .. -DFDEV_NAME=$BOARD -DTCP_STACK_EN=1\n\
+            Если платы '$BOARD' нет в devices/ — см. devices/README.md"
+}
+source $DEVICE_TCL
+
+# device.tcl обязан задать всё из этого списка. Проверяем разом, а не по факту
+# обращения: иначе неполный шаблон проявится где-нибудь в середине сборки
+# невнятной ошибкой Vivado.
+foreach v {DEV_PART DEV_BOARD_PART DEV_BOARD_DIR DEV_MEM_TYPE DEV_MEM_IF
+           DEV_MEM_CLK DEV_CMAC_SLR DEV_FREQ_MHZ DEV_PINS_XDC} {
+     if {![info exists $v]} {
+          error "device.tcl не задаёт $v — проверь devices/$BOARD/device.tcl.in"
+     }
+}
+
+# HBM (u280/u50/u55c) требует другого IP с другими портами — это отдельная
+# ветка кода, а не другое значение параметра. Лучше сказать сразу.
+if {$DEV_MEM_TYPE ne "ddr4"} {
+     error "DEV_MEM_TYPE=$DEV_MEM_TYPE не поддержан: build_bd.tcl умеет только ddr4.\
+            Для HBM нужна отдельная ветка инстанцирования памяти."
+}
+
+set PART        $DEV_PART
+set BOARD_PART  $DEV_BOARD_PART
+set PINS_XDC    "$DEVICE_DIR/$DEV_PINS_XDC"
+set BOARD_REPO  "$DEVICE_DIR/board_files"
+
+puts "плата:     $BOARD ($DEV_PART)"
+puts "память:    $DEV_MEM_IF, клок $DEV_MEM_CLK"
+puts "CMAC SLR:  $DEV_CMAC_SLR"
+puts "частота:   $DEV_FREQ_MHZ МГц"
+
+foreach f [list $PINS_XDC "$BOARD_REPO/$DEV_BOARD_DIR/board.xml"] {
+     if {![file exists $f]} { error "нет файла платы: $f" }
+}
 
 source "$REPO_ROOT/scripts/vivado/gen_axis_connect.tcl"
 
@@ -50,14 +98,13 @@ source "$REPO_ROOT/scripts/vivado/gen_axis_connect.tcl"
 # C0_DDR4_BOARD_INTERFACE): так он сам берёт ~150 пинов DDR4 и параметры чипа
 # из board file, вместо того чтобы прописывать их вручную в XDC.
 #
-# Board file лежит в репозитории (scripts/vivado/board_files/au200/1.3),
-# поэтому сборка не зависит от того, установлены ли board files в Vivado —
-# в этой установке их нет. Файлы взяты из hw.xsa платформы
-# xilinx_u200_gen3x16_xdma_2_202110_1 (каталог board/1.3).
+# Board file лежит в репозитории (devices/<плата>/board_files), поэтому сборка
+# не зависит от того, установлены ли board files в Vivado — в этой установке их
+# нет. Файлы извлечены из hw.xsa платформы; см. devices/README.md.
 #
 # repoPaths задаётся ДО create_project — иначе плата не попадёт в каталог
 # проекта.
-set_param board.repoPaths [list "$REPO_ROOT/scripts/vivado/board_files"]
+set_param board.repoPaths [list $BOARD_REPO]
 
 create_project $PROJ_NAME $PROJ_DIR -part $PART -force
 
@@ -71,14 +118,14 @@ set_property board_part $BOARD_PART [current_project]
 
 if {[get_property board_part [current_project]] ne $BOARD_PART} {
      error "board_part не применился (пусто вместо $BOARD_PART).\
-            Проверь, что $REPO_ROOT/scripts/vivado/board_files/au200/1.3/board.xml на месте."
+            Проверь, что $BOARD_REPO/$DEV_BOARD_DIR/board.xml на месте."
 }
 puts "board part: [get_property board_part [current_project]]"
 
 # Проверяем, что интерфейсы платы реально видны: без них DDR4 придётся
 # конфигурировать вручную (~150 пинов + параметры чипа), и лучше узнать об этом
 # здесь, а не по невнятной ошибке DDR4 IP.
-foreach need {ddr4_sdram_c3 default_300mhz_clk3} {
+foreach need [list $DEV_MEM_IF $DEV_MEM_CLK] {
      if {[llength [get_board_part_interfaces -quiet -filter "NAME == $need"]] == 0} {
           error "board interface '$need' не найден — DDR4 не сконфигурировать из board file"
      }
@@ -205,11 +252,12 @@ if {$USER_HAS_CTRL} {
 #
 # Шелл давал ap_clk (kernel clock) и free-running clock готовыми. Здесь строим
 # сами из 300 МГц входа:
-#   clk_out1 = 170 МГц — ap_clk ядер. НЕ 200 из Makefile: те 200 МГц никогда не
-#              достигались, v++ сам снижал частоту до 192.9. У нас на 5 нс вышло
-#              WNS=-0.616 (критический путь — finalize_ipv4_checksum_32 внутри
-#              network_krnl), достижимый предел ~178 МГц. Подробнее — в
-#              export_hls_ip.tcl, там же PERIOD_NS; менять надо в обоих местах.
+#   clk_out1 = ap_clk ядер, DEV_FREQ_MHZ из devices/<плата>/device.tcl.in.
+#              НЕ 200 из Makefile: те 200 МГц никогда не достигались, v++ сам
+#              снижал частоту до 192.9. На 5 нс вышло WNS=-0.616 (критический
+#              путь — finalize_ipv4_checksum_32 внутри network_krnl), предел
+#              ~178 МГц. export_hls_ip.tcl берёт DEV_PERIOD_NS из того же файла,
+#              так что частота задана в одном месте и разойтись не может.
 #   clk_out2 = 100 МГц — free-running для CMAC; в шелле это был
 #              ulp_m_aclk_freerun_ref_00 (см. ветку frc1 в post_sys_link.tcl.in).
 
@@ -218,7 +266,7 @@ set_property -dict [list \
      CONFIG.PRIM_SOURCE {Differential_clock_capable_pin} \
      CONFIG.PRIM_IN_FREQ {300.000} \
      CONFIG.CLKOUT1_USED {true} \
-     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {170.000} \
+     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $DEV_FREQ_MHZ \
      CONFIG.CLKOUT2_USED {true} \
      CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {100.000} \
      CONFIG.USE_RESET {false} \
@@ -283,10 +331,9 @@ connect_bd_net [get_bd_ports qsfp0_refclk_n] [get_bd_pins cmac_krnl_1/gt_refclk0
 # scripts/network_krnl_mem.txt.in; шелл предоставлял memory subsystem.
 #
 # Воспроизводим ровно то, что делала XRT-сборка, а не подбираем свой вариант.
-# CMakeLists.txt для FDEV_NAME=u200 задаёт:
-#     NETWORK_KRNL_MEM = DDR[3]      -> банк ddr4_sdram_c3
-#     CMAC_SLR         = SLR2
-# и scripts/network_krnl_mem.txt.in привязывал ОБА мастера (m00_axi и m01_axi)
+# CMakeLists.txt задаёт NETWORK_KRNL_MEM и CMAC_SLR, device.tcl переводит банк
+# в имя board interface (для u200: DDR[3] -> ddr4_sdram_c3), и
+# scripts/network_krnl_mem.txt.in привязывал ОБА мастера (m00_axi и m01_axi)
 # к одному и тому же банку. board.xml подтверждает: ddr4_sdram_c3 — 16 ГБ,
 # SLR2, тактируется от default_300mhz_clk3. То есть память и CMAC жили в одном
 # SLR — сохраняем и это.
@@ -298,15 +345,16 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:ddr4:2.2 ddr4_c3
 
 # Всё, что описывает саму память (деталь, тип, тайминги, ~150 пинов), приходит
 # из board interface — так же, как это делает Block Automation в GUI. Своих
-# значений не подставляем: board file для au200 уже содержит верные (сверено с
-# ulp.bd платформы: MTA18ASF2G72PZ-2G3, RDIMM, 72 бита, TIMEPERIOD_PS=833).
+# значений не подставляем: board file платы уже содержит верные (для u200
+# сверено с ulp.bd платформы: MTA18ASF2G72PZ-2G3, RDIMM, 72 бита,
+# TIMEPERIOD_PS=833).
 #
 # Если board_part не применился, эти два параметра принимают только "Custom",
 # контроллер остаётся в конфигурации по умолчанию и требует подключить
 # C0_DDR4_S_AXI_CTRL. Поэтому board_part проверяется выше явной ошибкой.
 set_property -dict [list \
-     CONFIG.C0_CLOCK_BOARD_INTERFACE {default_300mhz_clk3} \
-     CONFIG.C0_DDR4_BOARD_INTERFACE {ddr4_sdram_c3} \
+     CONFIG.C0_CLOCK_BOARD_INTERFACE $DEV_MEM_CLK \
+     CONFIG.C0_DDR4_BOARD_INTERFACE $DEV_MEM_IF \
      CONFIG.C0.DDR4_AxiSelection {true} \
      CONFIG.C0.DDR4_AxiDataWidth {512} \
 ] [get_bd_cells ddr4_c3]
@@ -493,15 +541,15 @@ set_property top ${BD_NAME}_wrapper [current_fileset]
 
 add_files -fileset constrs_1 -norecurse $PINS_XDC
 
-# CMAC в SLR2 — как задавал scripts/cmac_krnl_slr.txt.in в Vitis-флоу
-# (CMakeLists.txt: CMAC_SLR=SLR2 для u200). Это не косметика: GT-квады QSFP0
-# физически в SLR2, и размещение ядра в другом SLR ломает timing на GT-путях.
-# DDR4 c3 по board.xml тоже в SLR2, так что весь сетевой путь остаётся локальным.
+# CMAC в свой SLR — как задавал scripts/cmac_krnl_slr.txt.in в Vitis-флоу
+# (CMakeLists.txt: CMAC_SLR). Это не косметика: GT-квады QSFP физически в этом
+# SLR, и размещение ядра в другом ломает timing на GT-путях. Для u200 там же
+# (SLR2) сидит и DDR4 c3 по board.xml, так что весь сетевой путь локален.
 set slr_xdc "$PROJ_DIR/cmac_slr.xdc"
 set fh [open $slr_xdc w]
-puts $fh "# сгенерировано build_bd.tcl из CMAC_SLR=SLR2 (CMakeLists.txt, u200)"
+puts $fh "# сгенерировано build_bd.tcl из DEV_CMAC_SLR=$DEV_CMAC_SLR (devices/$BOARD/device.tcl)"
 puts $fh "create_pblock pblock_cmac"
-puts $fh "resize_pblock \[get_pblocks pblock_cmac\] -add {SLR2}"
+puts $fh "resize_pblock \[get_pblocks pblock_cmac\] -add {$DEV_CMAC_SLR}"
 puts $fh "add_cells_to_pblock \[get_pblocks pblock_cmac\] \[get_cells -hierarchical -filter {NAME =~ *cmac_krnl_1*}\]"
 close $fh
 add_files -fileset constrs_1 -norecurse $slr_xdc

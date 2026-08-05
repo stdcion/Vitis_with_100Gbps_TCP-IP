@@ -1,0 +1,55 @@
+# --- артефакты сборки --------------------------------------------------------
+/build/
+/build_vivado/
+/build_dir.*/
+/_x.*/
+/packaged_kernel_*/
+/tmp_kernel_pack_*/
+/cmake-build-*/
+/sd_card*/
+
+# --- генерируется cmake из шаблонов -----------------------------------------
+# Шаблоны (*.in) в git, результат — нет.
+/scripts/network_krnl_mem.txt
+/scripts/cmac_krnl_slr.txt
+/scripts/post_sys_link.tcl
+/kernel/common/types/network_types.svh
+/devices/*/device.tcl
+
+# --- HLS-проекты user-ядер ---------------------------------------------------
+# export_hls_ip.tcl создаёт проект в каталоге исходников: HLS резолвит пути
+# относительно каталога проекта, а не cwd.
+*_ip_proj/
+
+# --- Vivado / Vitis ----------------------------------------------------------
+*.jou
+*.log
+*.str
+*.wdb
+*.wcfg
+.Xil/
+vivado_pid*.str
+usage_statistics_webtalk.*
+.run/
+
+# --- Vitis HLS ---------------------------------------------------------------
+vitis_hls.log
+*.autopilot
+hls.app
+
+# --- хост --------------------------------------------------------------------
+/host/host
+emconfig.json
+
+# --- отчёты и профилирование -------------------------------------------------
+*.rpt
+*.csv
+profile_*
+system_estimate.xtxt
+TempConfig
+
+# --- IDE / OS ----------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+*.swp
