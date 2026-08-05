@@ -6,10 +6,22 @@
 # GT-порты), и управление через JTAG вместо PCIe/XRT.
 #
 # Запуск (проще через make, см. Makefile.vivado):
-#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs <user_krnl> <плата>
+#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs <user_krnl> <плата> [num_qsfp]
 #
-# Оба аргумента ОБЯЗАТЕЛЬНЫ. Дефолтов нет намеренно: забытый аргумент собирал бы
-# не то ядро молча, а следом шла бы часовая имплементация.
+# Первые два аргумента ОБЯЗАТЕЛЬНЫ. Дефолтов нет намеренно: забытый аргумент
+# собирал бы не то ядро молча, а следом шла бы часовая имплементация.
+# Третий аргумент (num_qsfp, по умолчанию 2) — сколько независимых каналов
+# cmac_krnl/network_krnl инстанцировать (QSFP0, QSFP1, ...).
+#
+# USER_KRNL инстанцируется в одном из двух режимов, определяется автоматически
+# по наличию kernel/user_krnl/<user_krnl>/config_sp_<user_krnl>_dual.txt:
+#   - per-port (файла нет): N экземпляров ${USER_KRNL}_1..N, по одному на
+#     каждый network_krnl_N — независимые каналы без связи между собой
+#     (hls_echo_krnl, iperf_krnl, ...);
+#   - dual (файл есть): РОВНО ОДИН экземпляр ${USER_KRNL}_1 с портами _a/_b,
+#     подключёнными к network_krnl_1 и network_krnl_2 — для ядер, которым
+#     нужно видеть оба канала сразу (relay/gateway между портами). Требует
+#     NUM_QSFP>=2.
 #
 # Что должно быть готово до запуска:
 #   1. build/devices/<плата>/device.tcl — параметры платы, генерирует cmake
@@ -38,8 +50,37 @@ if {$::argc < 2} {
 set USER_KRNL [lindex $::argv 0]
 set BOARD     [lindex $::argv 1]
 
+# Сколько независимых QSFP+CMAC+network_krnl+USER_KRNL каналов собирать.
+# Дефолт 2 — конечная цель дизайна (двупортовый гейтвей), см. заголовок Makefile.vivado.
+# NUM_QSFP=1 воспроизводит старое поведение (только QSFP0).
+set NUM_QSFP 2
+if {$::argc >= 3} {
+     set NUM_QSFP [lindex $::argv 2]
+}
+if {$NUM_QSFP != 1 && $NUM_QSFP != 2} {
+     error "NUM_QSFP=$NUM_QSFP не поддержан: package_cmac_krnl.tcl знает только\
+            координаты GT-квадов для QSFP0/QSFP1 (0..1) на u200. См. задачу\
+            расширения в kernel/cmac_krnl/package_cmac_krnl.tcl, если нужно больше."
+}
+
 set REPO_ROOT   [file normalize [file dirname [info script]]/../..]
 set CONFIG_SP   "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/config_sp_$USER_KRNL.txt"
+
+# Режим USER_KRNL определяется по наличию config_sp_<user_krnl>_dual.txt:
+#   dual (один инстанс ${USER_KRNL}_1, порты _a/_b -> оба network_krnl) —
+#     для ядер, которым нужно видеть оба канала одновременно (реальный
+#     гейтвей/relay между портами, см. dual-qsfp-gateway-architecture);
+#   per-port (N инстансов ${USER_KRNL}_1..N, как раньше) — для ядер без
+#     связи между каналами (hls_echo_krnl, iperf_krnl и т.п.), а также
+#     единственный вариант, поддерживающий NUM_QSFP=1.
+set CONFIG_SP_DUAL "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/config_sp_${USER_KRNL}_dual.txt"
+set USER_KRNL_DUAL [file exists $CONFIG_SP_DUAL]
+
+if {$USER_KRNL_DUAL && $NUM_QSFP < 2} {
+     error "$USER_KRNL — dual-ядро (найден $CONFIG_SP_DUAL), а NUM_QSFP=$NUM_QSFP.\
+            Dual-ядру нужны оба network_krnl (порты _a/_b) — собери с NUM_QSFP>=2\
+            либо используй per-port ядро для отладки одного линка."
+}
 
 # Артефакты — по плате и ядру: .bit жёстко привязан к part, а HLS-IP ядра ещё и
 # к периоду. Без разделения сборка под другую плату затирала бы предыдущую, и в
@@ -210,18 +251,39 @@ set VLNV_CMAC [_find_ipdef cmac_krnl]
 set VLNV_NET  [_find_ipdef network_krnl]
 set VLNV_USER [_find_ipdef $USER_KRNL user_krnl]
 
-# Имена экземпляров ДОЛЖНЫ быть <kernel>_1: под них написан config_sp_*.txt,
-# из которого генерируются соединения.
-create_bd_cell -type ip -vlnv $VLNV_CMAC cmac_krnl_1
-create_bd_cell -type ip -vlnv $VLNV_NET  network_krnl_1
-create_bd_cell -type ip -vlnv $VLNV_USER ${USER_KRNL}_1
+# cmac_krnl_N/network_krnl_N — всегда по одному на канал (N=1..NUM_QSFP).
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     create_bd_cell -type ip -vlnv $VLNV_CMAC cmac_krnl_$n
+     create_bd_cell -type ip -vlnv $VLNV_NET  network_krnl_$n
+}
 
-# --- 18 stream-соединений из config_sp ----------------------------------------
-# Это ровно то, что v++ делал по тому же файлу.
+# ${USER_KRNL} — режим зависит от USER_KRNL_DUAL (см. определение выше):
+#   dual: РОВНО ОДИН экземпляр ${USER_KRNL}_1, config_sp_..._dual.txt сам
+#         содержит sc= для обоих network_krnl (порты _a/_b на стороне ядра).
+#   per-port: N экземпляров ${USER_KRNL}_1..N, под них написаны
+#         config_sp_${USER_KRNL}.txt (N=1) и config_sp_${USER_KRNL}_N.txt (N>=2).
+if {$USER_KRNL_DUAL} {
+     create_bd_cell -type ip -vlnv $VLNV_USER ${USER_KRNL}_1
 
-puts ""
-puts "=== AXI-Stream соединения из [file tail $CONFIG_SP] ==="
-axis_connect_from_config $CONFIG_SP
+     puts ""
+     puts "=== AXI-Stream соединения (dual) из [file tail $CONFIG_SP_DUAL] ==="
+     axis_connect_from_config $CONFIG_SP_DUAL
+} else {
+     for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+          create_bd_cell -type ip -vlnv $VLNV_USER ${USER_KRNL}_$n
+     }
+
+     for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+          if {$n == 1} {
+               set cfg $CONFIG_SP
+          } else {
+               set cfg "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/config_sp_${USER_KRNL}_$n.txt"
+          }
+          puts ""
+          puts "=== AXI-Stream соединения из [file tail $cfg] ==="
+          axis_connect_from_config $cfg
+     }
+}
 
 # --- управление: JTAG вместо PCIe/XRT ----------------------------------------
 #
@@ -236,14 +298,22 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 ctrl_interconnect
 
 # У user-ядра s_axi_control есть НЕ всегда: hls_ouch_krnl объявляет
 # s_axilite-аргументы (listenPort/enable/счётчики) и получает порт, а
-# hls_echo_krnl обходится без них — порт слушания зашит константой, управлять
-# нечем. Поэтому число мастеров зависит от ядра.
+# hls_echo_krnl/hls_dual_echo_krnl обходятся без них — порт слушания зашит
+# константой, управлять нечем. Проверяем по ${USER_KRNL}_1 — при per-port все
+# каналы инстанцированы из одного VLNV, наличие порта одинаково для всех N;
+# при dual это и есть единственный экземпляр.
 set USER_HAS_CTRL [expr {[llength [get_bd_intf_pins -quiet ${USER_KRNL}_1/s_axi_control]] > 0}]
 
-# Мастера: network_krnl, ECC-регистры DDR4 (C0_DDR4_S_AXI_CTRL, см. секцию
-# памяти ниже) и, если есть, s_axi_control user-ядра.
-set n_mi [expr {$USER_HAS_CTRL ? 3 : 2}]
-puts "ctrl_interconnect: $n_mi мастеров (user-ядро [expr {$USER_HAS_CTRL ? {со} : {без}}] s_axi_control)"
+# Сколько экземпляров ${USER_KRNL} претендуют на s_axi_control: при dual —
+# всегда 1 (единственный инстанс), при per-port — NUM_QSFP.
+set n_user_instances [expr {$USER_KRNL_DUAL ? 1 : $NUM_QSFP}]
+
+# Мастера: по network_krnl_N на каждый канал, ECC-регистры DDR4
+# (C0_DDR4_S_AXI_CTRL, см. секцию памяти ниже) и, если есть, s_axi_control
+# каждого экземпляра ${USER_KRNL}.
+set n_mi [expr {$NUM_QSFP + ($USER_HAS_CTRL ? $n_user_instances : 0) + 1}]
+puts "ctrl_interconnect: $n_mi мастеров ($NUM_QSFP x network_krnl,\
+      [expr {$USER_HAS_CTRL ? \"$n_user_instances x ${USER_KRNL}\" : \"без ${USER_KRNL}\"}] s_axi_control, DDR4 ECC)"
 
 # NUM_CLKS=2: управляющие порты ядер на ap_clk, ECC-регистры DDR4 — на ui_clk
 # контроллера.
@@ -255,12 +325,25 @@ set_property -dict [list \
 
 connect_bd_intf_net [get_bd_intf_pins jtag_axi_0/M_AXI] \
                     [get_bd_intf_pins ctrl_interconnect/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M00_AXI] \
-                    [get_bd_intf_pins network_krnl_1/s_axi_control]
-if {$USER_HAS_CTRL} {
-     connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/M01_AXI] \
-                         [get_bd_intf_pins ${USER_KRNL}_1/s_axi_control]
+
+# Мастера нумеруются по порядку: сначала все network_krnl_N, потом (если есть)
+# экземпляры ${USER_KRNL} — так адреса, которые сверяются с jtag_ctrl.tcl
+# ниже, предсказуемы и не зависят от порядка обхода BD.
+set mi_idx 0
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/[format "M%02d_AXI" $mi_idx]] \
+                         [get_bd_intf_pins network_krnl_$n/s_axi_control]
+     incr mi_idx
 }
+if {$USER_HAS_CTRL} {
+     for {set n 1} {$n <= $n_user_instances} {incr n} {
+          connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/[format "M%02d_AXI" $mi_idx]] \
+                              [get_bd_intf_pins ${USER_KRNL}_$n/s_axi_control]
+          incr mi_idx
+     }
+}
+# Оставшийся мастер (mi_idx) — DDR4 ECC, подключается в секции памяти ниже.
+set MI_DDR4_ECC $mi_idx
 
 # --- клоки и сбросы -----------------------------------------------------------
 #
@@ -306,37 +389,53 @@ create_bd_port -dir I -type rst resetn
 set_property CONFIG.POLARITY {ACTIVE_LOW} [get_bd_ports resetn]
 connect_bd_net [get_bd_ports resetn] [get_bd_pins rst_gen/ext_reset_in]
 
-# ap_clk всех ядер + управляющая шина — на 250 МГц.
-foreach pin {cmac_krnl_1/ap_clk network_krnl_1/ap_clk jtag_axi_0/aclk
-             ctrl_interconnect/aclk} {
+# ap_clk всех ядер (во всех каналах) + управляющая шина — на DEV_FREQ_MHZ.
+foreach pin {jtag_axi_0/aclk ctrl_interconnect/aclk} {
      connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] [get_bd_pins $pin]
 }
-connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] [get_bd_pins ${USER_KRNL}_1/ap_clk]
-
-foreach pin {cmac_krnl_1/ap_rst_n network_krnl_1/ap_rst_n jtag_axi_0/aresetn
-             ctrl_interconnect/aresetn} {
+foreach pin {jtag_axi_0/aresetn ctrl_interconnect/aresetn} {
      connect_bd_net [get_bd_pins rst_gen/peripheral_aresetn] [get_bd_pins $pin]
 }
-connect_bd_net [get_bd_pins rst_gen/peripheral_aresetn] [get_bd_pins ${USER_KRNL}_1/ap_rst_n]
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     # ${USER_KRNL}_$n при dual-режиме существует только для n=1 (см.
+     # n_user_instances выше) — остальные каналы дают ему клок отдельным
+     # проходом ниже не нужно, его ap_clk уже подключён на n=1.
+     set cells [list cmac_krnl_$n network_krnl_$n]
+     if {$n <= $n_user_instances} {
+          lappend cells ${USER_KRNL}_$n
+     }
+     foreach cell $cells {
+          connect_bd_net [get_bd_pins clk_wiz_0/clk_out1]             [get_bd_pins $cell/ap_clk]
+          connect_bd_net [get_bd_pins rst_gen/peripheral_aresetn]     [get_bd_pins $cell/ap_rst_n]
+     }
+     # free-running clock для CMAC — имя пина взято из scripts/post_sys_link.tcl.in,
+     # где шелл подключал к нему ulp_m_aclk_freerun_ref_00. Общий clk_wiz_0/clk_out2
+     # на все каналы — это не отдельный клок на порт, а один и тот же 100 МГц.
+     connect_bd_net [get_bd_pins clk_wiz_0/clk_out2] [get_bd_pins cmac_krnl_$n/clk_gt_freerun]
+}
 
-# free-running clock для CMAC — имя пина взято из scripts/post_sys_link.tcl.in,
-# где шелл подключал к нему ulp_m_aclk_freerun_ref_00.
-connect_bd_net [get_bd_pins clk_wiz_0/clk_out2] [get_bd_pins cmac_krnl_1/clk_gt_freerun]
-
-# --- GT / QSFP0 ---------------------------------------------------------------
+# --- GT / QSFP0, QSFP1, ... ----------------------------------------------------
 #
 # Соответствие пинов cmac_krnl и портов платформы — из post_sys_link.tcl.in,
-# ветка io_clk_gt2 (U200): io_gt_qsfp0_00 + io_clk_qsfp0_refclka_00.
-# Пины кристалла — в u200_pins.xdc.
+# ветка io_clk_gt2 (U200): io_gt_qsfp<n>_00 + io_clk_qsfp<n>_refclka_00.
+# Пины кристалла — в u200_pins.xdc (qsfp0_* и qsfp1_*).
+#
+# Индексация портов платы (qsfp0, qsfp1, ...) начинается с 0, а имена ячеек
+# BD (cmac_krnl_1, cmac_krnl_2, ...) — с 1: канал N использует физический
+# порт qsfp<N-1>, что совпадает с QSFP_IDX в package_cmac_krnl.tcl/gen_xo.tcl.
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     set qsfp_idx [expr {$n - 1}]
+     set qsfp_port "qsfp${qsfp_idx}"
 
-create_bd_intf_port -mode Master -vlnv xilinx.com:interface:gt_rtl:1.0 qsfp0
-connect_bd_intf_net [get_bd_intf_ports qsfp0] \
-                    [get_bd_intf_pins cmac_krnl_1/gt_serial_port]
+     create_bd_intf_port -mode Master -vlnv xilinx.com:interface:gt_rtl:1.0 $qsfp_port
+     connect_bd_intf_net [get_bd_intf_ports $qsfp_port] \
+                         [get_bd_intf_pins cmac_krnl_$n/gt_serial_port]
 
-create_bd_port -dir I qsfp0_refclk_p
-create_bd_port -dir I qsfp0_refclk_n
-connect_bd_net [get_bd_ports qsfp0_refclk_p] [get_bd_pins cmac_krnl_1/gt_refclk0_p]
-connect_bd_net [get_bd_ports qsfp0_refclk_n] [get_bd_pins cmac_krnl_1/gt_refclk0_n]
+     create_bd_port -dir I ${qsfp_port}_refclk_p
+     create_bd_port -dir I ${qsfp_port}_refclk_n
+     connect_bd_net [get_bd_ports ${qsfp_port}_refclk_p] [get_bd_pins cmac_krnl_$n/gt_refclk0_p]
+     connect_bd_net [get_bd_ports ${qsfp_port}_refclk_n] [get_bd_pins cmac_krnl_$n/gt_refclk0_n]
+}
 
 # --- память для TCP session tables -------------------------------------------
 #
@@ -432,8 +531,9 @@ connect_bd_net [get_bd_pins ddr4_rst_inv/Res]  [get_bd_pins ddr4_c3/sys_rst]
 # Вешаем его на тот же управляющий интерконнект: ECC-статус (счётчики
 # исправленных/неисправимых ошибок) будет читаться через JTAG, как и остальные
 # регистры. Домен здесь ui_clk контроллера, отсюда NUM_CLKS=2 у ctrl_interconnect.
-# Номер мастера зависит от того, занял ли M01 user-ядро (см. USER_HAS_CTRL).
-set mi_ddr [format "M%02d_AXI" [expr {$USER_HAS_CTRL ? 2 : 1}]]
+# Номер мастера — MI_DDR4_ECC, вычислен выше (последний, после всех
+# network_krnl_N и, если есть, всех ${USER_KRNL}_N).
+set mi_ddr [format "M%02d_AXI" $MI_DDR4_ECC]
 connect_bd_intf_net [get_bd_intf_pins ctrl_interconnect/$mi_ddr] \
                     [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI_CTRL]
 connect_bd_net [get_bd_pins ddr4_c3/c0_ddr4_ui_clk] [get_bd_pins ctrl_interconnect/aclk1]
@@ -452,16 +552,27 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 mem_interconnect
 # просто нет пина aclk1, и подключение падает с "No pins matched .../aclk1" —
 # число тактовых входов задаётся конфигурацией, а не появляется само при
 # подключении разнодоменных портов.
+#
+# NUM_SI = 2 * NUM_QSFP: оба network_krnl (session tables для TCP) делят один
+# ddr4_c3 (первая итерация, см. решение в задаче #5) — не отдельный банк на
+# канал. Каждый network_krnl_N даёт два мастера (m00_axi/m01_axi), как и при
+# одном порте.
+set n_mem_si [expr {2 * $NUM_QSFP}]
 set_property -dict [list \
-     CONFIG.NUM_SI {2} \
+     CONFIG.NUM_SI $n_mem_si \
      CONFIG.NUM_MI {1} \
      CONFIG.NUM_CLKS {2} \
 ] [get_bd_cells mem_interconnect]
 
-connect_bd_intf_net [get_bd_intf_pins network_krnl_1/m00_axi] \
-                    [get_bd_intf_pins mem_interconnect/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins network_krnl_1/m01_axi] \
-                    [get_bd_intf_pins mem_interconnect/S01_AXI]
+set si_idx 0
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     connect_bd_intf_net [get_bd_intf_pins network_krnl_$n/m00_axi] \
+                         [get_bd_intf_pins mem_interconnect/[format "S%02d_AXI" $si_idx]]
+     incr si_idx
+     connect_bd_intf_net [get_bd_intf_pins network_krnl_$n/m01_axi] \
+                         [get_bd_intf_pins mem_interconnect/[format "S%02d_AXI" $si_idx]]
+     incr si_idx
+}
 connect_bd_intf_net [get_bd_intf_pins mem_interconnect/M00_AXI] \
                     [get_bd_intf_pins ddr4_c3/C0_DDR4_S_AXI]
 
@@ -486,62 +597,76 @@ connect_bd_net [get_bd_pins rst_ddr4/peripheral_aresetn]     [get_bd_pins ddr4_c
 # расхождение здесь означает запись параметров не в те регистры, поэтому
 # фиксируем адреса и сверяем их в конце.
 
-set ADDR_NETWORK 0x00000000
-set ADDR_USER    0x00010000
+# Каждый канал N получает свою пару базовых адресов, шаг 0x10000 (размер
+# адресного пространства s_axi_control с запасом — оба ядра используют
+# считанные КБ, см. смещения в jtag_ctrl.tcl). network_krnl_N и ${USER_KRNL}_N
+# чередуются по каналам, а не блоками — так адрес по индексу N совпадает и
+# здесь, и в jtag_ctrl.tcl (OUCH_BASE_NETWORK(N)/OUCH_BASE_USER(N)):
+#   network_krnl_1 -> 0x00000000   ${USER_KRNL}_1 -> 0x00010000
+#   network_krnl_2 -> 0x00020000   ${USER_KRNL}_2 -> 0x00030000
+proc _addr_network {n} { return [expr {($n - 1) * 0x20000}] }
+proc _addr_user    {n} { return [expr {($n - 1) * 0x20000 + 0x10000}] }
 
 # Сначала — автоматически всё, что не назначено (память для m0*_axi).
 assign_bd_address -quiet
 
-set seg_net  [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
-                  -filter "NAME =~ *network_krnl*"]
-set seg_user [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
-                  -filter "NAME =~ *${USER_KRNL}*"]
-
-# Переназначаем в два прохода: сперва уводим сегменты в свободную область,
-# потом ставим на целевые адреса.
-#
-# В один проход нельзя: автораспределение раскладывает сегменты в порядке
-# обхода, и он зависит от состава дизайна. Если целевой адрес занят другим
-# сегментом, set_property offset молча не применяется, и проверка ниже падает.
-set_property offset 0x10000000 $seg_net
-if {[llength $seg_user] > 0} {
-     set_property offset 0x20000000 $seg_user
-}
-
-set_property offset $ADDR_NETWORK $seg_net
-if {[llength $seg_user] > 0} {
-     set_property offset $ADDR_USER $seg_user
-}
-
 puts ""
-puts "=== карта адресов ==="
-foreach seg [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data]] {
-     puts [format "  %-52s %s" $seg [get_property OFFSET $seg]]
-}
+puts "=== адреса s_axi_control ==="
 
-# Проверяем, что получилось именно то, что прописано в jtag_ctrl.tcl —
-# иначе управление пойдёт не в те регистры, а на железе это выглядит как
-# "ядро не реагирует", без всякой диагностики.
-set got_net [get_property OFFSET $seg_net]
-if {$got_net ne $ADDR_NETWORK} {
-     error "адрес network_krnl=$got_net, ждали $ADDR_NETWORK.\
-            Либо он занят другим сегментом, либо правь OUCH_BASE_NETWORK\
-            в scripts/vivado/jtag_ctrl.tcl."
-}
-puts ""
-puts "  network_krnl s_axi_control -> $ADDR_NETWORK  (OUCH_BASE_NETWORK)"
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     set seg_net  [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+                       -filter "NAME =~ *network_krnl_${n}*"]
+     set seg_user [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+                       -filter "NAME =~ *${USER_KRNL}_${n}*"]
 
-if {[llength $seg_user] > 0} {
-     set got_user [get_property OFFSET $seg_user]
-     if {$got_user ne $ADDR_USER} {
-          error "адрес ${USER_KRNL}=$got_user, ждали $ADDR_USER —\
-                 сверь OUCH_BASE_USER в scripts/vivado/jtag_ctrl.tcl."
+     set addr_net  [_addr_network $n]
+     set addr_user [_addr_user $n]
+
+     # Переназначаем в два прохода: сперва уводим сегмент в свободную область,
+     # потом ставим на целевой адрес.
+     #
+     # В один проход нельзя: автораспределение раскладывает сегменты в порядке
+     # обхода, и он зависит от состава дизайна. Если целевой адрес занят другим
+     # сегментом, set_property offset молча не применяется, и проверка ниже падает.
+     set_property offset [expr {0x10000000 + $n * 0x1000000}] $seg_net
+     if {[llength $seg_user] > 0} {
+          set_property offset [expr {0x20000000 + $n * 0x1000000}] $seg_user
      }
-     puts "  ${USER_KRNL} s_axi_control -> $ADDR_USER  (OUCH_BASE_USER)"
-} else {
-     puts "  ${USER_KRNL}: без s_axi_control — управлять нечем,"
-     puts "               порт слушания зашит в ядре. Из jtag_ctrl.tcl нужны"
-     puts "               только network_configure и network_start."
+
+     set_property offset $addr_net $seg_net
+     if {[llength $seg_user] > 0} {
+          set_property offset $addr_user $seg_user
+     }
+
+     # Проверяем, что получилось именно то, что прописано в jtag_ctrl.tcl —
+     # иначе управление пойдёт не в те регистры, а на железе это выглядит как
+     # "ядро не реагирует", без всякой диагностики.
+     set got_net [get_property OFFSET $seg_net]
+     if {$got_net ne $addr_net} {
+          error "адрес network_krnl_$n=$got_net, ждали $addr_net.\
+                 Либо он занят другим сегментом, либо правь OUCH_BASE_NETWORK($n)\
+                 в scripts/vivado/jtag_ctrl.tcl."
+     }
+     puts "  network_krnl_$n s_axi_control -> $addr_net"
+
+     if {[llength $seg_user] > 0} {
+          set got_user [get_property OFFSET $seg_user]
+          if {$got_user ne $addr_user} {
+               error "адрес ${USER_KRNL}_$n=$got_user, ждали $addr_user —\
+                      сверь OUCH_BASE_USER($n) в scripts/vivado/jtag_ctrl.tcl."
+          }
+          puts "  ${USER_KRNL}_$n s_axi_control -> $addr_user"
+     } elseif {$USER_KRNL_DUAL && $n > $n_user_instances} {
+          # Ожидаемо: при dual-режиме экземпляра ${USER_KRNL}_$n для n>1
+          # просто не существует (см. n_user_instances выше) — это не
+          # "ядро без s_axi_control", а "этого инстанса нет вовсе".
+          puts "  ${USER_KRNL}_$n: не инстанцирован (dual-режим — один экземпляр\
+                на оба network_krnl, см. ${USER_KRNL}_1 выше)"
+     } else {
+          puts "  ${USER_KRNL}_$n: без s_axi_control — управлять нечем,"
+          puts "               порт слушания зашит в ядре. Из jtag_ctrl.tcl нужны"
+          puts "               только network_configure и network_start."
+     }
 }
 
 # --- финал --------------------------------------------------------------------
@@ -557,14 +682,17 @@ add_files -fileset constrs_1 -norecurse $PINS_XDC
 
 # CMAC в свой SLR — как задавал scripts/cmac_krnl_slr.txt.in в Vitis-флоу
 # (CMakeLists.txt: CMAC_SLR). Это не косметика: GT-квады QSFP физически в этом
-# SLR, и размещение ядра в другом ломает timing на GT-путях. Для u200 там же
-# (SLR2) сидит и DDR4 c3 по board.xml, так что весь сетевой путь локален.
+# SLR, и размещение ядра в другом ломает timing на GT-путях. Для u200 в этом же
+# SLR2 находятся ОБА GT-квада (CMACE4_X0Y6 и CMACE4_X0Y7, см.
+# kernel/cmac_krnl/package_cmac_krnl.tcl) и DDR4 c3 по board.xml, так что весь
+# сетевой путь для каждого канала остаётся локальным — один общий pblock на
+# все cmac_krnl_N, а не по pblock-у на канал.
 set slr_xdc "$PROJ_DIR/cmac_slr.xdc"
 set fh [open $slr_xdc w]
 puts $fh "# сгенерировано build_bd.tcl из DEV_CMAC_SLR=$DEV_CMAC_SLR (devices/$BOARD/device.tcl)"
 puts $fh "create_pblock pblock_cmac"
 puts $fh "resize_pblock \[get_pblocks pblock_cmac\] -add {$DEV_CMAC_SLR}"
-puts $fh "add_cells_to_pblock \[get_pblocks pblock_cmac\] \[get_cells -hierarchical -filter {NAME =~ *cmac_krnl_1*}\]"
+puts $fh "add_cells_to_pblock \[get_pblocks pblock_cmac\] \[get_cells -hierarchical -filter {NAME =~ *cmac_krnl_*}\]"
 close $fh
 add_files -fileset constrs_1 -norecurse $slr_xdc
 

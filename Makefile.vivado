@@ -87,11 +87,13 @@ BITSTREAM = $(PROJ_DIR)/net_vivado.runs/impl_1/net_bd_wrapper.bit
 # AWS-консоль. Имплементация всё равно последовательная, теряется мало.
 JOBS ?= 2
 
-# Какой физический QSFP-разъём собирает cmac_krnl на шаге `xo` (0 = QSFP0,
-# как раньше; 1 = QSFP1). BD пока инстанцирует только один cmac_krnl —
-# `xo QSFP_IDX=1` даёт возможность собрать и проверить IP второго порта
-# отдельно, до правки build_bd.tcl под два одновременных канала.
-QSFP_IDX ?= 0
+# Сколько QSFP-портов собирать на шаге `xo` (0..NUM_QSFP-1 — GT-квады
+# CMACE4_X0Y6/X0Y7 на u200, см. kernel/cmac_krnl/package_cmac_krnl.tcl).
+# Дефолт 2: цель дизайна — двупортовый гейтвей с двумя независимыми
+# TCP-стеками, поэтому "собери всё как обычно" должно сразу давать оба .xo.
+# NUM_QSFP=1 — старое поведение (только QSFP0), пригодится, если build_bd.tcl
+# соберётся под один порт для отладки.
+NUM_QSFP ?= 2
 
 .PHONY: help list xo user_ip bd impl all clean-krnl
 
@@ -111,9 +113,9 @@ help:
 	@echo "Перед первым запуском нужен шаг 0 (cmake + make ip) — docs/building.md."
 	@echo ""
 	@echo "Переменные: USER_KRNL (обязательно), BOARD (обязательно), JOBS (по умолчанию $(JOBS)),"
-	@echo "            QSFP_IDX (по умолчанию $(QSFP_IDX)) — какой GT-квад собирает cmac_krnl на шаге xo."
-	@echo "            BD пока использует только один cmac_krnl, так что QSFP_IDX=1 сейчас только"
-	@echo "            собирает и проверяет IP второго порта, не подключает его в дизайн."
+	@echo "            NUM_QSFP (по умолчанию $(NUM_QSFP)) — сколько QSFP-портов собирает cmac_krnl"
+	@echo "            на шаге xo (0..NUM_QSFP-1). BD инстанцирует ровно столько же независимых"
+	@echo "            каналов cmac_krnl/network_krnl/USER_KRNL."
 
 # Что вообще есть и что уже собрано. Полезно, чтобы не помнить имена ядер и не
 # гадать, остался ли битстрим от прошлого раза.
@@ -164,8 +166,11 @@ xo:
 	     echo "ОШИБКА: нет build/ip_repo — не прогнан шаг 0 (make ip)"; \
 	     exit 1; \
 	fi
-	@echo "=== шаг 1: RTL-ядра, платформа $(notdir $(XPFM)), QSFP_IDX=$(QSFP_IDX) ==="
-	cd $(REPO_ROOT) && $(MAKE) cmac_krnl    DEVICE=$(XPFM) QSFP_IDX=$(QSFP_IDX)
+	@echo "=== шаг 1: RTL-ядра, платформа $(notdir $(XPFM)), NUM_QSFP=$(NUM_QSFP) ==="
+	@for i in $$(seq 0 $$(($(NUM_QSFP) - 1))); do \
+	     echo "--- cmac_krnl QSFP_IDX=$$i ---"; \
+	     $(MAKE) -C $(REPO_ROOT) cmac_krnl DEVICE=$(XPFM) QSFP_IDX=$$i || exit 1; \
+	done
 	cd $(REPO_ROOT) && $(MAKE) network_krnl DEVICE=$(XPFM)
 
 # --- шаг 2: user-ядро в IP ---------------------------------------------------
@@ -180,10 +185,10 @@ user_ip:
 bd:
 	$(need_krnl)
 	$(need_board)
-	@echo "=== шаг 3: блок-дизайн ==="
+	@echo "=== шаг 3: блок-дизайн, NUM_QSFP=$(NUM_QSFP) ==="
 	cd $(REPO_ROOT) && vivado -mode batch \
 	     -source scripts/vivado/build_bd.tcl \
-	     -tclargs $(USER_KRNL) $(BOARD)
+	     -tclargs $(USER_KRNL) $(BOARD) $(NUM_QSFP)
 
 # --- шаг 4: синтез, имплементация, битстрим ----------------------------------
 #

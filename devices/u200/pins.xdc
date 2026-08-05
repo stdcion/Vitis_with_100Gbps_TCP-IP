@@ -42,31 +42,30 @@ set_property PACKAGE_PIN K7  [get_ports {qsfp0_gtx_p[3]}]
 set_property PACKAGE_PIN K6  [get_ports {qsfp0_gtx_n[3]}]
 
 # ============================ QSFP1 ==========================================
-# Второй порт — пины наготове, но в дизайне пока не используется: для него
-# нужен второй cmac_krnl + второй network_krnl (в репозитории нет параметра
-# числа интерфейсов, config_sp описывает по одному экземпляру).
-# Раскомментировать вместе с инстанцированием второго стека.
+# Второй порт: используется при NUM_QSFP=2 (дефолт) — cmac_krnl_2/network_krnl_2
+# в build_bd.tcl. Пины идентичны QSFP0 по структуре, координаты другие
+# (GT-квад CMACE4_X0Y7, см. kernel/cmac_krnl/package_cmac_krnl.tcl).
 
-# set_property PACKAGE_PIN T11 [get_ports {qsfp1_refclk_p}]
-# set_property PACKAGE_PIN T10 [get_ports {qsfp1_refclk_n}]
-#
-# set_property PACKAGE_PIN U4  [get_ports {qsfp1_grx_p[0]}]
-# set_property PACKAGE_PIN U3  [get_ports {qsfp1_grx_n[0]}]
-# set_property PACKAGE_PIN T2  [get_ports {qsfp1_grx_p[1]}]
-# set_property PACKAGE_PIN T1  [get_ports {qsfp1_grx_n[1]}]
-# set_property PACKAGE_PIN R4  [get_ports {qsfp1_grx_p[2]}]
-# set_property PACKAGE_PIN R3  [get_ports {qsfp1_grx_n[2]}]
-# set_property PACKAGE_PIN P2  [get_ports {qsfp1_grx_p[3]}]
-# set_property PACKAGE_PIN P1  [get_ports {qsfp1_grx_n[3]}]
-#
-# set_property PACKAGE_PIN U9  [get_ports {qsfp1_gtx_p[0]}]
-# set_property PACKAGE_PIN U8  [get_ports {qsfp1_gtx_n[0]}]
-# set_property PACKAGE_PIN T7  [get_ports {qsfp1_gtx_p[1]}]
-# set_property PACKAGE_PIN T6  [get_ports {qsfp1_gtx_n[1]}]
-# set_property PACKAGE_PIN R9  [get_ports {qsfp1_gtx_p[2]}]
-# set_property PACKAGE_PIN R8  [get_ports {qsfp1_gtx_n[2]}]
-# set_property PACKAGE_PIN P7  [get_ports {qsfp1_gtx_p[3]}]
-# set_property PACKAGE_PIN P6  [get_ports {qsfp1_gtx_n[3]}]
+set_property PACKAGE_PIN T11 [get_ports {qsfp1_refclk_p}]
+set_property PACKAGE_PIN T10 [get_ports {qsfp1_refclk_n}]
+
+set_property PACKAGE_PIN U4  [get_ports {qsfp1_grx_p[0]}]
+set_property PACKAGE_PIN U3  [get_ports {qsfp1_grx_n[0]}]
+set_property PACKAGE_PIN T2  [get_ports {qsfp1_grx_p[1]}]
+set_property PACKAGE_PIN T1  [get_ports {qsfp1_grx_n[1]}]
+set_property PACKAGE_PIN R4  [get_ports {qsfp1_grx_p[2]}]
+set_property PACKAGE_PIN R3  [get_ports {qsfp1_grx_n[2]}]
+set_property PACKAGE_PIN P2  [get_ports {qsfp1_grx_p[3]}]
+set_property PACKAGE_PIN P1  [get_ports {qsfp1_grx_n[3]}]
+
+set_property PACKAGE_PIN U9  [get_ports {qsfp1_gtx_p[0]}]
+set_property PACKAGE_PIN U8  [get_ports {qsfp1_gtx_n[0]}]
+set_property PACKAGE_PIN T7  [get_ports {qsfp1_gtx_p[1]}]
+set_property PACKAGE_PIN T6  [get_ports {qsfp1_gtx_n[1]}]
+set_property PACKAGE_PIN R9  [get_ports {qsfp1_gtx_p[2]}]
+set_property PACKAGE_PIN R8  [get_ports {qsfp1_gtx_n[2]}]
+set_property PACKAGE_PIN P7  [get_ports {qsfp1_gtx_p[3]}]
+set_property PACKAGE_PIN P6  [get_ports {qsfp1_gtx_n[3]}]
 
 # ==================== free-running clock =====================================
 # В шелле cmac_krnl получал clk_gt_freerun с ulp_m_aclk_freerun_ref_00 (100 МГц,
