@@ -87,7 +87,19 @@ set_property PACKAGE_PIN AY38 [get_ports {default_300mhz_clk0_clk_n}]
 set_property IOSTANDARD LVDS  [get_ports {default_300mhz_clk0_clk_p}]
 set_property IOSTANDARD LVDS  [get_ports {default_300mhz_clk0_clk_n}]
 
-create_clock -period 3.333 -name default_300mhz_clk0 [get_ports {default_300mhz_clk0_clk_p}]
+# create_clock на этот порт НЕ ставим — по той же причине, что и для GT refclk
+# ниже: clk_wiz создаёт клок сам, из CONFIG.PRIM_IN_FREQ (300.000).
+#
+# Здесь стояло `create_clock -period 3.333 -name default_300mhz_clk0`, и это
+# давало CRITICAL WARNING [Constraints 18-1055]:
+#     Clock 'default_300mhz_clk0' completely overrides clock
+#     'default_300mhz_clk0_clk_p' ... Any constraints that refer to the
+#     overridden clock will be ignored.
+# Период совпадал (3.333 в обоих), так что MMCM видел правильные 300 МГц, и
+# сборка проходила: WNS +0.108, WHS +0.0096, 0 failed nets. Опасность не в
+# частоте, а в последней фразе — clk_wiz описывает через свой входной клок
+# производные (clk_out1 170 МГц, clk_out2 100 МГц), и его уточняющие
+# ограничения молча отбрасывались. Тайминг считался по неполной модели.
 
 # GT refclk НЕ объявляем: cmac_usplus_axis.xdc внутри CMAC IP уже создаёт этот
 # клок с тем же периодом 6.4 нс, и второй create_clock даёт

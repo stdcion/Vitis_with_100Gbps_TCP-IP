@@ -115,9 +115,24 @@ mv devices/<плата>/meta/board/<версия> \
   `default_300mhz_clk0_clk_p` / `_clk_n`. Без суффикса пины молча не
   назначаются, и получается DRC `NSTD-1`/`UCIO-1` уже на `write_bitstream`.
   Проверять по сгенерированному `*_wrapper.v`.
-- **GT refclk объявлять `create_clock` НЕ надо** — `cmac_usplus_axis.xdc`
-  внутри CMAC IP уже создаёт этот клок. Второй `create_clock` даёт
-  `completely overrides clock`.
+- **`create_clock` в `pins.xdc` не нужен вообще ни для одного клока.** Каждый
+  из них уже объявлен внутри IP, который этот клок потребляет:
+
+  | клок | кто создаёт |
+  |---|---|
+  | QSFP refclk 156.25 МГц | `cmac_usplus_axis.xdc` внутри CMAC IP |
+  | 300 МГц вход MMCM | `<bd>_clk_wiz_0_0.xdc`, из `CONFIG.PRIM_IN_FREQ` |
+
+  Второй `create_clock` на тот же порт даёт
+  `CRITICAL WARNING [Constraints 18-1055] ... completely overrides clock`.
+  **Совпадающий период не спасает:** сообщение заканчивается словами
+  `Any constraints that refer to the overridden clock will be ignored` — то
+  есть уточняющие ограничения из XDC этого IP отбрасываются, и тайминг
+  считается по неполной модели. На clk0 мы это поймали уже после того, как
+  сборка прошла с положительным WNS: частота была верная, но проверить, что
+  ничего не потеряно, невозможно.
+
+  В `pins.xdc` оставляем только `PACKAGE_PIN` и `IOSTANDARD`.
 
 ### 5. Написать device.tcl.in
 
