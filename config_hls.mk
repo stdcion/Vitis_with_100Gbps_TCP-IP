@@ -8,6 +8,8 @@ $(TEMP_DIR)/${KRNL_2}.xo: kernel/user_krnl/${KRNL_2}/src/hls/*.cpp
 	$(VPP) $(CLFLAGS) -c -k ${KRNL_2} -o $(TEMP_DIR)/${KRNL_2}.xo --input_files kernel/user_krnl/${KRNL_2}/src/hls/*.cpp
 
 
-$(TEMP_DIR)/${KRNL_3}.xo: kernel/cmac_krnl/cmac_krnl.xml kernel/cmac_krnl/package_cmac_krnl.tcl scripts/gen_xo.tcl kernel/cmac_krnl/src/hdl/*.sv
-	mkdir -p $(TEMP_DIR)
-	$(VIVADO) -mode batch -source scripts/gen_xo.tcl -tclargs $(TEMP_DIR)/${KRNL_3}.xo ${KRNL_3} $(TARGET) $(DEVICE) $(XSA) kernel/cmac_krnl/cmac_krnl.xml kernel/cmac_krnl/package_cmac_krnl.tcl
+# Правило для ${KRNL_3} (= cmac_krnl) живёт в Makefile, а не здесь: только там
+# оно умеет QSFP_IDX (7-й аргумент gen_xo.tcl и имя .xo под порт). Здесь была
+# копия без QSFP_IDX, и оба определения целили в $(TEMP_DIR)/cmac_krnl.xo —
+# make печатал "overriding recipe for target". Работало лишь потому, что
+# include (Makefile:81) идёт раньше, и побеждало правило из Makefile.

@@ -84,6 +84,42 @@ add_files -norecurse [glob $path_to_hdl/hdl/*.v $path_to_hdl/hdl/*.sv $path_to_h
 add_files -norecurse [glob $path_to_common/types/*.v $path_to_common/types/*.sv $path_to_common/types/*.svh ]
 
 set_property top cmac_krnl [current_fileset]
+
+# ВАЖНО: у каждого QSFP-порта СВОЁ имя внутреннего cmac_usplus IP.
+#
+# Vivado привязывает XDC сгенерированного IP через SCOPED_TO_REF, то есть по
+# ИМЕНИ МОДУЛЯ, а не по экземпляру. Пока оба порта создавали IP с одним именем
+# "cmac_usplus_axis", у обоих XDC получался SCOPED_TO_REF=cmac_usplus_axis, и
+# Vivado применял КАЖДЫЙ файл к ОБОИМ ячейкам этого типа. В логе impl это видно
+# как двойной парсинг: XDC из net_bd_cmac_krnl_2_0 применялся и к cmac_krnl_1,
+# и к cmac_krnl_2. Последним побеждал LOC второго порта, ставился на оба CMAC,
+# и второй в уже занятый сайт не влезал:
+#     CRITICAL WARNING [Vivado 12-2285] ... can not be placed in CMACE4 ...
+#     WARNING [Place 30-1241] A large block is missing its placement assignment
+# то есть cmac_krnl_2 оставался БЕЗ LOC и садился мимо квада QSFP1 — сборка
+# проходила зелёной, а второй порт линк не поднимал.
+#
+# Разного VLNV у обёртки (см. ~стр. 250) для этого НЕ достаточно: он развёл
+# пакеты, но внутренний IP в них оставался одноимённым.
+#
+# Порт 0 сохраняет прежнее имя — на него смотрят Vitis-флоу и cmac_krnl.xml.
+if {$qsfp_idx == 0} {
+    set cmac_ip_name "cmac_usplus_axis"
+} else {
+    set cmac_ip_name "cmac_usplus_axis_qsfp${qsfp_idx}"
+}
+puts "INFO: внутренний cmac_usplus IP: $cmac_ip_name (qsfp_idx=$qsfp_idx)"
+
+# cmac_usplus_axis_wrapper.sv инстанцирует этот IP через макрос
+# `CMAC_USPLUS_MODULE — иначе имя модуля пришлось бы генерировать в RTL.
+# Define ставится на fileset здесь, до create_ip: порядок в файле —
+# сначала исходники, потом IP.
+#
+# На sim_1 не ставим: cmac_usplus там не инстанцируется. Если понадобится —
+# ставить отдельным set_property, sources_1 симуляционным filesetом не
+# наследуется.
+set_property verilog_define "CMAC_USPLUS_MODULE=$cmac_ip_name" [current_fileset]
+
 update_compile_order -fileset sources_1
 
 set __ip_list [get_property ip_repo_paths [current_project]]
@@ -103,7 +139,10 @@ create_ip -name ethernet_frame_padding -vendor ethz.systems.fpga -library hls -v
 # Default GT reference frequency
 set gt_ref_clk 156.25
 set freerunningclock 100
-create_ip -name cmac_usplus -vendor xilinx.com -library ip -module_name cmac_usplus_axis
+
+# $cmac_ip_name — имя, зависящее от порта; задано выше, там же объяснение,
+# зачем оно вообще разное (SCOPED_TO_REF у XDC этого IP).
+create_ip -name cmac_usplus -vendor xilinx.com -library ip -module_name $cmac_ip_name
 if {[string compare -nocase $board "u280"] == 0} {
 	if {$qsfp_idx != 0} {
 		error "u280: для QSFP_IDX=$qsfp_idx координаты GT-квада не проверены — правь эту ветку осознанно, а не угадывай"
@@ -178,8 +217,8 @@ set_property -dict [list \
 	CONFIG.TX_FLOW_CONTROL             {0} \
 	CONFIG.RX_FLOW_CONTROL             {0} \
 	CONFIG.ENABLE_PIPELINE_REG         {1} \
-	CONFIG.Component_Name              {cmac_usplus_axis}
-]  [get_ips cmac_usplus_axis]
+	CONFIG.Component_Name              $cmac_ip_name
+]  [get_ips $cmac_ip_name]
 
 ## Crossings
 create_ip -name axis_data_fifo -vendor xilinx.com -library ip -module_name axis_data_fifo_cc_udp_data
