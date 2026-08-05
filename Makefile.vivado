@@ -95,7 +95,7 @@ JOBS ?= 2
 # соберётся под один порт для отладки.
 NUM_QSFP ?= 2
 
-.PHONY: help list xo user_ip bd impl all clean-krnl
+.PHONY: help list xo user_ip bd impl all report clean-krnl
 
 help:
 	@echo "Vivado-флоу: четыре шага, .bit на выходе."
@@ -109,6 +109,9 @@ help:
 	@echo "  bd       блок-дизайн                                             ~25 сек"
 	@echo "  impl     синтез + имплементация + битстрим                        ~1 час"
 	@echo "  all      всё подряд"
+	@echo ""
+	@echo "Диагностика готового битстрима (ничего не пересобирает):"
+	@echo "  report   утилизация по SLR, SLL, сайты CMAC/GT, ядро->SLR         ~1 мин"
 	@echo ""
 	@echo "Перед первым запуском нужен шаг 0 (cmake + make ip) — docs/building.md."
 	@echo ""
@@ -229,6 +232,28 @@ impl:
 	fi
 
 all: xo user_ip bd impl
+
+# --- отчёт по размещению -----------------------------------------------------
+#
+# Читает готовый impl_1 и печатает утилизацию по SLR, пересечения SLR (SLL),
+# в каком SLR оказалось каждое ядро и физические сайты CMAC/GT. Ничего не
+# пересобирает — только открывает checkpoint (~минута).
+#
+# Отдельная цель, а не часть impl: отчёт хочется смотреть многократно и после
+# того, как имплементация уже прошла, не трогая час работы.
+report:
+	$(need_krnl)
+	$(need_board)
+	@if [ ! -f "$(PROJ_DIR)/net_vivado.xpr" ]; then \
+	     echo "ОШИБКА: нет проекта $(PROJ_DIR)/net_vivado.xpr"; \
+	     exit 1; \
+	fi
+	@echo "=== отчёт по размещению: $(USER_KRNL) / $(BOARD) ==="
+	cd $(REPO_ROOT) && vivado -mode batch \
+	     -source scripts/vivado/report_placement.tcl \
+	     -tclargs $(PROJ_DIR) 2>&1 | tee $(PROJ_DIR)/report_placement.log
+	@echo ""
+	@echo "Отчёт сохранён: $(PROJ_DIR)/report_placement.log"
 
 # Снести артефакты одной пары плата+ядро, не задевая остальные и cmake-кеш.
 clean-krnl:

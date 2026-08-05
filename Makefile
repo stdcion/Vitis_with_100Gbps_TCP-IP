@@ -216,19 +216,28 @@ cleanall: clean
 	-$(RMDIR) _x.* *xclbin.run_summary qemu-memory-_* emulation/ _vimage/ pl* start_simulation.sh *.xclbin _x
 	-$(RMDIR) ./tmp_kernel_pack* ./packaged_kernel* 
 
-cmac_krnl: $(CMAC_KRNL)
 network_krnl: $(NETWORK_KRNL)
 
 # Имя .xo зависит от QSFP_IDX (cmac_krnl.xo для 0, cmac_krnl_qsfp1.xo для 1, ...),
 # иначе повторный `make cmac_krnl QSFP_IDX=1` затирал бы .xo первого порта —
 # сборки обоих портов должны уметь жить в $(TEMP_DIR) одновременно.
+#
+# Цель make для порта 0 — сам .xo, а для портов N>0 — каталог упакованного IP:
+# .xo для них не создаётся (нужен только Vitis-флоу с одним портом, см.
+# scripts/gen_xo.tcl). Раньше цель всегда была cmac_krnl.xo независимо от
+# QSFP_IDX, поэтому после сборки порта 0 make считал порт 1 уже готовым и
+# пропускал его — на диске оставался пакет только одного порта.
 ifeq ($(QSFP_IDX),0)
 CMAC_XO_NAME := cmac_krnl.xo
+CMAC_TARGET  := $(TEMP_DIR)/cmac_krnl.xo
 else
 CMAC_XO_NAME := cmac_krnl_qsfp$(QSFP_IDX).xo
+CMAC_TARGET  := packaged_kernel_cmac_krnl_$(TARGET)_$(XSA)_qsfp$(QSFP_IDX)
 endif
 
-$(CMAC_KRNL): kernel/cmac_krnl/cmac_krnl.xml kernel/cmac_krnl/package_cmac_krnl.tcl scripts/gen_xo.tcl kernel/cmac_krnl/src/hdl/*.sv
+cmac_krnl: $(CMAC_TARGET)
+
+$(CMAC_TARGET): kernel/cmac_krnl/cmac_krnl.xml kernel/cmac_krnl/package_cmac_krnl.tcl scripts/gen_xo.tcl kernel/cmac_krnl/src/hdl/*.sv
 	mkdir -p $(TEMP_DIR)
 	vivado -mode batch -source scripts/gen_xo.tcl -tclargs $(TEMP_DIR)/$(CMAC_XO_NAME) cmac_krnl $(TARGET) $(DEVICE) $(XSA) kernel/cmac_krnl/cmac_krnl.xml kernel/cmac_krnl/package_cmac_krnl.tcl $(QSFP_IDX)
 

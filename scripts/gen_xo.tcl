@@ -71,4 +71,15 @@ if {[file exists "${xoname}"]} {
     file delete -force "${xoname}"
 }
 
-package_xo -xo_path ${xoname} -kernel_name ${krnl_name} -ip_directory ./packaged_kernel_${suffix} -kernel_xml ${xml_path}
+# .xo нужен только Vitis-флоу (v++ -l), а тот собирает единственный порт.
+# Для qsfp_idx != 0 упакованный IP называется иначе (cmac_krnl_qsfpN, см.
+# package_cmac_krnl.tcl), и -kernel_name/kernel_xml с родовым именем ему уже
+# не соответствуют. Vivado-флоу .xo не использует вовсе — он читает
+# packaged_kernel_* напрямую, поэтому пропуск здесь ничего не ломает.
+if { $qsfp_idx != 0 } {
+    puts "INFO: qsfp_idx=${qsfp_idx} — .xo не пакуется (нужен только Vitis-флоу,"
+    puts "      который собирает один порт). IP готов в ./packaged_kernel_${suffix},"
+    puts "      его использует scripts/vivado/build_bd.tcl."
+} else {
+    package_xo -xo_path ${xoname} -kernel_name ${krnl_name} -ip_directory ./packaged_kernel_${suffix} -kernel_xml ${xml_path}
+}

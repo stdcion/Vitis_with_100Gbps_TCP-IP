@@ -230,7 +230,24 @@ proc _find_ipdef {name args} {
           if {[llength $hits] == 0} {
                set hits [get_ipdefs -all -filter "VLNV =~ *:${cand}:*"]
           }
-          if {[llength $hits] > 0} {
+          if {[llength $hits] > 1} {
+               # Раньше здесь молча бралось [lindex $hits 0]. Именно так
+               # два пакета cmac_krnl (QSFP0 и QSFP1) с одинаковым VLNV
+               # сводились к одному IP: Vivado печатал "Duplicate IP found"
+               # предупреждением, а BD получал координаты GT-квада порта 0
+               # для ОБОИХ каналов. Неоднозначность здесь — всегда ошибка
+               # сборки, а не повод угадывать.
+               puts ""
+               puts "Кандидаты для '$cand':"
+               foreach h $hits { puts "  $h" }
+               error "IP '$cand' разрешается неоднозначно ([llength $hits] совпадений).\
+                      Обычно это два пакета с одинаковым VLNV в ip_repo_paths —\
+                      проверь, что каждый QSFP-порт упакован под своим именем\
+                      (см. kernel/cmac_krnl/package_cmac_krnl.tcl). Старые\
+                      packaged_kernel_* от прошлых сборок тоже дают дубликаты:\
+                      удали их и пересобери."
+          }
+          if {[llength $hits] == 1} {
                set vlnv [lindex $hits 0]
                puts "  $name -> $vlnv"
                return $vlnv
@@ -247,13 +264,38 @@ proc _find_ipdef {name args} {
 
 puts ""
 puts "=== разрешение VLNV ==="
-set VLNV_CMAC [_find_ipdef cmac_krnl]
+
+# У каждого QSFP-порта СВОЙ cmac_krnl: core_selection/group_selection (какой
+# CMACE4 и какие GT-каналы) зашиты в XDC упакованного IP, параметром их не
+# переопределить. Порт 0 — "cmac_krnl", порт N>0 — "cmac_krnl_qsfpN"
+# (см. kernel/cmac_krnl/package_cmac_krnl.tcl).
+#
+# network_krnl, наоборот, к физическим сайтам не привязан, поэтому один VLNV
+# на все каналы — это правильно, а не недосмотр.
+set VLNV_CMAC [list]
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     set qsfp_idx [expr {$n - 1}]
+     if {$qsfp_idx == 0} {
+          lappend VLNV_CMAC [_find_ipdef cmac_krnl]
+     } else {
+          lappend VLNV_CMAC [_find_ipdef cmac_krnl_qsfp${qsfp_idx}]
+     }
+}
 set VLNV_NET  [_find_ipdef network_krnl]
 set VLNV_USER [_find_ipdef $USER_KRNL user_krnl]
 
+# Разные каналы обязаны прийти из разных пакетов — иначе два CMAC снова
+# нацелятся на один GT-квад. Проверяем явно: молчаливое совпадение здесь
+# стоит часа имплементации и нерабочего второго порта.
+if {[llength [lsort -unique $VLNV_CMAC]] != [llength $VLNV_CMAC]} {
+     error "cmac_krnl для разных QSFP разрешился в один и тот же VLNV: $VLNV_CMAC.\
+            Пересобери ядра (make -f Makefile.vivado xo) — пакеты портов должны\
+            иметь разные имена."
+}
+
 # cmac_krnl_N/network_krnl_N — всегда по одному на канал (N=1..NUM_QSFP).
 for {set n 1} {$n <= $NUM_QSFP} {incr n} {
-     create_bd_cell -type ip -vlnv $VLNV_CMAC cmac_krnl_$n
+     create_bd_cell -type ip -vlnv [lindex $VLNV_CMAC [expr {$n - 1}]] cmac_krnl_$n
      create_bd_cell -type ip -vlnv $VLNV_NET  network_krnl_$n
 }
 

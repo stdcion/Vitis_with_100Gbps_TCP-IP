@@ -203,6 +203,27 @@ ipx::package_project -root_dir $path_to_packaged -vendor xilinx.com -library RTL
 ipx::unload_core $path_to_packaged/component.xml
 ipx::edit_ip_in_project -upgrade true -name tmp_edit_project -directory $path_to_packaged $path_to_packaged/component.xml
 set_property core_revision 1 [ipx::current_core]
+
+# ВАЖНО: у каждого QSFP-порта должен быть СВОЙ VLNV.
+#
+# core_selection/group_selection выше зашиваются в XDC упакованного IP, то есть
+# порт 0 и порт 1 — физически разные IP, а не один IP с параметром. Пока имя
+# ядра было общим ("cmac_krnl"), оба пакета получали VLNV
+# xilinx.com:RTLKernel:cmac_krnl:1.0, Vivado при загрузке каталога сообщал
+# "Duplicate IP found ... will take precedence" и молча брал ТОЛЬКО пакет
+# порта 0. В результате cmac_krnl_2 в BD получал координаты порта 0
+# (CMACE4_X0Y6/X1Y48~X1Y51), Vivado снимал конфликтующий LOC ([Place 30-1241])
+# и размещал второй CMAC мимо квада QSFP1 — сборка проходила без ошибок, но
+# второй порт на плате не поднял бы линк.
+#
+# Разводим имена: порт 0 остаётся "cmac_krnl" (совместимость с Vitis-флоу и
+# cmac_krnl.xml), порт N>0 получает "cmac_krnl_qsfpN". Парная правка —
+# _find_ipdef в scripts/vivado/build_bd.tcl, который резолвит VLNV per-канал.
+if {$qsfp_idx != 0} {
+    set_property name "cmac_krnl_qsfp${qsfp_idx}" [ipx::current_core]
+    set_property display_name "cmac_krnl_qsfp${qsfp_idx}" [ipx::current_core]
+    set_property description "CMAC kernel for QSFP${qsfp_idx} (${core_selection}, ${group_selection})" [ipx::current_core]
+}
 foreach up [ipx::get_user_parameters] {
   ipx::remove_user_parameter [get_property NAME $up] [ipx::current_core]
 }
