@@ -645,8 +645,15 @@ for {set n 1} {$n <= $NUM_QSFP} {incr n} {
      # Проверяем, что получилось именно то, что прописано в jtag_ctrl.tcl —
      # иначе управление пойдёт не в те регистры, а на железе это выглядит как
      # "ядро не реагирует", без всякой диагностики.
+     #
+     # Сравнение ЧИСЛОВОЕ (!=), а не строковое (ne): get_property OFFSET
+     # возвращает hex-строку вида "0x00000000", а _addr_network/_addr_user —
+     # результат expr в десятичном виде ("0", "131072", ...). Строковое
+     # сравнение этих двух представлений одного и того же числа считает их
+     # разными всегда, кроме случайных совпадений вида "0" — эта проверка
+     # валилась бы на every канале, кроме n=1 с нулевым адресом.
      set got_net [get_property OFFSET $seg_net]
-     if {$got_net ne $addr_net} {
+     if {$got_net != $addr_net} {
           error "адрес network_krnl_$n=$got_net, ждали $addr_net.\
                  Либо он занят другим сегментом, либо правь OUCH_BASE_NETWORK($n)\
                  в scripts/vivado/jtag_ctrl.tcl."
@@ -655,7 +662,7 @@ for {set n 1} {$n <= $NUM_QSFP} {incr n} {
 
      if {[llength $seg_user] > 0} {
           set got_user [get_property OFFSET $seg_user]
-          if {$got_user ne $addr_user} {
+          if {$got_user != $addr_user} {
                error "адрес ${USER_KRNL}_$n=$got_user, ждали $addr_user —\
                       сверь OUCH_BASE_USER($n) в scripts/vivado/jtag_ctrl.tcl."
           }
