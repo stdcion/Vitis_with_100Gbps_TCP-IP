@@ -312,8 +312,12 @@ set n_user_instances [expr {$USER_KRNL_DUAL ? 1 : $NUM_QSFP}]
 # (C0_DDR4_S_AXI_CTRL, см. секцию памяти ниже) и, если есть, s_axi_control
 # каждого экземпляра ${USER_KRNL}.
 set n_mi [expr {$NUM_QSFP + ($USER_HAS_CTRL ? $n_user_instances : 0) + 1}]
-puts "ctrl_interconnect: $n_mi мастеров ($NUM_QSFP x network_krnl,\
-      [expr {$USER_HAS_CTRL ? \"$n_user_instances x ${USER_KRNL}\" : \"без ${USER_KRNL}\"}] s_axi_control, DDR4 ECC)"
+if {$USER_HAS_CTRL} {
+     set user_ctrl_desc "$n_user_instances x ${USER_KRNL}"
+} else {
+     set user_ctrl_desc "без ${USER_KRNL}"
+}
+puts "ctrl_interconnect: $n_mi мастеров ($NUM_QSFP x network_krnl, $user_ctrl_desc s_axi_control, DDR4 ECC)"
 
 # NUM_CLKS=2: управляющие порты ядер на ap_clk, ECC-регистры DDR4 — на ui_clk
 # контроллера.
