@@ -214,7 +214,7 @@ clean:
 cleanall: clean
 	-$(RMDIR) build_dir* sd_card*
 	-$(RMDIR) _x.* *xclbin.run_summary qemu-memory-_* emulation/ _vimage/ pl* start_simulation.sh *.xclbin _x
-	-$(RMDIR) ./tmp_kernel_pack* ./packaged_kernel* 
+	-$(RMDIR) ./tmp_kernel_pack* ./packaged_kernel* ./tmp_hdl_cmac_krnl_*
 
 network_krnl: $(NETWORK_KRNL)
 

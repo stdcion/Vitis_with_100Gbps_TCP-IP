@@ -80,27 +80,23 @@ if {[string compare -nocase $board "u200"] == 0} {
 set projName kernel_pack
 create_project -force $projName $path_to_tmp_project -part $projPart
 
-add_files -norecurse [glob $path_to_hdl/hdl/*.v $path_to_hdl/hdl/*.sv $path_to_hdl/hdl/*.svh ]
-add_files -norecurse [glob $path_to_common/types/*.v $path_to_common/types/*.sv $path_to_common/types/*.svh ]
-
-set_property top cmac_krnl [current_fileset]
-
-# ВАЖНО: у каждого QSFP-порта СВОЁ имя внутреннего cmac_usplus IP.
+# --- имя внутреннего cmac_usplus IP: СВОЁ у каждого порта ---------------------
 #
-# Vivado привязывает XDC сгенерированного IP через SCOPED_TO_REF, то есть по
-# ИМЕНИ МОДУЛЯ, а не по экземпляру. Пока оба порта создавали IP с одним именем
-# "cmac_usplus_axis", у обоих XDC получался SCOPED_TO_REF=cmac_usplus_axis, и
-# Vivado применял КАЖДЫЙ файл к ОБОИМ ячейкам этого типа. В логе impl это видно
-# как двойной парсинг: XDC из net_bd_cmac_krnl_2_0 применялся и к cmac_krnl_1,
-# и к cmac_krnl_2. Последним побеждал LOC второго порта, ставился на оба CMAC,
-# и второй в уже занятый сайт не влезал:
-#     CRITICAL WARNING [Vivado 12-2285] ... can not be placed in CMACE4 ...
-#     WARNING [Place 30-1241] A large block is missing its placement assignment
-# то есть cmac_krnl_2 оставался БЕЗ LOC и садился мимо квада QSFP1 — сборка
-# проходила зелёной, а второй порт линк не поднимал.
+# Так делает и официальный OpenNIC от AMD: у него на каждый порт отдельный
+# скрипт с отдельным module_name (src/cmac_subsystem/vivado_ip/
+# cmac_usplus_{0,1}_au200.tcl, имена cmac_usplus_0 / cmac_usplus_1) и своими
+# CMAC_CORE_SELECT/GT_GROUP_SELECT. Это не наша выдумка, а штатный способ
+# держать два CMAC в одном дизайне.
 #
-# Разного VLNV у обёртки (см. ~стр. 250) для этого НЕ достаточно: он развёл
-# пакеты, но внутренний IP в них оставался одноимённым.
+# ЗАЧЕМ. Vivado привязывает XDC сгенерированного IP через SCOPED_TO_REF, то есть
+# по ИМЕНИ МОДУЛЯ. При общем имени XDC каждого порта матчил ОБА CMAC (LOC там
+# задан шаблоном get_cells -hierarchical по всему дизайну), из-за чего:
+#     CRITICAL WARNING [Vivado 12-2285] can not be placed in CMACE4 ... occupied
+#     CRITICAL WARNING [Common 17-55]   'set_property' expects at least one object
+#     WARNING          [Place 30-1241]  large block is missing its placement
+# Последнее означает CMAC вообще без LOC — placer ставит его куда попало, и порт
+# на плате не поднимает линк. Разные имена разводят SCOPED_TO_REF, и каждый XDC
+# применяется только к своему экземпляру.
 #
 # Порт 0 сохраняет прежнее имя — на него смотрят Vitis-флоу и cmac_krnl.xml.
 if {$qsfp_idx == 0} {
@@ -110,15 +106,52 @@ if {$qsfp_idx == 0} {
 }
 puts "INFO: внутренний cmac_usplus IP: $cmac_ip_name (qsfp_idx=$qsfp_idx)"
 
-# cmac_usplus_axis_wrapper.sv инстанцирует этот IP через макрос
-# `CMAC_USPLUS_MODULE — иначе имя модуля пришлось бы генерировать в RTL.
-# Define ставится на fileset здесь, до create_ip: порядок в файле —
-# сначала исходники, потом IP.
+# cmac_usplus_axis_wrapper.sv инстанцирует этот IP ПО ИМЕНИ, а имя модуля в
+# Verilog не параметризуется. Через `define это не решается: файл попадает в
+# пакет как исходник и синтезируется уже в проекте BD, где никаких наших
+# define нет (проверено — синтез падал с "[Synth 8-439] module
+# 'cmac_usplus_axis' not found"), причём оба пакета кладут .sv в ОДИН общий
+# ipshared/<hash>/src/, так что одного файла на два имени не хватит.
 #
-# На sim_1 не ставим: cmac_usplus там не инстанцируется. Если понадобится —
-# ставить отдельным set_property, sources_1 симуляционным filesetом не
-# наследуется.
-set_property verilog_define "CMAC_USPLUS_MODULE=$cmac_ip_name" [current_fileset]
+# Поэтому для портов N>0 работаем с КОПИЕЙ дерева исходников, где имя модуля
+# подставлено. Оригинал в kernel/cmac_krnl/src не трогаем: он остаётся валидным
+# сам по себе (порт 0, Vitis-флоу, чтение глазами).
+if {$qsfp_idx != 0} {
+    set path_to_hdl_staged "./tmp_hdl_cmac_krnl_${suffix}"
+    file delete -force $path_to_hdl_staged
+    file mkdir $path_to_hdl_staged
+    file copy -force "$path_to_hdl/hdl" "$path_to_hdl_staged/hdl"
+
+    set wrapper_sv "$path_to_hdl_staged/hdl/cmac_usplus_axis_wrapper.sv"
+    set fh [open $wrapper_sv r]
+    set body [read $fh]
+    close $fh
+
+    # Заменяем ровно инстанцирование ("cmac_usplus_axis cmac_axis_inst"), а не
+    # все вхождения строки: имя встречается ещё в комментариях и в имени самого
+    # файла-обёртки, и слепой replace их бы тоже задел.
+    set needle "cmac_usplus_axis cmac_axis_inst"
+    set n_repl [regsub -all "cmac_usplus_axis\\s+cmac_axis_inst" $body \
+                     "$cmac_ip_name cmac_axis_inst" body]
+    if {$n_repl != 1} {
+        error "ожидал РОВНО одно инстанцирование '$needle' в\
+               cmac_usplus_axis_wrapper.sv, нашёл $n_repl. Если обёртку\
+               переименовали — поправь эту подстановку в package_cmac_krnl.tcl,\
+               иначе порт $qsfp_idx соберётся с CMAC от порта 0."
+    }
+
+    set fh [open $wrapper_sv w]
+    puts -nonewline $fh $body
+    close $fh
+    puts "INFO: staged RTL: $path_to_hdl_staged (имя модуля -> $cmac_ip_name)"
+} else {
+    set path_to_hdl_staged $path_to_hdl
+}
+
+add_files -norecurse [glob $path_to_hdl_staged/hdl/*.v $path_to_hdl_staged/hdl/*.sv $path_to_hdl_staged/hdl/*.svh ]
+add_files -norecurse [glob $path_to_common/types/*.v $path_to_common/types/*.sv $path_to_common/types/*.svh ]
+
+set_property top cmac_krnl [current_fileset]
 
 update_compile_order -fileset sources_1
 
@@ -140,8 +173,10 @@ create_ip -name ethernet_frame_padding -vendor ethz.systems.fpga -library hls -v
 set gt_ref_clk 156.25
 set freerunningclock 100
 
-# $cmac_ip_name — имя, зависящее от порта; задано выше, там же объяснение,
-# зачем оно вообще разное (SCOPED_TO_REF у XDC этого IP).
+# $cmac_ip_name задан выше (общий для всех портов) — там же объяснение, почему
+# развести его по портам нельзя и что из этого следует для размещения CMAC.
+# Переменная, а не литерал: имя фигурирует в трёх местах, и расхождение между
+# ними даёт невнятную ошибку "IP not found" вместо понятной.
 create_ip -name cmac_usplus -vendor xilinx.com -library ip -module_name $cmac_ip_name
 if {[string compare -nocase $board "u280"] == 0} {
 	if {$qsfp_idx != 0} {
@@ -158,17 +193,35 @@ if {[string compare -nocase $board "u280"] == 0} {
 	# QSFP0 -> CMACE4_X0Y6 (X1Y48~X1Y51); QSFP1 -> CMACE4_X0Y7 (X1Y44~X1Y47).
 	# Оба квада в SLR2 (см. devices/u200/device.tcl.in) — второй порт не требует
 	# другого pblock.
+	#
+	# Значения сверены с официальным OpenNIC от AMD для этой же платы
+	# (src/cmac_subsystem/vivado_ip/cmac_usplus_{0,1}_au200.tcl) — совпадают.
+	# Оттуда же взяты lane_loc и pll_type ниже.
 	if {$qsfp_idx == 0} {
 		set core_selection  CMACE4_X0Y6
 		set group_selection X1Y48~X1Y51
+		set lane_loc        [list X1Y48 X1Y49 X1Y50 X1Y51]
+		# QPLL0 — дефолт IP, задаём явно для симметрии с портом 1.
+		set pll_type        QPLL0
 	} elseif {$qsfp_idx == 1} {
 		set core_selection  CMACE4_X0Y7
 		set group_selection X1Y44~X1Y47
+		set lane_loc        [list X1Y44 X1Y45 X1Y46 X1Y47]
+		# КРИТИЧНО: второму CMAC нужен ДРУГОЙ QPLL.
+		#
+		# Квады X1Y44~47 и X1Y48~47 сидят в одном GT-банке, а QPLL там общий на
+		# банк. Если оба порта возьмут QPLL0, второй не получит тактирования и
+		# линк не поднимется — при этом сборка пройдёт без ошибок, потому что
+		# конфликт не виден ни DRC, ни placer'у.
+		#
+		# OpenNIC ставит QPLL1 ровно для порта 1 на au200 — берём то же.
+		set pll_type        QPLL1
 	} else {
 		error "u200 поддерживает только QSFP_IDX 0 или 1, получено: $qsfp_idx"
 	}
 	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
 	puts "Generating IPI for u200 cmac_usplus_axis (QSFP${qsfp_idx}) with GT clock running at ${gt_clk_freq} Hz"
+	puts "  core=$core_selection quad=$group_selection lanes=$lane_loc pll=$pll_type"
 
 } elseif {[string compare -nocase $board "u250"] == 0} {
 	if {$qsfp_idx != 0} {
@@ -219,6 +272,39 @@ set_property -dict [list \
 	CONFIG.ENABLE_PIPELINE_REG         {1} \
 	CONFIG.Component_Name              $cmac_ip_name
 ]  [get_ips $cmac_ip_name]
+
+# --- сайты GT-каналов и QPLL — параметрами IP, а не через XDC ------------------
+#
+# LANE{1..4}_GT_LOC задаёт физический сайт каждого канала. Без них IP сам
+# раскладывает каналы внутри GT_GROUP_SELECT и пишет LOC в свой
+# cmac_usplus_axis_gt.xdc через шаблон gen_channel_container[NN] — при двух
+# CMAC в дизайне такой шаблон лезет и в чужое IP (см. Common 17-55 в логе impl).
+# Заданные параметром, координаты попадают в IP явно и от XDC не зависят.
+#
+# PLL_TYPE: два CMAC в одном GT-банке не могут делить один QPLL. Порт 0 —
+# QPLL0, порт 1 — QPLL1.
+#
+# Оба набора значений — из официального OpenNIC для au200
+# (src/cmac_subsystem/vivado_ip/cmac_usplus_{0,1}_au200.tcl).
+#
+# Задаётся только там, где значения проверены (сейчас u200 с двумя портами).
+# Для остальных плат ветки выше lane_loc/pll_type не выставляют — оставляем
+# поведение IP по умолчанию, как было до этой правки.
+if {[info exists lane_loc] && [info exists pll_type]} {
+	set lane_dict [list]
+	for {set l 0} {$l < [llength $lane_loc]} {incr l} {
+		lappend lane_dict "CONFIG.LANE[expr {$l + 1}]_GT_LOC" [lindex $lane_loc $l]
+	}
+	# Каналы 5..10 существуют только для CAUI-10; в режиме 4x25 их надо явно
+	# погасить, иначе IP оставляет прежние значения от предыдущей конфигурации.
+	for {set l 5} {$l <= 10} {incr l} {
+		lappend lane_dict "CONFIG.LANE${l}_GT_LOC" {NA}
+	}
+	lappend lane_dict CONFIG.PLL_TYPE $pll_type
+
+	set_property -dict $lane_dict [get_ips $cmac_ip_name]
+	puts "INFO: LANE*_GT_LOC = $lane_loc, PLL_TYPE = $pll_type"
+}
 
 ## Crossings
 create_ip -name axis_data_fifo -vendor xilinx.com -library ip -module_name axis_data_fifo_cc_udp_data

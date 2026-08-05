@@ -31,21 +31,6 @@
 `define XILINX_2019
 //`define XILINX_2020
 
-// Имя инстанцируемого cmac_usplus IP задаётся снаружи (package_cmac_krnl.tcl
-// ставит -verilog_define CMAC_USPLUS_MODULE=...), потому что у каждого
-// QSFP-порта это ОТДЕЛЬНЫЙ IP со своим именем: порт 0 — cmac_usplus_axis,
-// порт N>0 — cmac_usplus_axis_qsfpN. Иначе у обоих портов совпадал бы
-// SCOPED_TO_REF, и XDC одного порта применялся бы к CMAC другого — второй
-// CMAC оставался без LOC и садился мимо своего GT-квада (см. подробный
-// комментарий в package_cmac_krnl.tcl).
-//
-// Дефолт нужен для прямого чтения файла вне того флоу (симуляция, lint,
-// открытие проекта руками) — он совпадает с портом 0, то есть с прежним
-// поведением.
-`ifndef CMAC_USPLUS_MODULE
-  `define CMAC_USPLUS_MODULE cmac_usplus_axis
-`endif
-
 module cmac_axis_wrapper
 (
     input wire                 init_clk,
@@ -314,7 +299,17 @@ logic tx_unf;//TODO use for debug
 wire tx_user_rst_i;
 assign tx_user_rst_i = sys_reset; //TODO why not 1'b0??
 
-`CMAC_USPLUS_MODULE cmac_axis_inst (
+// ВНИМАНИЕ: имя модуля здесь обязано быть жёстким.
+//
+// Была попытка параметризовать его макросом (CMAC_USPLUS_MODULE через
+// -verilog_define), чтобы у каждого QSFP-порта был свой cmac_usplus IP.
+// Не работает принципиально: этот .sv попадает в пакет как ИСХОДНИК, а
+// синтезирует его уже другой проект (net_vivado), где define отсутствует —
+// синтез падал с "[Synth 8-439] module 'cmac_usplus_axis' not found" на
+// втором порту. Причём оба пакета кладут файл в ОДИН общий каталог
+// net_vivado.gen/.../ipshared/<hash>/src/, так что и правильный define на
+// уровне BD не спас бы: файл один, а значений нужно два.
+cmac_usplus_axis cmac_axis_inst (
         .gt_rxp_in                     (gt_rxp_in),
         .gt_rxn_in                     (gt_rxn_in),
         .gt_txp_out                    (gt_txp_out),
