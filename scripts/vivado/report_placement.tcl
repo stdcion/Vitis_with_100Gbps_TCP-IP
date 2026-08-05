@@ -74,27 +74,68 @@ puts $line
 puts "3. РАЗМЕЩЕНИЕ ЯДЕР ПО SLR"
 puts $line
 
-proc _slr_of_cell {cell} {
-     # У иерархической ячейки своего сайта нет — берём SLR по её листьям.
-     # Если листья разъехались по разным SLR, это само по себе интересно,
-     # поэтому возвращаем весь список, а не первый попавшийся.
-     set leaves [get_cells -quiet -hier -filter "PRIMITIVE_LEVEL != INTERNAL" $cell/*]
-     if {[llength $leaves] == 0} { return "" }
-     set slrs {}
-     foreach s [get_slrs -quiet -of_objects $leaves] {
-          lappend slrs [get_property NAME $s]
+# Раскладка листьев ядра по SLR.
+#
+# Первая версия печатала пустоту. Две причины, обе поучительные:
+#   1. get_cells -hier ИГНОРИРУЕТ позиционный шаблон ("$cell/*") — при -hier
+#      обход идёт по всему дизайну, а отбор возможен только через -filter.
+#      Шаблон молча отбрасывался, и фильтр PRIMITIVE_LEVEL применялся не к тем
+#      ячейкам.
+#   2. IS_PRIMITIVE == 0 у BD-ячеек не выделяет то, что нужно: обёртки ядер
+#      сами примитивами не являются, но и лишних совпадений даёт слишком много.
+#
+# Теперь берём листья явно: -hier + фильтр по префиксу имени, и считаем только
+# РАЗМЕЩЁННЫЕ примитивы (у неразмещённых LOC пуст, и get_slrs по ним молчит,
+# из-за чего ядро выглядело бы отсутствующим).
+#
+# Возвращаем список всех SLR, а не первый: ядро, растянутое на два кристалла —
+# само по себе интересный факт, его нельзя схлопывать.
+proc _slr_hist_of_cell {cell} {
+     set leaves [get_cells -quiet -hier -filter \
+                     "NAME =~ ${cell}/* && IS_PRIMITIVE == 1"]
+     if {[llength $leaves] == 0} { return {} }
+
+     # Счётчик по SLR: важно не только ГДЕ, но и СКОЛЬКО — ядро на границе
+     # двух SLR с перекосом 90/10 и ядро пополам это разные ситуации.
+     set hist [dict create]
+     foreach l $leaves {
+          set slr [get_slrs -quiet -of_objects $l]
+          if {$slr eq ""} { continue }
+          set nm [get_property NAME $slr]
+          dict incr hist $nm
      }
-     return [lsort -unique $slrs]
+     return $hist
 }
 
-foreach pat {cmac_krnl_* network_krnl_* *_krnl_1 *_krnl_2} {
-     foreach c [get_cells -quiet -hier -filter "NAME =~ net_bd_i/$pat && IS_PRIMITIVE == 0"] {
-          set nm   [get_property NAME $c]
-          set slrs [_slr_of_cell $nm]
-          if {[llength $slrs] == 0} { continue }
-          set n_leaf [llength [get_cells -quiet -hier $nm/*]]
-          puts [format "  %-34s SLR: %-14s (ячеек: %s)" \
-                    [string map {net_bd_i/ ""} $nm] [join $slrs ","] $n_leaf]
+foreach pat {cmac_krnl_* network_krnl_* *_krnl_1 *_krnl_2 *_krnl_3} {
+     foreach c [get_cells -quiet -hier -filter "NAME =~ net_bd_i/$pat"] {
+          set nm [get_property NAME $c]
+
+          # Отсекаем вложенные ячейки: интересны только ядра верхнего уровня
+          # BD (net_bd_i/<ядро>), а не их внутренности, тоже попадающие в
+          # шаблон вроде *_krnl_1.
+          if {[llength [split [string map {net_bd_i/ ""} $nm] /]] != 1} {
+               continue
+          }
+
+          set hist [_slr_hist_of_cell $nm]
+          if {[dict size $hist] == 0} { continue }
+
+          set total 0
+          dict for {slr n} $hist { incr total $n }
+
+          set parts {}
+          foreach slr [lsort [dict keys $hist]] {
+               set n [dict get $hist $slr]
+               lappend parts [format "%s:%d (%.0f%%)" \
+                                   $slr $n [expr {100.0 * $n / $total}]]
+          }
+
+          puts [format "  %-26s %s" \
+                    [string map {net_bd_i/ ""} $nm] [join $parts "  "]]
+          if {[dict size $hist] > 1} {
+               puts "                             ^ ядро разложено на несколько SLR"
+          }
      }
 }
 
@@ -155,10 +196,51 @@ puts $line
 puts "  WNS: [get_property STATS.WNS $run]   WHS: [get_property STATS.WHS $run]"
 puts "  (оба обязаны быть положительными)"
 puts ""
-puts "  На что смотреть:"
-puts "    - раздел 1: если какой-то SLR под 80%+ по LUT — жди проблем с таймингом"
-puts "    - раздел 2: SLL близко к лимиту (u200: ~23k на границу) — тоже риск"
-puts "    - раздел 4: у каждого QSFP свой CMACE4 и своя четвёрка GTYE4_CHANNEL"
+
+# Автопроверки вместо «смотри глазами»: раздел 1 большой, и занятость CLB в нём
+# легко пропустить, потому что проценты по LUT выглядят спокойно. Именно CLB
+# (занятые слайсы) упирается первым: у dual-echo SLR1 = 92% CLB при 49% LUT.
+puts "  Проверки:"
+
+set _warned 0
+foreach slr [get_slrs] {
+     set nm [get_property NAME $slr]
+
+     set clb_all   [get_sites -quiet -of_objects $slr -filter {SITE_TYPE =~ SLICE*}]
+     set clb_used  [get_sites -quiet -of_objects $slr \
+                        -filter {SITE_TYPE =~ SLICE* && IS_USED}]
+     if {[llength $clb_all] == 0} { continue }
+
+     set pct [expr {100.0 * [llength $clb_used] / [llength $clb_all]}]
+     if {$pct >= 85.0} {
+          puts [format "    !! %s: CLB занято %.1f%% — placer на пределе." $nm $pct]
+          puts        "       Добавлять логику в этот SLR уже нечем; следующее ядро"
+          puts        "       либо не влезет, либо съест запас по таймингу."
+          set _warned 1
+     } elseif {$pct >= 70.0} {
+          puts [format "    -  %s: CLB занято %.1f%% — тесно, но терпимо." $nm $pct]
+     }
+}
+if {!$_warned} {
+     puts "    OK: ни один SLR не забит по CLB выше 85%."
+}
+
+# Один CMACE4-сайт на два ядра или отсутствие LOC — это тот самый баг с
+# пересечением XDC/VLNV, который стоил двух прогонов имплементации.
+set _cmacs [get_cells -quiet -hier -filter "REF_NAME =~ CMACE4*"]
+if {[llength $_cmacs] > 1} {
+     set _sites [lsort -unique [get_property SITE $_cmacs]]
+     if {[llength $_sites] == [llength $_cmacs] && [lsearch -exact $_sites ""] < 0} {
+          puts "    OK: у каждого CMAC свой сайт ([join $_sites {, }])."
+     } else {
+          puts "    !! CMAC делят сайт или сидят без LOC — см. раздел 4."
+     }
+}
+
+puts ""
+puts "  Остальное глазами:"
+puts "    - раздел 2: SLL близко к лимиту (u200: ~23k на границу) — риск по таймингу"
+puts "    - раздел 3: ядро, размазанное по двум SLR, гоняет данные через границу"
 puts ""
 
 close_project
