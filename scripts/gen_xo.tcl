@@ -32,9 +32,12 @@
 #
 # *******************************************************************************/
 
-if { $::argc != 7 } {
-    puts "ERROR: Program \"$::argv0\" requires 6 arguments!\n"
-    puts "Usage: $::argv0 <xoname> <krnl_name> <target> <xpfm_path> <device> <xml_path> <package_tcl_path>\n"
+# 8-й аргумент (qsfp_idx) необязателен: только cmac_krnl про него знает
+# (выбор GT-квада в package_cmac_krnl.tcl), для network_krnl и остальных вызовов
+# он просто не используется. Дефолт 0 сохраняет прежнее поведение 1:1.
+if { $::argc != 7 && $::argc != 8 } {
+    puts "ERROR: Program \"$::argv0\" requires 6 or 7 arguments!\n"
+    puts "Usage: $::argv0 <xoname> <krnl_name> <target> <xpfm_path> <device> <xml_path> <package_tcl_path> \[qsfp_idx\]\n"
     exit
 }
 
@@ -46,9 +49,21 @@ set device    [lindex $::argv 4]
 set xml_path [lindex $::argv 5]
 set package_tcl_path [lindex $::argv 6]
 
-set suffix "${krnl_name}_${target}_${device}"
+if { $::argc == 8 } {
+    set qsfp_idx [lindex $::argv 7]
+} else {
+    set qsfp_idx 0
+}
 
-puts "INFO: ${xoname} ${krnl_name} ${target} ${xpfm_path} ${device}" 
+# Suffix за qsfp_idx != 0 получает свой хвост, чтобы packaged_kernel_${suffix} и
+# tmp_kernel_pack_${suffix} не пересекались с портом 0 и не затирали его на
+# диске — сборки обоих портов должны уметь жить рядом одновременно.
+set suffix "${krnl_name}_${target}_${device}"
+if { $qsfp_idx != 0 } {
+    set suffix "${suffix}_qsfp${qsfp_idx}"
+}
+
+puts "INFO: ${xoname} ${krnl_name} ${target} ${xpfm_path} ${device} qsfp_idx=${qsfp_idx}"
 
 source -notrace ${package_tcl_path}
 

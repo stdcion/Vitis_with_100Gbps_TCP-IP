@@ -53,6 +53,15 @@ set path_to_common "./kernel/common"
 set words [split $device "_"]
 set board [lindex $words 1]
 
+# qsfp_idx выбирает физический QSFP-разъём (GT-квад), а не плату — cmake про
+# него не знает и не должен: CMAC_SLR/NETWORK_KRNL_MEM в CMakeLists.txt общие
+# для платы независимо от того, какой порт собирается. Переменную задаёт
+# gen_xo.tcl из необязательного 8-го аргумента; при прямом source без неё
+# (старые вызовы) сохраняем текущее поведение — порт 0.
+if {![info exists qsfp_idx]} {
+    set qsfp_idx 0
+}
+
 if {[string compare -nocase $board "u200"] == 0} {
     set projPart "xcu200-fsgd2104-2-e"
 } elseif {[string compare -nocase $board "u280"] == 0} {
@@ -96,6 +105,9 @@ set gt_ref_clk 156.25
 set freerunningclock 100
 create_ip -name cmac_usplus -vendor xilinx.com -library ip -module_name cmac_usplus_axis
 if {[string compare -nocase $board "u280"] == 0} {
+	if {$qsfp_idx != 0} {
+		error "u280: для QSFP_IDX=$qsfp_idx координаты GT-квада не проверены — правь эту ветку осознанно, а не угадывай"
+	}
 	set freerunningclock 50
 	# Possible core_selection CMACE4_X0Y5; CMACE4_X0Y6 and CMACE4_X0Y7
 	set core_selection  CMACE4_X0Y5
@@ -104,19 +116,34 @@ if {[string compare -nocase $board "u280"] == 0} {
 	puts "Generating IPI for u280 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
 
 } elseif {[string compare -nocase $board "u200"] == 0} {
-	# Possible core_selection CMACE4_X0Y6 (X1Y48~X1Y51) and CMACE4_X0Y7 (X1Y44~X1Y47)
-  	set core_selection  CMACE4_X0Y6
-    set group_selection X1Y48~X1Y51
+	# QSFP0 -> CMACE4_X0Y6 (X1Y48~X1Y51); QSFP1 -> CMACE4_X0Y7 (X1Y44~X1Y47).
+	# Оба квада в SLR2 (см. devices/u200/device.tcl.in) — второй порт не требует
+	# другого pblock.
+	if {$qsfp_idx == 0} {
+		set core_selection  CMACE4_X0Y6
+		set group_selection X1Y48~X1Y51
+	} elseif {$qsfp_idx == 1} {
+		set core_selection  CMACE4_X0Y7
+		set group_selection X1Y44~X1Y47
+	} else {
+		error "u200 поддерживает только QSFP_IDX 0 или 1, получено: $qsfp_idx"
+	}
 	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
-	puts "Generating IPI for u200 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
+	puts "Generating IPI for u200 cmac_usplus_axis (QSFP${qsfp_idx}) with GT clock running at ${gt_clk_freq} Hz"
 
 } elseif {[string compare -nocase $board "u250"] == 0} {
+	if {$qsfp_idx != 0} {
+		error "u250: для QSFP_IDX=$qsfp_idx координаты GT-квада не проверены — правь эту ветку осознанно, а не угадывай"
+	}
   	set core_selection  CMACE4_X0Y7
     set group_selection X1Y44~X1Y47
 	set gt_clk_freq [expr int(${gt_ref_clk} * 1000000)]
 	puts "Generating IPI for u250 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
 	
 } elseif {[string compare -nocase $board "u50"] == 0} {
+	if {$qsfp_idx != 0} {
+		error "u50: для QSFP_IDX=$qsfp_idx координаты GT-квада не проверены — правь эту ветку осознанно, а не угадывай"
+	}
 	# Possible core_selection CMACE4_X0Y3 and CMACE4_X0Y4
 	set gt_ref_clk 161.1328125
 	set core_selection  CMACE4_X0Y3
@@ -125,6 +152,9 @@ if {[string compare -nocase $board "u280"] == 0} {
 	puts "Generating IPI for u50 cmac_usplus_axis with GT clock running at ${gt_clk_freq} Hz"
 
 } elseif {[string compare -nocase $board "u55c"] == 0} {
+	if {$qsfp_idx != 0} {
+		error "u55c: для QSFP_IDX=$qsfp_idx координаты GT-квада не проверены — правь эту ветку осознанно, а не угадывай"
+	}
 	set gt_ref_clk 161.1328125
 	# Possible core_selection CMACE4_X0Y2; CMACE4_X0Y3; CMACE4_X0Y4
 	set core_selection  CMACE4_X0Y2
