@@ -5,8 +5,11 @@
 # их, добавляет обвязку, которую раньше давал шелл (клоки, сбросы, память,
 # GT-порты), и управление через JTAG вместо PCIe/XRT.
 #
-# Запуск:
-#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs <user_krnl> [плата]
+# Запуск (проще через make, см. Makefile.vivado):
+#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs <user_krnl> <плата>
+#
+# Оба аргумента ОБЯЗАТЕЛЬНЫ. Дефолтов нет намеренно: забытый аргумент собирал бы
+# не то ядро молча, а следом шла бы часовая имплементация.
 #
 # Что должно быть готово до запуска:
 #   1. build/devices/<плата>/device.tcl — параметры платы, генерирует cmake
@@ -22,23 +25,34 @@
 # распределение по SLR. Они помечены явно, а не оставлены молча.
 # -----------------------------------------------------------------------------
 
-set PROJ_NAME   "ouch_vivado"
-set PROJ_DIR    "./build_vivado"
-set BD_NAME     "ouch_bd"
+if {$::argc < 2} {
+     puts "ОШИБКА: нужно два аргумента: <user_krnl> <плата>"
+     puts ""
+     puts "  vivado -mode batch -source scripts/vivado/build_bd.tcl \\"
+     puts "         -tclargs hls_echo_krnl u200"
+     puts ""
+     puts "Проще: make -f Makefile.vivado bd USER_KRNL=hls_echo_krnl BOARD=u200"
+     exit 1
+}
 
-# Имя user-ядра. Первым аргументом -tclargs, иначе hls_ouch_krnl:
-#     vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs hls_echo_krnl
-#
-# То же имя надо передать export_hls_ip.tcl — иначе соберётся IP одного
-# ядра, а BD будет искать другое.
-set USER_KRNL [expr {$::argc > 0 ? [lindex $::argv 0] : "hls_ouch_krnl"}]
-puts "user-ядро: $USER_KRNL"
-
-# Плата. Вторым аргументом, иначе u200.
-set BOARD [expr {$::argc > 1 ? [lindex $::argv 1] : "u200"}]
+set USER_KRNL [lindex $::argv 0]
+set BOARD     [lindex $::argv 1]
 
 set REPO_ROOT   [file normalize [file dirname [info script]]/../..]
 set CONFIG_SP   "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/config_sp_$USER_KRNL.txt"
+
+# Артефакты — по плате и ядру: .bit жёстко привязан к part, а HLS-IP ядра ещё и
+# к периоду. Без разделения сборка под другую плату затирала бы предыдущую, и в
+# ls было бы не видно, для какой платы лежит битстрим.
+#
+# Внутри build/, а не рядом: снос build/ (cmake-кеш) обязан уносить и битстримы.
+# После пересборки ip_repo прежний битстрим собран из другого стека — он выглядит
+# валидным, но им нельзя пользоваться.
+set PROJ_NAME   "net_vivado"
+set PROJ_DIR    "$REPO_ROOT/build/vivado/$BOARD/$USER_KRNL"
+set BD_NAME     "net_bd"
+
+puts "user-ядро: $USER_KRNL"
 
 # --- параметры платы ----------------------------------------------------------
 #
@@ -555,13 +569,11 @@ close $fh
 add_files -fileset constrs_1 -norecurse $slr_xdc
 
 puts ""
-puts "BD собран. Дальше:"
-puts "  launch_runs impl_1 -to_step write_bitstream -jobs 2"
-puts "  wait_on_run impl_1"
+puts "BD собран: $PROJ_DIR/$PROJ_NAME.xpr"
 puts ""
-puts "  jobs=2, а не больше: на 30 ГБ памяти параллельные синтезы Vivado"
-puts "  (~3 ГБ каждый) плюс имплементация 100G-дизайна уводят машину в свап."
-puts "  Имплементация всё равно последовательная — по времени теряется мало."
+puts "Дальше — синтез и имплементация (час с лишним):"
+puts "  make -f Makefile.vivado impl USER_KRNL=$USER_KRNL BOARD=$BOARD"
 puts ""
-puts "Битстрим: $PROJ_DIR/$PROJ_NAME.runs/impl_1/${BD_NAME}_wrapper.bit"
+puts "Битстрим будет здесь:"
+puts "  $PROJ_DIR/$PROJ_NAME.runs/impl_1/${BD_NAME}_wrapper.bit"
 puts "Грузить: Hardware Manager -> Program Device (flash НЕ трогается)"

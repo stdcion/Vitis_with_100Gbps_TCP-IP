@@ -1,0 +1,225 @@
+# -----------------------------------------------------------------------------
+# Makefile.vivado — Vivado-флоу (без XRT-шелла), .bit вместо .xclbin
+#
+# Обёртка над четырьмя шагами, чтобы не набирать длинные vivado-команды руками.
+# Что делает каждый шаг и когда его перезапускать — docs/building.md.
+#
+#     make -f Makefile.vivado list
+#     make -f Makefile.vivado all USER_KRNL=hls_echo_krnl BOARD=u200
+#
+# Отдельный файл, а не цели в корневом Makefile: там уже есть `all` для
+# XRT-флоу, и совпадение имён при слиянии надо будет решать отдельно.
+#
+# ИНКРЕМЕНТАЛЬНОСТИ НЕТ. Каждая цель делает свою работу всегда, без проверки
+# свежести. Так задумано: три из четырёх шагов занимают меньше минуты, а
+# отслеживать устаревание каталогов (packaged_kernel_*, *_ip_proj) make не
+# умеет — пришлось бы вводить stamp-файлы, которые легко разъезжаются с
+# реальностью. Врущая инкрементальность хуже её отсутствия, особенно когда
+# ошибка стоит час имплементации.
+# -----------------------------------------------------------------------------
+
+SHELL := /bin/bash
+
+REPO_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+
+# --- параметры ---------------------------------------------------------------
+#
+# Дефолтов нет. Забытый USER_KRNL с дефолтом собрал бы не то ядро молча, а
+# следом пошла бы часовая имплементация.
+KERNELS := $(notdir $(wildcard $(REPO_ROOT)/kernel/user_krnl/*))
+
+# Плата — это каталог с device.tcl.in; в devices/ лежит ещё README.md, а платы
+# без шаблона Vivado-флоу не поддерживают (см. devices/README.md).
+BOARDS  := $(notdir $(patsubst %/device.tcl.in,%,\
+                    $(wildcard $(REPO_ROOT)/devices/*/device.tcl.in)))
+
+define need_krnl
+	@if [ -z "$(USER_KRNL)" ]; then \
+	     echo "ОШИБКА: не задан USER_KRNL"; \
+	     echo ""; \
+	     echo "Доступные ядра:"; \
+	     for k in $(KERNELS); do echo "  $$k"; done; \
+	     echo ""; \
+	     echo "  make -f Makefile.vivado $@ USER_KRNL=<ядро> BOARD=<плата>"; \
+	     exit 1; \
+	fi
+	@if [ ! -d "$(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)" ]; then \
+	     echo "ОШИБКА: нет ядра '$(USER_KRNL)' в kernel/user_krnl/"; \
+	     echo "Доступные: $(KERNELS)"; \
+	     exit 1; \
+	fi
+endef
+
+define need_board
+	@if [ -z "$(BOARD)" ]; then \
+	     echo "ОШИБКА: не задан BOARD"; \
+	     echo ""; \
+	     echo "Платы с поддержкой Vivado-флоу:"; \
+	     for b in $(BOARDS); do echo "  $$b"; done; \
+	     echo ""; \
+	     echo "  make -f Makefile.vivado $@ USER_KRNL=<ядро> BOARD=<плата>"; \
+	     exit 1; \
+	fi
+	@if [ ! -f "$(REPO_ROOT)/build/devices/$(BOARD)/device.tcl" ]; then \
+	     echo "ОШИБКА: нет build/devices/$(BOARD)/device.tcl"; \
+	     echo ""; \
+	     echo "Его генерирует cmake (шаг 0):"; \
+	     echo "  cd build && cmake .. -DFDEV_NAME=$(BOARD) -DTCP_STACK_EN=1"; \
+	     echo ""; \
+	     echo "Если платы '$(BOARD)' нет в devices/ — см. devices/README.md"; \
+	     exit 1; \
+	fi
+endef
+
+# Платформа XRT нужна ТОЛЬКО шагу 1, и только для package_xo — на плате шелл не
+# используется. Ищем по имени платы, чтобы не писать путь руками.
+#
+# Если когда-нибудь понадобится собирать на машине без установленной платформы —
+# резать надо здесь: package_xo заменяется на ipx::package_project, остальные
+# шаги от платформы не зависят вовсе.
+XPFM = $(firstword $(wildcard /opt/xilinx/platforms/xilinx_$(BOARD)_*/*.xpfm))
+
+PROJ_DIR = $(REPO_ROOT)/build/vivado/$(BOARD)/$(USER_KRNL)
+BITSTREAM = $(PROJ_DIR)/net_vivado.runs/impl_1/net_bd_wrapper.bit
+
+# jobs=2, а не больше: на 8 vCPU / 30 ГБ восемь параллельных синтезов Vivado
+# съедали всю память и подвешивали инстанс так, что не отвечал ни ssh, ни
+# AWS-консоль. Имплементация всё равно последовательная, теряется мало.
+JOBS ?= 2
+
+.PHONY: help list xo user_ip bd impl all clean-krnl
+
+help:
+	@echo "Vivado-флоу: четыре шага, .bit на выходе."
+	@echo ""
+	@echo "  make -f Makefile.vivado list"
+	@echo "  make -f Makefile.vivado all USER_KRNL=hls_echo_krnl BOARD=u200"
+	@echo ""
+	@echo "Шаги по отдельности:"
+	@echo "  xo       RTL-ядра cmac_krnl и network_krnl (нужна платформа XRT)  ~1 мин"
+	@echo "  user_ip  user-ядро из HLS в IP-каталог                            ~20 сек"
+	@echo "  bd       блок-дизайн                                             ~25 сек"
+	@echo "  impl     синтез + имплементация + битстрим                        ~1 час"
+	@echo "  all      всё подряд"
+	@echo ""
+	@echo "Перед первым запуском нужен шаг 0 (cmake + make ip) — docs/building.md."
+	@echo ""
+	@echo "Переменные: USER_KRNL (обязательно), BOARD (обязательно), JOBS (по умолчанию $(JOBS))"
+
+# Что вообще есть и что уже собрано. Полезно, чтобы не помнить имена ядер и не
+# гадать, остался ли битстрим от прошлого раза.
+list:
+	@echo "Ядра (kernel/user_krnl/):"
+	@for k in $(KERNELS); do \
+	     if [ -f "$(REPO_ROOT)/kernel/user_krnl/$$k/config_sp_$$k.txt" ]; then \
+	          printf "  %-26s config_sp: да\n" "$$k"; \
+	     else \
+	          printf "  %-26s config_sp: НЕТ (шаг 3 упадёт)\n" "$$k"; \
+	     fi; \
+	done
+	@echo ""
+	@echo "Платы (devices/): $(BOARDS)"
+	@echo ""
+	@echo "Собрано (build/vivado/):"
+	@found=0; \
+	for d in $(REPO_ROOT)/build/vivado/*/*; do \
+	     [ -d "$$d" ] || continue; \
+	     found=1; \
+	     bit="$$d/net_vivado.runs/impl_1/net_bd_wrapper.bit"; \
+	     if [ -f "$$bit" ]; then \
+	          printf "  %-40s .bit %s\n" "$${d#$(REPO_ROOT)/build/vivado/}" \
+	                 "$$(date -r $$bit '+%Y-%m-%d %H:%M')"; \
+	     else \
+	          printf "  %-40s только BD\n" "$${d#$(REPO_ROOT)/build/vivado/}"; \
+	     fi; \
+	done; \
+	[ $$found = 1 ] || echo "  (пусто)"
+
+# --- шаг 1: RTL-ядра ---------------------------------------------------------
+#
+# От user-ядра не зависят, но зависят от build/ip_repo: network_krnl тянет туда
+# девять IP стека при упаковке. То есть после make ip шаг 1 надо повторить,
+# иначе в BD попадёт network_krnl со старым стеком.
+xo:
+	$(need_board)
+	@if [ -z "$(XPFM)" ]; then \
+	     echo "ОШИБКА: не нашёл .xpfm для платы $(BOARD)"; \
+	     echo "  искал: /opt/xilinx/platforms/xilinx_$(BOARD)_*/*.xpfm"; \
+	     echo ""; \
+	     echo "Платформа нужна только этому шагу (package_xo), на плате шелл"; \
+	     echo "не используется. Установленные платформы:"; \
+	     ls -d /opt/xilinx/platforms/*/ 2>/dev/null | sed 's/^/  /' || echo "  (нет)"; \
+	     exit 1; \
+	fi
+	@if [ ! -d "$(REPO_ROOT)/build/ip_repo" ]; then \
+	     echo "ОШИБКА: нет build/ip_repo — не прогнан шаг 0 (make ip)"; \
+	     exit 1; \
+	fi
+	@echo "=== шаг 1: RTL-ядра, платформа $(notdir $(XPFM)) ==="
+	cd $(REPO_ROOT) && $(MAKE) cmac_krnl    DEVICE=$(XPFM)
+	cd $(REPO_ROOT) && $(MAKE) network_krnl DEVICE=$(XPFM)
+
+# --- шаг 2: user-ядро в IP ---------------------------------------------------
+user_ip:
+	$(need_krnl)
+	$(need_board)
+	@echo "=== шаг 2: $(USER_KRNL) из HLS в IP-каталог ==="
+	cd $(REPO_ROOT) && USER_KRNL=$(USER_KRNL) BOARD=$(BOARD) \
+	     vitis_hls -f scripts/vivado/export_hls_ip.tcl
+
+# --- шаг 3: блок-дизайн ------------------------------------------------------
+bd:
+	$(need_krnl)
+	$(need_board)
+	@echo "=== шаг 3: блок-дизайн ==="
+	cd $(REPO_ROOT) && vivado -mode batch \
+	     -source scripts/vivado/build_bd.tcl \
+	     -tclargs $(USER_KRNL) $(BOARD)
+
+# --- шаг 4: синтез, имплементация, битстрим ----------------------------------
+#
+# Отдельно от шага 3, чтобы можно было пересобрать BD за полминуты, не запуская
+# час имплементации.
+#
+# Скрипт генерируется здесь, а не лежит в scripts/: он на треть состоит из путей
+# к проекту, то есть от USER_KRNL и BOARD, и держать его файлом означало бы
+# передавать те же параметры дважды.
+impl:
+	$(need_krnl)
+	$(need_board)
+	@if [ ! -f "$(PROJ_DIR)/net_vivado.xpr" ]; then \
+	     echo "ОШИБКА: нет проекта $(PROJ_DIR)/net_vivado.xpr"; \
+	     echo "Сначала шаг 3:"; \
+	     echo "  make -f Makefile.vivado bd USER_KRNL=$(USER_KRNL) BOARD=$(BOARD)"; \
+	     exit 1; \
+	fi
+	@echo "=== шаг 4: имплементация, jobs=$(JOBS) — это час с лишним ==="
+	@printf '%s\n' \
+	     'open_project $(PROJ_DIR)/net_vivado.xpr' \
+	     'launch_runs impl_1 -to_step write_bitstream -jobs $(JOBS)' \
+	     'wait_on_run impl_1' \
+	     'puts "@@@ IMPL:     [get_property STATUS   [get_runs impl_1]]"' \
+	     'puts "@@@ PROGRESS: [get_property PROGRESS [get_runs impl_1]]"' \
+	     'puts "@@@ WNS:      [get_property STATS.WNS [get_runs impl_1]]"' \
+	     'puts "@@@ WHS:      [get_property STATS.WHS [get_runs impl_1]]"' \
+	     'puts "@@@ BIT:      [glob -nocomplain $(PROJ_DIR)/net_vivado.runs/impl_1/*.bit]"' \
+	     > $(PROJ_DIR)/impl.tcl
+	cd $(REPO_ROOT) && vivado -mode batch -source $(PROJ_DIR)/impl.tcl
+	@echo ""
+	@if [ -f "$(BITSTREAM)" ]; then \
+	     echo "Битстрим: $(BITSTREAM)"; \
+	     echo "WNS/WHS смотреть в строках @@@ выше — оба обязаны быть положительными."; \
+	else \
+	     echo "Битстрим не создан — смотри лог выше."; \
+	     exit 1; \
+	fi
+
+all: xo user_ip bd impl
+
+# Снести артефакты одной пары плата+ядро, не задевая остальные и cmake-кеш.
+clean-krnl:
+	$(need_krnl)
+	$(need_board)
+	rm -rf $(PROJ_DIR)
+	rm -rf $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/src/hls/$(USER_KRNL)_ip_proj
+	@echo "удалено: $(PROJ_DIR) и HLS-проект ядра"

@@ -19,17 +19,33 @@
 # USR_OFF_* в scripts/vivado/jtag_ctrl.tcl.
 # -----------------------------------------------------------------------------
 
-# Имя ядра. Через переменную окружения, иначе hls_ouch_krnl:
-#     USER_KRNL=hls_echo_krnl vitis_hls -f scripts/vivado/export_hls_ip.tcl
+# Имя ядра и плата — через переменные окружения, ОБЕ обязательны:
+#     USER_KRNL=hls_echo_krnl BOARD=u200 vitis_hls -f scripts/vivado/export_hls_ip.tcl
+#
+# Проще через make:
+#     make -f Makefile.vivado user_ip USER_KRNL=hls_echo_krnl BOARD=u200
 #
 # Не -tclargs: vitis_hls кладёт в $argv ВСЁ, включая "-f" и путь к скрипту,
 # поэтому [lindex $argv 0] даёт "-f". (У vivado поведение другое — там
 # -tclargs отсекает свои аргументы, и build_bd.tcl читает их напрямую.)
-set KRNL [expr {[info exists ::env(USER_KRNL)] ? $::env(USER_KRNL) : "hls_ouch_krnl"}]
-puts "ядро: $KRNL"
+#
+# Дефолтов нет намеренно: с дефолтом забытый USER_KRNL собирал бы IP другого
+# ядра, BD на шаге 3 подхватил бы его молча, и разошлось бы только на железе.
+foreach v {USER_KRNL BOARD} {
+     if {![info exists ::env($v)]} {
+          puts "ОШИБКА: не задана переменная окружения $v"
+          puts ""
+          puts "  USER_KRNL=hls_echo_krnl BOARD=u200 \\"
+          puts "      vitis_hls -f scripts/vivado/export_hls_ip.tcl"
+          puts ""
+          puts "Проще: make -f Makefile.vivado user_ip USER_KRNL=hls_echo_krnl BOARD=u200"
+          exit 1
+     }
+}
 
-# Плата — тоже через окружение, по той же причине.
-set BOARD [expr {[info exists ::env(BOARD)] ? $::env(BOARD) : "u200"}]
+set KRNL  $::env(USER_KRNL)
+set BOARD $::env(BOARD)
+puts "ядро: $KRNL"
 
 set REPO_ROOT [file normalize [file dirname [info script]]/../..]
 
