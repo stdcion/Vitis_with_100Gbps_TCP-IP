@@ -76,14 +76,18 @@ set_property PACKAGE_PIN P6  [get_ports {qsfp1_gtx_n[3]}]
 # описаны ни в UG1289, ни в board file, ни в официальном XDC. Поэтому задаём
 # явно, константами из BD (см. build_bd.tcl).
 #
-# Полярности — из официального alveo XDC (страница продукта U200/U250):
-#     LPMODE  active high -> 0 = полная мощность (оптика включена)
-#     RESETL  active low  -> 1 = не в сбросе
-#     MODSELL active low  -> 1 = НЕ выбран для I2C
-# LPMODE/RESETL совпадают с преcетом заводского шелла (hw.xsa:
-# board/1.3/preset.xml, C_TRI_DEFAULT=0xFFFFFFF8, C_DOUT_DEFAULT=0x2).
-# MODSELL у нас 1, а в шелле 0 — на линк он не влияет (только I2C-адресация),
-# и без I2C-обвязки пассивное состояние правильнее; подробности в build_bd.tcl.
+# Требуемые уровни (значения задаются константами в build_bd.tcl):
+#     LPMODE  BD18/AV22  -> 0, полная мощность (active high по SFF-8679:
+#                             high = low-power). См. разбор ниже.
+#     RESETL  BE17/BC18  -> 1, НЕ в сбросе (active low)
+#     MODSELL BE16/AY20  -> 0, модуль выбран (active low)
+#
+# ВНИМАНИЕ по LPMODE: UG1289 Table 10 называет его "Active-Low ... must be High
+# for normal operation", что противоречит и стандарту SFF-8679 ("active high
+# logic ... low power mode when high"), и официальному alveo XDC, и преcету
+# заводского шелла, и рабочему железу — везде 0 = полная мощность. Считаем
+# строку UG1289 опечаткой. Полный разбор источников — в build_bd.tcl, там же
+# объяснено, почему это важно не «исправить» обратно.
 #
 # Пины сверены по ТРЁМ независимым источникам и совпадают:
 #   devices/u200/board_files/au200/1.3/part0_pins.xml (qsfp{N}_lowspeed_0..4),
