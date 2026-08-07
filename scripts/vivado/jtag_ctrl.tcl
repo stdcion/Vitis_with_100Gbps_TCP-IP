@@ -120,7 +120,14 @@ proc axi_read32 {addr} {
      run_hw_axi -quiet [get_hw_axi_txns $txn]
 
      set data [get_property DATA [get_hw_axi_txns $txn]]
-     return [expr {0x$data}]
+     # scan, а не expr {0x$data}: в фигурных скобках подстановки нет, и
+     # выражение «0x$data» падает с "invalid bareword x". Без скобок
+     # работало бы, но scan надёжнее — он не зависит от того, как Tcl
+     # разберёт строку, и корректен для 32-битных значений со старшим
+     # битом (0xFFFFFFFF даёт -1 при expr, но 4294967295 при %x).
+     set v 0
+     scan $data %x v
+     return $v
 }
 
 # --- network_krnl -------------------------------------------------------------
@@ -132,8 +139,12 @@ proc axi_read32 {addr} {
 proc network_configure {ip_str mac_str {arp 1} {n 1}} {
      set base [ouch_base_network $n]
 
-     set ip  [expr {0x$ip_str}]
-     set mac [expr {0x$mac_str}]
+     # scan вместо expr {0x$...}: см. пояснение в axi_read32. MAC 48 бит,
+     # поэтому %llx — на 32-битном %x старшие байты потерялись бы.
+     set ip 0
+     set mac 0
+     scan $ip_str  %x   ip
+     scan $mac_str %llx mac
 
      puts "network_krnl: ip=0x[format %08x $ip] mac=0x[format %012x $mac]"
 
@@ -304,4 +315,240 @@ proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
      echo_bringup $ip_str1 $mac_str1 1
      puts ""
      echo_bringup $ip_str2 $mac_str2 2
+}
+
+# =============================================================================
+# hls_echo_probe_dual_krnl — измерение задержки TCP-стека
+# =============================================================================
+#
+# Ядро содержит клиент (порт 0) и сервер-эхо (порт 1). Пакет уходит по
+# триггеру, обходит круг через кабель и возвращается; ядро защёлкивает
+# четыре сырых таймстемпа, хост считает интервалы.
+#
+# Порядок работы:
+#     echo_bringup_dual 0a01d498 000a35029de5 0a01d499 000a35029de6
+#     epd_configure 0a01d499 7001 64
+#     epd_enable 1
+#     epd_status                  ; # проверить, что соединение открылось
+#     epd_collect 20              ; # 20 замеров со статистикой
+#
+# СМЕЩЕНИЯ взяты из сгенерированного HLS заголовка драйвера:
+#     .../hls_echo_probe_dual_krnl_ip_proj/sol1/impl/misc/drivers/
+#         hls_echo_probe_dual_krnl_v1_0/src/xhls_echo_probe_dual_krnl_hw.h
+# Их печатает export_hls_ip.tcl в конце прогона.
+#
+# ВАЖНО ПРО ШАГ. У входных параметров шаг 8 байт, у выходных — 16: HLS
+# вставляет ap_vld-регистр после каждого выходного значения. Поэтому
+# смещения нельзя вычислить по порядку аргументов, только взять из
+# заголовка. При любой правке сигнатуры ядра — сверить заново.
+set ::EPD_OFF_SERVER_IP     0x10
+set ::EPD_OFF_SERVER_PORT   0x18
+set ::EPD_OFF_LISTEN_PORT   0x20
+set ::EPD_OFF_MSG_BYTES     0x28
+set ::EPD_OFF_TRIGGER_GO    0x30
+set ::EPD_OFF_CONN_ATTEMPTS 0x38
+set ::EPD_OFF_SENT          0x48
+set ::EPD_OFF_RECV          0x58
+set ::EPD_OFF_TIMEOUTS      0x68
+set ::EPD_OFF_ECHOES        0x78
+set ::EPD_OFF_TS_REQUEST    0x88
+set ::EPD_OFF_TS_ECHO_IN    0x98
+set ::EPD_OFF_TS_ECHO_OUT   0xa8
+set ::EPD_OFF_TS_REPLY      0xb8
+set ::EPD_OFF_SAMPLE_READY  0xc8
+set ::EPD_OFF_ENABLE        0xd8
+
+# Период такта ap_clk, нс. Должен совпадать с DEV_FREQ_MHZ в
+# devices/<плата>/device.tcl (170 МГц -> 5.882 нс). Если частоту меняли,
+# поправить здесь, иначе пересчёт в наносекунды соврёт.
+set ::EPD_CLK_NS 5.882
+
+# Счётчик триггеров: фронт ловится по ИЗМЕНЕНИЮ значения, поэтому
+# сбрасывать регистр в ноль между замерами не нужно.
+set ::EPD_TRIG 0
+
+# Параметры. serverIp — в hex без префикса, как в network_configure.
+# listenPort всегда равен serverPort: клиент подключается туда, где
+# слушает сервер.
+proc epd_configure {serverIp serverPort msgBytes {n 1}} {
+     set base [ouch_base_user $n]
+
+     puts "epd\[$n\]: server=0x$serverIp:$serverPort msg=$msgBytes байт"
+
+     set sip 0
+     scan $serverIp %x sip
+     axi_write32 [expr {$base + $::EPD_OFF_SERVER_IP}]   $sip
+     axi_write32 [expr {$base + $::EPD_OFF_SERVER_PORT}] $serverPort
+     axi_write32 [expr {$base + $::EPD_OFF_LISTEN_PORT}] $serverPort
+     axi_write32 [expr {$base + $::EPD_OFF_MSG_BYTES}]   $msgBytes
+
+     # Проверяем чтением: без этого «ядро не отвечает» не отличить от
+     # «параметры не записались».
+     set rd [axi_read32 [expr {$base + $::EPD_OFF_MSG_BYTES}]]
+     if {$rd != $msgBytes} {
+          puts "  *** ЗАПИСЬ НЕ ПОДТВЕРДИЛАСЬ (msgBytes=$rd, ждали $msgBytes)"
+          puts "      проверь ouch_base_user $n и что загружен этот битстрим"
+          return 0
+     }
+     puts "  запись подтверждена"
+     return 1
+}
+
+# enable ПОСЛЕДНИМ: до него ядро не трогает порты стека, потому что
+# параметры в регистрах могут быть ещё не записаны.
+proc epd_enable {{v 1} {n 1}} {
+     puts "epd\[$n\]: enable=$v"
+     axi_write32 [expr {[ouch_base_user $n] + $::EPD_OFF_ENABLE}] $v
+}
+
+# Счётчики: по ним видно, на каком этапе встало.
+proc epd_status {{n 1}} {
+     set base [ouch_base_user $n]
+     set att [axi_read32 [expr {$base + $::EPD_OFF_CONN_ATTEMPTS}]]
+     set snt [axi_read32 [expr {$base + $::EPD_OFF_SENT}]]
+     set ech [axi_read32 [expr {$base + $::EPD_OFF_ECHOES}]]
+     set rcv [axi_read32 [expr {$base + $::EPD_OFF_RECV}]]
+     set tmo [axi_read32 [expr {$base + $::EPD_OFF_TIMEOUTS}]]
+     set rdy [axi_read32 [expr {$base + $::EPD_OFF_SAMPLE_READY}]]
+
+     puts "epd\[$n\]: попыток соединения=$att отправлено=$snt эхо=$ech получено=$rcv таймаутов=$tmo ready=$rdy"
+
+     # Диагностика: где именно оборвалась цепочка.
+     if {$att == 0} {
+          puts "  -> клиент не пытался открыть соединение: enable=0?"
+     } elseif {$snt == 0 && $att > 3} {
+          puts "  -> соединение не открылось. Сервер не поднял listen, либо"
+          puts "     нет линка между портами (проверь ping и stat_rx_aligned в VIO)"
+     } elseif {$snt > 0 && $ech == 0} {
+          puts "  -> запрос не дошёл до порта 1: линк, кабель или размещение CMAC"
+     } elseif {$ech > 0 && $rcv == 0} {
+          puts "  -> эхо ответило, но ответ не вернулся: обратный путь"
+     }
+     return [list $att $snt $ech $rcv $tmo $rdy]
+}
+
+# Один замер: дёрнуть триггер, дождаться sampleReady, прочитать четвёрку.
+#
+# Гонки чтения нет по построению: пока не дёрнем триггер снова, новый
+# пакет не отправится и регистры не изменятся.
+#
+# Возвращает {t1p t2p t1 t2} либо пустой список при таймауте.
+proc epd_sample {{n 1} {timeout_ms 500}} {
+     set base [ouch_base_user $n]
+
+     # Запись triggerGo снимает sampleReady и пускает пакет — одна
+     # транзакция на два действия.
+     incr ::EPD_TRIG
+     axi_write32 [expr {$base + $::EPD_OFF_TRIGGER_GO}] $::EPD_TRIG
+
+     set t0 [clock milliseconds]
+     while {1} {
+          if {[axi_read32 [expr {$base + $::EPD_OFF_SAMPLE_READY}]] == 1} break
+          if {[expr {[clock milliseconds] - $t0}] > $timeout_ms} {
+               return {}
+          }
+     }
+
+     set t1p [axi_read32 [expr {$base + $::EPD_OFF_TS_REQUEST}]]
+     set t2p [axi_read32 [expr {$base + $::EPD_OFF_TS_ECHO_IN}]]
+     set t1  [axi_read32 [expr {$base + $::EPD_OFF_TS_ECHO_OUT}]]
+     set t2  [axi_read32 [expr {$base + $::EPD_OFF_TS_REPLY}]]
+
+     return [list $t1p $t2p $t1 $t2]
+}
+
+# Вычитание по модулю 2^32 — так же, как в железе. Нужно, потому что
+# счётчик тактов оборачивается каждые ~25 с на 170 МГц, и разность через
+# границу должна остаться правильной.
+proc _epd_sub32 {a b} { return [expr {($a - $b) & 0xFFFFFFFF}] }
+
+# Считает четыре интервала из сырых таймстемпов.
+# Возвращает {rtt fwd echo rev} в тактах.
+proc epd_intervals {sample} {
+     lassign $sample t1p t2p t1 t2
+     set rtt [_epd_sub32 $t2  $t1p]
+     set fwd [_epd_sub32 $t2p $t1p]
+     set ech [_epd_sub32 $t1  $t2p]
+     set rev [_epd_sub32 $t2  $t1]
+     return [list $rtt $fwd $ech $rev]
+}
+
+# Один замер с печатью. Заодно проверяет баланс: сумма участков обязана
+# совпасть с полным кругом, иначе таймстемпы от разных пакетов.
+proc epd_measure {{n 1}} {
+     set s [epd_sample $n]
+     if {[llength $s] == 0} {
+          puts "epd: замер не удался (нет sampleReady за таймаут)"
+          epd_status $n
+          return {}
+     }
+     lassign [epd_intervals $s] rtt fwd ech rev
+     set ns $::EPD_CLK_NS
+
+     puts [format "  RTT     %6d тактов  %9.1f нс" $rtt [expr {$rtt*$ns}]]
+     puts [format "  NET_FWD %6d           %9.1f" $fwd [expr {$fwd*$ns}]]
+     puts [format "  ECHO    %6d           %9.1f" $ech [expr {$ech*$ns}]]
+     puts [format "  NET_REV %6d           %9.1f" $rev [expr {$rev*$ns}]]
+
+     set sum [expr {$fwd + $ech + $rev}]
+     if {$sum != $rtt} {
+          puts "  *** БАЛАНС НЕ СХОДИТСЯ: $fwd+$ech+$rev=$sum, а RTT=$rtt"
+          puts "      значит таймстемпы от разных пакетов — числа выбросить"
+     }
+     return [list $rtt $fwd $ech $rev]
+}
+
+# Сколько стоит одна JTAG-транзакция. Полезно знать до сбора статистики:
+# от этого зависит, сколько замеров реально успеть.
+proc epd_calibrate {{n 1} {iters 100}} {
+     set base [ouch_base_user $n]
+     set t0 [clock milliseconds]
+     for {set i 0} {$i < $iters} {incr i} {
+          axi_read32 [expr {$base + $::EPD_OFF_SAMPLE_READY}]
+     }
+     set dt [expr {[clock milliseconds] - $t0}]
+     set per [expr {double($dt)/$iters}]
+     puts [format "JTAG: %d чтений за %d мс = %.2f мс на транзакцию" $iters $dt $per]
+     puts [format "      один замер (~6 транзакций) ≈ %.0f мс" [expr {$per*6}]]
+     return $per
+}
+
+# Серия замеров со сводкой. count в пределах десятков-сотен: этого
+# достаточно, чтобы увидеть порядок величины и разброс. Тысячи нужны
+# только для хвоста распределения, а он относится к замеру под
+# нагрузкой — там понадобится другой режим.
+proc epd_collect {count {n 1}} {
+     set names {RTT NET_FWD ECHO NET_REV}
+     set data  {{} {} {} {}}
+     set bad 0
+
+     for {set i 0} {$i < $count} {incr i} {
+          set s [epd_sample $n]
+          if {[llength $s] == 0} { incr bad; continue }
+          set iv [epd_intervals $s]
+          lassign $iv rtt fwd ech rev
+          # Отбрасываем несогласованные наборы вместо того, чтобы
+          # портить ими статистику.
+          if {[expr {$fwd + $ech + $rev}] != $rtt} { incr bad; continue }
+          for {set k 0} {$k < 4} {incr k} {
+               lset data $k [concat [lindex $data $k] [lindex $iv $k]]
+          }
+     }
+
+     set got [llength [lindex $data 0]]
+     puts ""
+     puts "=== $got замеров из $count (отброшено: $bad) ==="
+     if {$got == 0} { epd_status $n; return }
+
+     puts [format "%-9s %8s %8s %9s   %s" "" "min" "max" "среднее" "нс (сред.)"]
+     for {set k 0} {$k < 4} {incr k} {
+          set v [lindex $data $k]
+          set mn [lindex [lsort -integer $v] 0]
+          set mx [lindex [lsort -integer $v] end]
+          set sum 0
+          foreach x $v { incr sum $x }
+          set avg [expr {double($sum)/$got}]
+          puts [format "%-9s %8d %8d %9.1f   %9.1f" \
+                    [lindex $names $k] $mn $mx $avg [expr {$avg*$::EPD_CLK_NS}]]
+     }
 }
