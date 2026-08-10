@@ -1,59 +1,68 @@
 # -----------------------------------------------------------------------------
 # jtag_ctrl.tcl
 #
-# Замена OpenCL-хоста для Vivado-флоу: конфигурирует ядра и читает счётчики
-# через JTAG-to-AXI Master вместо XRT.
+# Replaces the OpenCL host for the Vivado flow: configures kernels and reads
+# counters over the JTAG-to-AXI Master instead of XRT.
 #
-# Соответствие с Vitis-версией (host/hls_ouch_krnl/host.cpp):
-#     setArg(i, v)      -> запись в s_axi_control по смещению аргумента
-#     enqueueTask(k)    -> запись ap_start=1 (только для ap_ctrl_hs ядер!)
-#     чтение счётчиков  -> чтение s_axi_control (OpenCL так не умел вовсе)
+# ASCII ONLY. Vivado's Tcl console mangles non-ASCII output (the console
+# encoding is not UTF-8 on Windows), which turns every message into garbage
+# and makes error text unreadable. Keep all comments and puts strings ASCII.
 #
-# Запускать в Hardware Manager после программирования устройства:
+# Mapping to the Vitis version (host/hls_ouch_krnl/host.cpp):
+#     setArg(i, v)      -> write to s_axi_control at the argument offset
+#     enqueueTask(k)    -> write ap_start=1 (ap_ctrl_hs kernels only!)
+#     reading counters  -> read s_axi_control (OpenCL could not do this at all)
+#
+# Run in Hardware Manager after programming the device:
 #     open_hw_manager; connect_hw_server; open_hw_target
 #     current_hw_device [lindex [get_hw_devices] 0]
 #     source scripts/vivado/jtag_ctrl.tcl
 #
-#     hls_ouch_krnl (есть s_axi_control — listenPort/enable/счётчики):
+#     hls_ouch_krnl (has s_axi_control -- listenPort/enable/counters):
 #         ouch_bringup 7001 "0a01d498" "000a35029de5"
 #         NUM_QSFP=2: ouch_bringup_dual 7001 "0a01d498" "000a35029de5" \
 #                                       7002 "0a01d499" "000a35029de6"
 #
-#     hls_echo_krnl (порт зашит константой, БЕЗ s_axi_control — только сеть):
+#     hls_echo_krnl (port hardcoded, NO s_axi_control -- network only):
 #         echo_bringup "0a01d498" "000a35029de5"
 #         NUM_QSFP=2: echo_bringup_dual "0a01d498" "000a35029de5" \
 #                                        "0a01d499" "000a35029de6"
 #
-#     Любую процедуру ниже можно вызвать и по отдельности через последний
-#     аргумент n (1=QSFP0, 2=QSFP1).
+#     hls_echo_probe_dual_krnl (TCP stack latency measurement):
+#         see the epd_* section at the bottom of this file
+#
+#     Every procedure below can also be called on its own via the trailing
+#     argument n (1=QSFP0, 2=QSFP1).
 #
 # -----------------------------------------------------------------------------
-# ВАЖНО про два разных протокола управления:
+# IMPORTANT -- two different control protocols:
 #
-#   network_krnl объявлен ap_ctrl_hs (см. kernel/network_krnl/network_krnl.xml,
-#   hwControlProtocol="ap_ctrl_hs"). Ему НУЖЕН ap_start, иначе стек не
-#   запустится и всё будет молча стоять. В Vitis это делал enqueueTask().
+#   network_krnl is declared ap_ctrl_hs (see kernel/network_krnl/
+#   network_krnl.xml, hwControlProtocol="ap_ctrl_hs"). It NEEDS ap_start,
+#   otherwise the stack never starts and everything silently stalls. In Vitis
+#   this was done by enqueueTask().
 #
-#   hls_ouch_krnl объявлен ap_ctrl_none (#pragma HLS INTERFACE ap_ctrl_none
-#   port=return). У него нет регистра ap_start вообще — ядро "течёт" всё время,
-#   пока подан клок. Поэтому его enable-аргумент и служит разрешением начать
-#   работу: см. комментарий у ouch_listen в hls_ouch_krnl.cpp про гонку.
+#   hls_ouch_krnl is declared ap_ctrl_none (#pragma HLS INTERFACE ap_ctrl_none
+#   port=return). It has no ap_start register at all -- the kernel "flows" as
+#   long as the clock is running. That is why its enable argument acts as the
+#   permission to start: see the comment at ouch_listen in hls_ouch_krnl.cpp
+#   about the race.
 # -----------------------------------------------------------------------------
 
-# Базовые адреса s_axi_control. build_bd.tcl задаёт их явно (_addr_network/
-# _addr_user, шаг 0x20000 между каналами) и проверяет результат, поэтому здесь
-# просто та же формула. Канал N=1 — QSFP0, N=2 — QSFP1, и т.д. Если менять —
-# менять в обоих файлах.
+# s_axi_control base addresses. build_bd.tcl sets them explicitly
+# (_addr_network/_addr_user, step 0x20000 between channels) and checks the
+# result, so this is just the same formula. Channel N=1 is QSFP0, N=2 is
+# QSFP1, and so on. If you change this, change it in both files.
 proc ouch_base_network {{n 1}} { return [expr {($n - 1) * 0x20000}] }
 proc ouch_base_user    {{n 1}} { return [expr {($n - 1) * 0x20000 + 0x10000}] }
 
-# Оставлены для обратной совместимости со старыми вызовами (один канал,
-# N=1) — новый код должен использовать ouch_base_network N/ouch_base_user N.
+# Kept for backwards compatibility with older single-channel (N=1) calls --
+# new code should use ouch_base_network N / ouch_base_user N.
 set ::OUCH_BASE_NETWORK [ouch_base_network 1]
 set ::OUCH_BASE_USER    [ouch_base_user 1]
 
-# Смещения регистров network_krnl — взяты из network_krnl.xml (атрибут offset
-# у каждого <arg>), не угаданы.
+# network_krnl register offsets -- taken from network_krnl.xml (the offset
+# attribute of each <arg>), not guessed.
 set ::NET_OFF_AP_CTRL   0x000
 set ::NET_OFF_IP_ADDR   0x010
 set ::NET_OFF_MAC_ADDR  0x018
@@ -61,32 +70,58 @@ set ::NET_OFF_ARP       0x024
 set ::NET_OFF_AXI00_PTR 0x02c
 set ::NET_OFF_AXI01_PTR 0x038
 
-# Смещения регистров hls_ouch_krnl.
+# hls_ouch_krnl register offsets.
 #
-# Взяты из xhls_ouch_krnl_hw.h, который сгенерировал export_design
-# (ouch_ip_proj/sol1/impl/ip/drivers/hls_ouch_krnl_v1_0/src/) — не угаданы.
-# export_hls_ip.tcl печатает их в конце прогона; при изменении сигнатуры ядра
-# сверить заново.
+# Taken from xhls_ouch_krnl_hw.h generated by export_design
+# (ouch_ip_proj/sol1/impl/ip/drivers/hls_ouch_krnl_v1_0/src/) -- not guessed.
+# export_hls_ip.tcl prints them at the end of its run; re-check them whenever
+# the kernel signature changes.
 #
-# Порядок в C++ смещения НЕ задаёт: между аргументами HLS вставляет
-# ap_vld-регистры для выходных значений (0x20 для rxByteCount, 0x34 для
-# rxPacketCount), поэтому enable оказался на 0x40, а не сразу за счётчиками.
+# The C++ argument order does NOT determine the offsets: HLS inserts ap_vld
+# registers for output values (0x20 for rxByteCount, 0x34 for rxPacketCount),
+# which is why enable ended up at 0x40 rather than right after the counters.
 #
-# Ядро ap_ctrl_none, поэтому регистра ap_ctrl (0x00) у него нет вовсе.
+# The kernel is ap_ctrl_none, so it has no ap_ctrl register (0x00) at all.
 set ::USR_OFF_LISTEN_PORT   0x10
 set ::USR_OFF_RX_BYTE_LO    0x18
 set ::USR_OFF_RX_BYTE_HI    0x1c
 set ::USR_OFF_RX_PKT        0x30
 set ::USR_OFF_ENABLE        0x40
 
-# --- низкоуровневый доступ -----------------------------------------------------
+# --- hex string parsing --------------------------------------------------------
+
+# Inside expr {...} the substitution is done by expr's own parser, and it
+# cannot glue the literal 0x onto a variable: expr {0x$ip_str} fails with
+# "invalid bareword 0x". So build the string in quotes (where substitution
+# does work) and coerce it to a number with + 0.
+#
+# Why not scan $s %x v:
+#   * On a bad argument scan silently leaves v unset, and the failure surfaces
+#     later as "can't read v" somewhere unrelated. The regexp below rejects
+#     the input where the mistake actually is.
+#   * The +0 form yields an unsigned value, so 0xFFFFFFFF reads back as
+#     4294967295 rather than -1. That matters because axi_read32 feeds
+#     counters and timestamps straight into integer comparisons.
+#
+# Tcl 8.5+ computes in 64 bits, so a 48-bit MAC passes through intact and the
+# >> 32 shift stays correct.
+proc _hex2int {s} {
+     set s [string trim $s]
+     regsub -nocase {^0x} $s "" s
+     if {![regexp {^[0-9a-fA-F]+$} $s]} {
+          error "expected a hex number without prefix, got: '$s'"
+     }
+     return [expr {"0x$s" + 0}]
+}
+
+# --- low level access ----------------------------------------------------------
 
 proc _jtag_axi_name {} {
-     # Имя AXI-мастера в Hardware Manager: обычно hw_axi_1, но зависит от того,
-     # как назван jtag_axi в BD.
+     # Name of the AXI master in Hardware Manager: usually hw_axi_1, but it
+     # depends on how jtag_axi is named in the BD.
      set axis [get_hw_axis -quiet]
      if {[llength $axis] == 0} {
-          error "JTAG-to-AXI мастер не найден. Устройство запрограммировано? В дизайне есть jtag_axi IP?"
+          error "JTAG-to-AXI master not found. Is the device programmed? Does the design contain the jtag_axi IP?"
      }
      return [lindex $axis 0]
 }
@@ -96,8 +131,8 @@ proc axi_write32 {addr value} {
      set addr_hex [format %08x $addr]
      set data_hex [format %08x $value]
 
-     # Транзакции переиспользуются, поэтому старую с тем же именем удаляем —
-     # иначе create_hw_axi_txn падает на дубликате.
+     # Transactions are reused, so delete an old one with the same name --
+     # otherwise create_hw_axi_txn fails on the duplicate.
      set txn "wr_$addr_hex"
      if {[llength [get_hw_axi_txns -quiet $txn]] > 0} {
           delete_hw_axi_txn [get_hw_axi_txns $txn]
@@ -120,81 +155,70 @@ proc axi_read32 {addr} {
      run_hw_axi -quiet [get_hw_axi_txns $txn]
 
      set data [get_property DATA [get_hw_axi_txns $txn]]
-     # scan, а не expr {0x$data}: в фигурных скобках подстановки нет, и
-     # выражение «0x$data» падает с "invalid bareword x". Без скобок
-     # работало бы, но scan надёжнее — он не зависит от того, как Tcl
-     # разберёт строку, и корректен для 32-битных значений со старшим
-     # битом (0xFFFFFFFF даёт -1 при expr, но 4294967295 при %x).
-     set v 0
-     scan $data %x v
-     return $v
+     return [_hex2int $data]
 }
 
 # --- network_krnl -------------------------------------------------------------
 
-# ip_str  — IP в hex без префикса, порядок как в host.cpp (там local_IP
-#           собирается как 0x0A01D498 для 10.1.212.152)
-# mac_str — MAC в hex, 48 бит
-# n       — номер канала (1 = QSFP0, 2 = QSFP1, ...), см. ouch_base_network.
+# ip_str  -- IP in hex without prefix, same byte order as host.cpp (there
+#            local_IP is built as 0x0A01D498 for 10.1.212.152)
+# mac_str -- MAC in hex, 48 bits
+# n       -- channel number (1 = QSFP0, 2 = QSFP1, ...), see ouch_base_network.
 proc network_configure {ip_str mac_str {arp 1} {n 1}} {
      set base [ouch_base_network $n]
 
-     # scan вместо expr {0x$...}: см. пояснение в axi_read32. MAC 48 бит,
-     # поэтому %llx — на 32-битном %x старшие байты потерялись бы.
-     set ip 0
-     set mac 0
-     scan $ip_str  %x   ip
-     scan $mac_str %llx mac
+     set ip  [_hex2int $ip_str]
+     set mac [_hex2int $mac_str]
 
      puts "network_krnl: ip=0x[format %08x $ip] mac=0x[format %012x $mac]"
 
      axi_write32 [expr {$base + $::NET_OFF_IP_ADDR}] $ip
 
-     # mac_addr — 64-битный аргумент, s_axilite отдаёт его двумя словами.
+     # mac_addr is a 64-bit argument, s_axilite exposes it as two words.
      axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR}]       [expr {$mac & 0xffffffff}]
      axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]   [expr {($mac >> 32) & 0xffffffff}]
 
      axi_write32 [expr {$base + $::NET_OFF_ARP}] $arp
 
-     # Читаем обратно. Регистры ip_addr/mac_addr/arp в network_control_s_axi —
-     # обычные read/write, поэтому прочитанное значение подтверждает, что запись
-     # по JTAG дошла. Без этой проверки "стек не отвечает" не отличить от
-     # "адреса не записались".
+     # Read back. The ip_addr/mac_addr/arp registers in network_control_s_axi
+     # are plain read/write, so the value read back confirms the JTAG write
+     # landed. Without this check "the stack does not respond" is
+     # indistinguishable from "the addresses were never written".
      set rd_ip  [axi_read32 [expr {$base + $::NET_OFF_IP_ADDR}]]
      set rd_lo  [axi_read32 [expr {$base + $::NET_OFF_MAC_ADDR}]]
      set rd_hi  [axi_read32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]]
      set rd_mac [expr {($rd_hi << 32) | $rd_lo}]
 
-     puts "  прочитано:  ip=0x[format %08x $rd_ip] mac=0x[format %012x $rd_mac]"
+     puts "  read back:  ip=0x[format %08x $rd_ip] mac=0x[format %012x $rd_mac]"
 
      if {$rd_ip != $ip || $rd_mac != $mac} {
-          puts "  *** ЗАПИСЬ НЕ ПОДТВЕРДИЛАСЬ — проверь ouch_base_network $n и что"
-          puts "      устройство запрограммировано этим битстримом"
+          puts "  *** WRITE NOT CONFIRMED -- check ouch_base_network $n and that"
+          puts "      the device is programmed with this bitstream"
           return 0
      }
-     puts "  запись подтверждена"
+     puts "  write confirmed"
 
-     # ВАЖНО: сами адреса стек защёлкивает не сейчас, а по фронту ap_start —
-     # в network_stack.sv это
+     # IMPORTANT: the stack latches the addresses not now but on the ap_start
+     # edge -- in network_stack.sv that is
      #     assign set_ip_addr_valid  = ap_start_pulse;
      #     assign set_mac_addr_valid = ap_start_pulse;
-     # Поэтому network_configure ОБЯЗАТЕЛЬНО вызывать ДО network_start.
+     # So network_configure MUST be called BEFORE network_start.
      return 1
 }
 
-# Буферы для TCP session tables. В Vitis это были cl::Buffer, которые XRT
-# размещал в DDR сам (host.cpp: buffer_r1/buffer_r2 по 8 КБ каждый); здесь
-# адреса задаём вручную.
+# Buffers for the TCP session tables. In Vitis these were cl::Buffer objects
+# that XRT placed in DDR itself (host.cpp: buffer_r1/buffer_r2, 8 KB each);
+# here the addresses are set by hand.
 #
-# Значения по умолчанию — начало и середина диапазона DDR4 c3 (16 ГБ, банк
-# DDR[3] — тот же, что задавал NETWORK_KRNL_MEM в CMakeLists.txt для u200).
-# Точный базовый адрес печатает build_bd.tcl в карте адресов; если он не 0,
-# сдвинуть оба значения.
-# n — номер канала. Оба network_krnl делят один DDR4-банк (первая итерация,
-# см. build_bd.tcl), поэтому у разных каналов буферы ДОЛЖНЫ смотреть в разные
-# диапазоны — иначе session tables обоих стеков затрут друг друга. Дефолты
-# ниже валидны только для n=1; для n=2 передавай непересекающийся диапазон
-# (например 0x80000000/0xC0000000).
+# The defaults are the start and the middle of the DDR4 c3 range (16 GB, bank
+# DDR[3] -- the same one NETWORK_KRNL_MEM set in CMakeLists.txt for u200).
+# build_bd.tcl prints the exact base address in its address map; if it is not
+# 0, shift both values.
+# n -- channel number. Both network_krnl instances share one DDR4 bank (first
+# iteration, see build_bd.tcl), so different channels MUST point at different
+# ranges -- otherwise the two stacks overwrite each other's session tables.
+# The defaults below are valid for n=1 only; for n=2 pass a non-overlapping
+# range (for example 0x80000000/0xC0000000).
 proc network_set_buffers {{ptr0 0x00000000} {ptr1 0x40000000} {n 1}} {
      set base [ouch_base_network $n]
 
@@ -206,12 +230,12 @@ proc network_set_buffers {{ptr0 0x00000000} {ptr1 0x40000000} {n 1}} {
      axi_write32 [expr {$base + $::NET_OFF_AXI01_PTR + 4}] [expr {($ptr1 >> 32) & 0xffffffff}]
 }
 
-# Аналог enqueueTask(network_kernel). Только для ap_ctrl_hs.
+# Equivalent of enqueueTask(network_kernel). ap_ctrl_hs only.
 proc network_start {{n 1}} {
      set addr [expr {[ouch_base_network $n] + $::NET_OFF_AP_CTRL}]
 
-     # ap_start(бит0) + auto_restart(бит7): стек должен работать непрерывно,
-     # а не отработать один раз и встать.
+     # ap_start (bit 0) + auto_restart (bit 7): the stack must run
+     # continuously rather than run once and stop.
      axi_write32 $addr 0x81
 
      set ctrl [axi_read32 $addr]
@@ -226,14 +250,14 @@ proc ouch_configure {listen_port {n 1}} {
      axi_write32 [expr {$base + $::USR_OFF_LISTEN_PORT}] $listen_port
 }
 
-# enable пишется последним — это разрешение начать работу. См. комментарий
-# про гонку с ap_ctrl_none в hls_ouch_krnl.cpp.
+# enable is written last -- it is the permission to start. See the comment
+# about the ap_ctrl_none race in hls_ouch_krnl.cpp.
 proc ouch_enable {{v 1} {n 1}} {
      puts "hls_ouch_krnl\[$n\]: enable=$v"
      axi_write32 [expr {[ouch_base_user $n] + $::USR_OFF_ENABLE}] $v
 }
 
-# То, чего не мог OpenCL-хост: прочитать выходные счётчики.
+# What the OpenCL host could not do: read the output counters.
 proc ouch_counters {{n 1}} {
      set base [ouch_base_user $n]
 
@@ -249,7 +273,7 @@ proc ouch_counters {{n 1}} {
      return [list $bytes $pkt]
 }
 
-# Периодический опрос — удобно, чтобы видеть, что трафик идёт.
+# Periodic polling -- handy to see that traffic is flowing.
 proc ouch_watch {{iterations 10} {delay_ms 1000} {n 1}} {
      for {set i 0} {$i < $iterations} {incr i} {
           set c [ouch_counters $n]
@@ -258,15 +282,15 @@ proc ouch_watch {{iterations 10} {delay_ms 1000} {n 1}} {
      }
 }
 
-# --- всё вместе ---------------------------------------------------------------
+# --- everything together ------------------------------------------------------
 
-# Общая часть bringup: сеть (IP/MAC/буферы/ap_start) для канала n.
-# n — номер канала (1 = QSFP0, 2 = QSFP1, ...).
+# Common bringup part: network (IP/MAC/buffers/ap_start) for channel n.
+# n -- channel number (1 = QSFP0, 2 = QSFP1, ...).
 proc _network_bringup {ip_str mac_str n} {
      network_configure $ip_str $mac_str 1 $n
-     # ptr0/ptr1 по умолчанию валидны только для n=1 — при двух каналах на
-     # одном DDR4-банке (см. build_bd.tcl) второй канал должен получить
-     # непересекающийся диапазон, иначе session tables затрут друг друга.
+     # The default ptr0/ptr1 are valid for n=1 only -- with two channels on
+     # one DDR4 bank (see build_bd.tcl) the second channel must get a
+     # non-overlapping range, otherwise the session tables clobber each other.
      if {$n == 1} {
           network_set_buffers 0x00000000 0x40000000 $n
      } else {
@@ -275,24 +299,25 @@ proc _network_bringup {ip_str mac_str n} {
      network_start $n
 }
 
-# Порядок важен и повторяет host.cpp: сначала сконфигурировать сеть, запустить
-# стек, потом настроить user-ядро и только в конце разрешить ему работу.
+# The order matters and mirrors host.cpp: configure the network first, start
+# the stack, then configure the user kernel and only at the end allow it to
+# run.
 #
-# ТОЛЬКО для ядер с s_axi_control (hls_ouch_krnl). Для hls_echo_krnl используй
-# echo_bringup ниже — у него нет ни listenPort, ни enable регистров, запись
-# по несуществующему адресу в ctrl_interconnect уйдёт в DECERR.
+# ONLY for kernels with s_axi_control (hls_ouch_krnl). For hls_echo_krnl use
+# echo_bringup below -- it has neither listenPort nor enable registers, and a
+# write to a non-existent address in ctrl_interconnect ends up as DECERR.
 proc ouch_bringup {listen_port ip_str mac_str {n 1}} {
-     puts "=== bringup канал $n (ouch) ==="
+     puts "=== bringup channel $n (ouch) ==="
      _network_bringup $ip_str $mac_str $n
 
      ouch_configure $listen_port $n
      ouch_enable 1 $n
 
-     puts "=== готово, канал $n слушает порт $listen_port ==="
+     puts "=== done, channel $n is listening on port $listen_port ==="
      ouch_counters $n
 }
 
-# Поднять сразу оба канала гейтвея одним вызовом (hls_ouch_krnl).
+# Bring up both gateway channels in one call (hls_ouch_krnl).
 #   ouch_bringup_dual 7001 "0a01d498" "000a35029de5" 7002 "0a01d499" "000a35029de6"
 proc ouch_bringup_dual {listen_port1 ip_str1 mac_str1 listen_port2 ip_str2 mac_str2} {
      ouch_bringup $listen_port1 $ip_str1 $mac_str1 1
@@ -300,16 +325,20 @@ proc ouch_bringup_dual {listen_port1 ip_str1 mac_str1 listen_port2 ip_str2 mac_s
      ouch_bringup $listen_port2 $ip_str2 $mac_str2 2
 }
 
-# Аналог ouch_bringup для hls_echo_krnl: у него нет s_axi_control (порт
-# слушания зашит константой LISTEN_PORT в hls_echo_krnl.cpp), поэтому только
-# сеть — IP/MAC/ap_start. n — номер канала (1 = QSFP0, 2 = QSFP1, ...).
+# The hls_echo_krnl counterpart of ouch_bringup: it has no s_axi_control (the
+# listen port is hardcoded as LISTEN_PORT in hls_echo_krnl.cpp), so network
+# only -- IP/MAC/ap_start. n -- channel number (1 = QSFP0, 2 = QSFP1, ...).
 proc echo_bringup {ip_str mac_str {n 1}} {
-     puts "=== bringup канал $n (echo) ==="
+     puts "=== bringup channel $n (echo) ==="
      _network_bringup $ip_str $mac_str $n
-     puts "=== готово, канал $n слушает порт, зашитый в hls_echo_krnl.cpp (LISTEN_PORT) ==="
+     # NOTE: says nothing about the listen port on purpose. For hls_echo_krnl
+     # it is hardcoded (LISTEN_PORT); for hls_dual_echo_krnl it comes from
+     # dual_echo_configure, which runs after this. Claiming a port number
+     # here would be wrong for one of the two kernels.
+     puts "=== done, channel $n network is up (IP/MAC latched, stack started) ==="
 }
 
-# Поднять сразу оба канала для hls_echo_krnl.
+# Bring up both channels for hls_echo_krnl.
 #   echo_bringup_dual "0a01d498" "000a35029de5" "0a01d499" "000a35029de6"
 proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
      echo_bringup $ip_str1 $mac_str1 1
@@ -318,29 +347,30 @@ proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
 }
 
 # =============================================================================
-# hls_echo_probe_dual_krnl — измерение задержки TCP-стека
+# hls_echo_probe_dual_krnl -- TCP stack latency measurement
 # =============================================================================
 #
-# Ядро содержит клиент (порт 0) и сервер-эхо (порт 1). Пакет уходит по
-# триггеру, обходит круг через кабель и возвращается; ядро защёлкивает
-# четыре сырых таймстемпа, хост считает интервалы.
+# The kernel contains a client (port 0) and an echo server (port 1). A packet
+# is sent on a trigger, travels around the loop through the cable and comes
+# back; the kernel latches four raw timestamps and the host computes the
+# intervals.
 #
-# Порядок работы:
+# Usage:
 #     echo_bringup_dual 0a01d498 000a35029de5 0a01d499 000a35029de6
 #     epd_configure 0a01d499 7001 64
 #     epd_enable 1
-#     epd_status                  ; # проверить, что соединение открылось
-#     epd_collect 20              ; # 20 замеров со статистикой
+#     epd_status                  ; # check that the connection opened
+#     epd_collect 20              ; # 20 samples with statistics
 #
-# СМЕЩЕНИЯ взяты из сгенерированного HLS заголовка драйвера:
+# OFFSETS are taken from the generated HLS driver header:
 #     .../hls_echo_probe_dual_krnl_ip_proj/sol1/impl/misc/drivers/
 #         hls_echo_probe_dual_krnl_v1_0/src/xhls_echo_probe_dual_krnl_hw.h
-# Их печатает export_hls_ip.tcl в конце прогона.
+# export_hls_ip.tcl prints them at the end of its run.
 #
-# ВАЖНО ПРО ШАГ. У входных параметров шаг 8 байт, у выходных — 16: HLS
-# вставляет ap_vld-регистр после каждого выходного значения. Поэтому
-# смещения нельзя вычислить по порядку аргументов, только взять из
-# заголовка. При любой правке сигнатуры ядра — сверить заново.
+# IMPORTANT ABOUT THE STRIDE. Input parameters are 8 bytes apart, outputs are
+# 16: HLS inserts an ap_vld register after every output value. So the offsets
+# cannot be computed from the argument order, they must be taken from the
+# header. Re-check them after any change to the kernel signature.
 set ::EPD_OFF_SERVER_IP     0x10
 set ::EPD_OFF_SERVER_PORT   0x18
 set ::EPD_OFF_LISTEN_PORT   0x20
@@ -358,50 +388,49 @@ set ::EPD_OFF_TS_REPLY      0xb8
 set ::EPD_OFF_SAMPLE_READY  0xc8
 set ::EPD_OFF_ENABLE        0xd8
 
-# Период такта ap_clk, нс. Должен совпадать с DEV_FREQ_MHZ в
-# devices/<плата>/device.tcl (170 МГц -> 5.882 нс). Если частоту меняли,
-# поправить здесь, иначе пересчёт в наносекунды соврёт.
+# ap_clk period, ns. Must match DEV_FREQ_MHZ in devices/<board>/device.tcl
+# (170 MHz -> 5.882 ns). If the frequency was changed, fix it here too,
+# otherwise the conversion to nanoseconds lies.
 set ::EPD_CLK_NS 5.882
 
-# Счётчик триггеров: фронт ловится по ИЗМЕНЕНИЮ значения, поэтому
-# сбрасывать регистр в ноль между замерами не нужно.
+# Trigger counter: the edge is detected by a CHANGE in value, so there is no
+# need to clear the register between samples.
 set ::EPD_TRIG 0
 
-# Параметры. serverIp — в hex без префикса, как в network_configure.
-# listenPort всегда равен serverPort: клиент подключается туда, где
-# слушает сервер.
+# Parameters. serverIp is hex without prefix, same as in network_configure.
+# listenPort always equals serverPort: the client connects where the server
+# listens.
 proc epd_configure {serverIp serverPort msgBytes {n 1}} {
      set base [ouch_base_user $n]
 
-     puts "epd\[$n\]: server=0x$serverIp:$serverPort msg=$msgBytes байт"
+     puts "epd\[$n\]: server=0x$serverIp:$serverPort msg=$msgBytes bytes"
 
-     set sip 0
-     scan $serverIp %x sip
+     set sip [_hex2int $serverIp]
      axi_write32 [expr {$base + $::EPD_OFF_SERVER_IP}]   $sip
      axi_write32 [expr {$base + $::EPD_OFF_SERVER_PORT}] $serverPort
      axi_write32 [expr {$base + $::EPD_OFF_LISTEN_PORT}] $serverPort
      axi_write32 [expr {$base + $::EPD_OFF_MSG_BYTES}]   $msgBytes
 
-     # Проверяем чтением: без этого «ядро не отвечает» не отличить от
-     # «параметры не записались».
+     # Verify by reading back: without this, "the kernel does not respond" is
+     # indistinguishable from "the parameters were never written".
      set rd [axi_read32 [expr {$base + $::EPD_OFF_MSG_BYTES}]]
      if {$rd != $msgBytes} {
-          puts "  *** ЗАПИСЬ НЕ ПОДТВЕРДИЛАСЬ (msgBytes=$rd, ждали $msgBytes)"
-          puts "      проверь ouch_base_user $n и что загружен этот битстрим"
+          puts "  *** WRITE NOT CONFIRMED (msgBytes=$rd, expected $msgBytes)"
+          puts "      check ouch_base_user $n and that this bitstream is loaded"
           return 0
      }
-     puts "  запись подтверждена"
+     puts "  write confirmed"
      return 1
 }
 
-# enable ПОСЛЕДНИМ: до него ядро не трогает порты стека, потому что
-# параметры в регистрах могут быть ещё не записаны.
+# enable LAST: before it the kernel does not touch the stack ports, because
+# the serverIp/serverPort registers may not have been written yet.
 proc epd_enable {{v 1} {n 1}} {
      puts "epd\[$n\]: enable=$v"
      axi_write32 [expr {[ouch_base_user $n] + $::EPD_OFF_ENABLE}] $v
 }
 
-# Счётчики: по ним видно, на каком этапе встало.
+# Counters: they show which stage things got stuck at.
 proc epd_status {{n 1}} {
      set base [ouch_base_user $n]
      set att [axi_read32 [expr {$base + $::EPD_OFF_CONN_ATTEMPTS}]]
@@ -411,33 +440,33 @@ proc epd_status {{n 1}} {
      set tmo [axi_read32 [expr {$base + $::EPD_OFF_TIMEOUTS}]]
      set rdy [axi_read32 [expr {$base + $::EPD_OFF_SAMPLE_READY}]]
 
-     puts "epd\[$n\]: попыток соединения=$att отправлено=$snt эхо=$ech получено=$rcv таймаутов=$tmo ready=$rdy"
+     puts "epd\[$n\]: connAttempts=$att sent=$snt echoes=$ech recv=$rcv timeouts=$tmo ready=$rdy"
 
-     # Диагностика: где именно оборвалась цепочка.
+     # Diagnostics: where exactly the chain broke.
      if {$att == 0} {
-          puts "  -> клиент не пытался открыть соединение: enable=0?"
+          puts "  -> the client never tried to open a connection: enable=0?"
      } elseif {$snt == 0 && $att > 3} {
-          puts "  -> соединение не открылось. Сервер не поднял listen, либо"
-          puts "     нет линка между портами (проверь ping и stat_rx_aligned в VIO)"
+          puts "  -> connection did not open. Either the server is not listening,"
+          puts "     or there is no link between the ports (run vio_dump)"
      } elseif {$snt > 0 && $ech == 0} {
-          puts "  -> запрос не дошёл до порта 1: линк, кабель или размещение CMAC"
+          puts "  -> the request never reached port 1: link, cable or CMAC placement"
      } elseif {$ech > 0 && $rcv == 0} {
-          puts "  -> эхо ответило, но ответ не вернулся: обратный путь"
+          puts "  -> the echo replied but the reply never came back: reverse path"
      }
      return [list $att $snt $ech $rcv $tmo $rdy]
 }
 
-# Один замер: дёрнуть триггер, дождаться sampleReady, прочитать четвёрку.
+# One sample: pull the trigger, wait for sampleReady, read the four values.
 #
-# Гонки чтения нет по построению: пока не дёрнем триггер снова, новый
-# пакет не отправится и регистры не изменятся.
+# There is no read race by construction: until the trigger is pulled again no
+# new packet is sent and the registers do not change.
 #
-# Возвращает {t1p t2p t1 t2} либо пустой список при таймауте.
+# Returns {t1p t2p t1 t2}, or an empty list on timeout.
 proc epd_sample {{n 1} {timeout_ms 500}} {
      set base [ouch_base_user $n]
 
-     # Запись triggerGo снимает sampleReady и пускает пакет — одна
-     # транзакция на два действия.
+     # Writing triggerGo clears sampleReady and launches the packet -- one
+     # transaction doing two things.
      incr ::EPD_TRIG
      axi_write32 [expr {$base + $::EPD_OFF_TRIGGER_GO}] $::EPD_TRIG
 
@@ -457,13 +486,13 @@ proc epd_sample {{n 1} {timeout_ms 500}} {
      return [list $t1p $t2p $t1 $t2]
 }
 
-# Вычитание по модулю 2^32 — так же, как в железе. Нужно, потому что
-# счётчик тактов оборачивается каждые ~25 с на 170 МГц, и разность через
-# границу должна остаться правильной.
+# Subtraction modulo 2^32 -- the same as in hardware. Needed because the
+# clock-cycle counter wraps roughly every 25 s at 170 MHz, and a difference
+# across the wrap must stay correct.
 proc _epd_sub32 {a b} { return [expr {($a - $b) & 0xFFFFFFFF}] }
 
-# Считает четыре интервала из сырых таймстемпов.
-# Возвращает {rtt fwd echo rev} в тактах.
+# Computes the four intervals from the raw timestamps.
+# Returns {rtt fwd echo rev} in clock cycles.
 proc epd_intervals {sample} {
      lassign $sample t1p t2p t1 t2
      set rtt [_epd_sub32 $t2  $t1p]
@@ -473,33 +502,33 @@ proc epd_intervals {sample} {
      return [list $rtt $fwd $ech $rev]
 }
 
-# Один замер с печатью. Заодно проверяет баланс: сумма участков обязана
-# совпасть с полным кругом, иначе таймстемпы от разных пакетов.
+# One sample with printout. Also checks the balance: the parts must add up to
+# the full loop, otherwise the timestamps come from different packets.
 proc epd_measure {{n 1}} {
      set s [epd_sample $n]
      if {[llength $s] == 0} {
-          puts "epd: замер не удался (нет sampleReady за таймаут)"
+          puts "epd: sample failed (no sampleReady within the timeout)"
           epd_status $n
           return {}
      }
      lassign [epd_intervals $s] rtt fwd ech rev
      set ns $::EPD_CLK_NS
 
-     puts [format "  RTT     %6d тактов  %9.1f нс" $rtt [expr {$rtt*$ns}]]
-     puts [format "  NET_FWD %6d           %9.1f" $fwd [expr {$fwd*$ns}]]
-     puts [format "  ECHO    %6d           %9.1f" $ech [expr {$ech*$ns}]]
-     puts [format "  NET_REV %6d           %9.1f" $rev [expr {$rev*$ns}]]
+     puts [format "  RTT     %6d cycles  %9.1f ns" $rtt [expr {$rtt*$ns}]]
+     puts [format "  NET_FWD %6d          %9.1f" $fwd [expr {$fwd*$ns}]]
+     puts [format "  ECHO    %6d          %9.1f" $ech [expr {$ech*$ns}]]
+     puts [format "  NET_REV %6d          %9.1f" $rev [expr {$rev*$ns}]]
 
      set sum [expr {$fwd + $ech + $rev}]
      if {$sum != $rtt} {
-          puts "  *** БАЛАНС НЕ СХОДИТСЯ: $fwd+$ech+$rev=$sum, а RTT=$rtt"
-          puts "      значит таймстемпы от разных пакетов — числа выбросить"
+          puts "  *** BALANCE MISMATCH: $fwd+$ech+$rev=$sum, but RTT=$rtt"
+          puts "      the timestamps come from different packets -- discard them"
      }
      return [list $rtt $fwd $ech $rev]
 }
 
-# Сколько стоит одна JTAG-транзакция. Полезно знать до сбора статистики:
-# от этого зависит, сколько замеров реально успеть.
+# How much one JTAG transaction costs. Worth knowing before collecting
+# statistics: it determines how many samples are realistic.
 proc epd_calibrate {{n 1} {iters 100}} {
      set base [ouch_base_user $n]
      set t0 [clock milliseconds]
@@ -508,15 +537,15 @@ proc epd_calibrate {{n 1} {iters 100}} {
      }
      set dt [expr {[clock milliseconds] - $t0}]
      set per [expr {double($dt)/$iters}]
-     puts [format "JTAG: %d чтений за %d мс = %.2f мс на транзакцию" $iters $dt $per]
-     puts [format "      один замер (~6 транзакций) ≈ %.0f мс" [expr {$per*6}]]
+     puts [format "JTAG: %d reads in %d ms = %.2f ms per transaction" $iters $dt $per]
+     puts [format "      one sample (~6 transactions) is about %.0f ms" [expr {$per*6}]]
      return $per
 }
 
-# Серия замеров со сводкой. count в пределах десятков-сотен: этого
-# достаточно, чтобы увидеть порядок величины и разброс. Тысячи нужны
-# только для хвоста распределения, а он относится к замеру под
-# нагрузкой — там понадобится другой режим.
+# A series of samples with a summary. Keep count in the tens or hundreds:
+# that is enough to see the order of magnitude and the spread. Thousands are
+# only needed for the tail of the distribution, and that belongs to the
+# under-load measurement, which needs a different mode.
 proc epd_collect {count {n 1}} {
      set names {RTT NET_FWD ECHO NET_REV}
      set data  {{} {} {} {}}
@@ -527,8 +556,7 @@ proc epd_collect {count {n 1}} {
           if {[llength $s] == 0} { incr bad; continue }
           set iv [epd_intervals $s]
           lassign $iv rtt fwd ech rev
-          # Отбрасываем несогласованные наборы вместо того, чтобы
-          # портить ими статистику.
+          # Drop inconsistent sets instead of polluting the statistics.
           if {[expr {$fwd + $ech + $rev}] != $rtt} { incr bad; continue }
           for {set k 0} {$k < 4} {incr k} {
                lset data $k [concat [lindex $data $k] [lindex $iv $k]]
@@ -537,10 +565,10 @@ proc epd_collect {count {n 1}} {
 
      set got [llength [lindex $data 0]]
      puts ""
-     puts "=== $got замеров из $count (отброшено: $bad) ==="
+     puts "=== $got samples out of $count (discarded: $bad) ==="
      if {$got == 0} { epd_status $n; return }
 
-     puts [format "%-9s %8s %8s %9s   %s" "" "min" "max" "среднее" "нс (сред.)"]
+     puts [format "%-9s %8s %8s %9s   %s" "" "min" "max" "mean" "ns (mean)"]
      for {set k 0} {$k < 4} {incr k} {
           set v [lindex $data $k]
           set mn [lindex [lsort -integer $v] 0]
@@ -551,4 +579,209 @@ proc epd_collect {count {n 1}} {
           puts [format "%-9s %8d %8d %9.1f   %9.1f" \
                     [lindex $names $k] $mn $mx $avg [expr {$avg*$::EPD_CLK_NS}]]
      }
+}
+
+# =============================================================================
+# vio_dump -- TCP stack counters from the VIO
+# =============================================================================
+#
+# Diagnostics: run it when something does not work. Not needed on a normal run.
+#
+# The probes are vio_network from network_krnl/src/hdl/network_stack.sv (the
+# probe_in0..18 order is defined there). NOT to be confused with
+# stat_rx_aligned: that signal is not wired to a VIO at all, it is on an ILA
+# in cmac_krnl (inst_ila_0, probe0), and an ILA is read by arming a trigger,
+# not by reading a value.
+#
+# refresh_hw_vio IS REQUIRED: without it Vivado returns the values sampled
+# when the bitstream was loaded, i.e. zeros. That looks like "the stack is
+# dead".
+set ::VIO_PROBE_NAMES {
+     ip_toe ip_iph mac_mie mac_arp ip_arp
+     rx_words rx_pkts tx_words tx_pkts
+     tcp_rx tcp_tx arp_rx arp_tx udp_rx udp_tx
+     icmp_rx icmp_tx stream_down mac_addr
+}
+
+proc vio_dump {} {
+     set vios [get_hw_vios]
+     if {[llength $vios] == 0} {
+          puts "vio_dump: no VIOs found -- is the right bitstream loaded?"
+          return
+     }
+     refresh_hw_vio $vios
+
+     foreach vio $vios {
+          puts "--- [get_property NAME $vio] ---"
+          foreach p [get_hw_probes -of_objects $vio] {
+               set short [get_property NAME.SHORT $p]
+               # probe_inN -> a meaningful name from the table above.
+               set nm $short
+               if {[regexp {probe_in(\d+)$} $short -> i]} {
+                    set alias [lindex $::VIO_PROBE_NAMES $i]
+                    if {$alias ne ""} { set nm [format "%-11s (%s)" $alias $short] }
+               }
+               puts [format "  %-28s %s" $nm [get_property INPUT_VALUE $p]]
+          }
+     }
+}
+
+# =============================================================================
+# hls_dual_echo_krnl -- dual-QSFP echo, per-half listen port from the host
+# =============================================================================
+#
+# Bringup order (the order matters, see below):
+#     echo_bringup_dual 0a01d498 000a35029de5 0a01d499 000a35029de6
+#     dual_echo_configure 7001 7002
+#     dual_echo_enable 1
+#     dual_echo_status              ; # did the listen ports actually open?
+#
+# Or all of it in one call, arguments grouped per interface (ip mac port):
+#     dual_echo_bringup 0a01d498 000a35029de5 7001 \
+#                       0a01d499 000a35029de6 7002
+#
+# Each half gets its OWN listen port: portA -> half a (QSFP0, network_krnl_1),
+# portB -> half b (QSFP1, network_krnl_2). The same number on both is legal
+# (separate stacks, separate port tables), but different numbers make a failed
+# connect diagnostic: you learn which half is at fault instead of suspecting
+# both the IP and the port.
+#
+# WHY enable LAST. The kernel is ap_ctrl_none, so it starts running the
+# moment reset is released -- long before JTAG shows up. Until enable is
+# written it does not touch a single stack port, because (a) the listen ports
+# may not be written yet, and (b) network_krnl may not be started yet, and the
+# TOE only latches its IP on the ap_start edge (network_stack.sv:946) while
+# being reset only by net_aresetn (network_stack.sv:656). Requesting a
+# listen port before the stack is up is exactly the race that leaves the
+# port half-open with no way to tell from outside.
+#
+# OFFSETS BELOW ARE PLACEHOLDERS -- they must be replaced with the values
+# from the generated driver header after the next HLS export:
+#     .../hls_dual_echo_krnl_ip_proj/sol1/impl/misc/drivers/
+#         hls_dual_echo_krnl_v1_0/src/xhls_dual_echo_krnl_hw.h
+# export_hls_ip.tcl prints them at the end of its run.
+#
+# They CANNOT be derived from the C++ argument order: HLS inserts an
+# ap_vld register after every OUTPUT value, so inputs step by 8 bytes and
+# outputs by 16. The values below assume that layout (two 8-byte inputs at
+# 0x10/0x18, then six 16-byte outputs, then enable) but assuming is not
+# verifying -- dual_echo_configure checks the write and says so if it is wrong.
+# NOTE: adding listenPortB shifted every offset after it by 8 bytes compared
+# to the single-port version.
+set ::DE_OFF_LISTEN_PORT_A    0x10
+set ::DE_OFF_LISTEN_PORT_B    0x18
+set ::DE_OFF_LISTEN_ATT_A     0x20
+set ::DE_OFF_PORT_STATE_A     0x30
+set ::DE_OFF_NOTIFY_A         0x40
+set ::DE_OFF_LISTEN_ATT_B     0x50
+set ::DE_OFF_PORT_STATE_B     0x60
+set ::DE_OFF_NOTIFY_B         0x70
+set ::DE_OFF_ENABLE           0x80
+
+# Write the listen ports -- one per half. portB defaults to portA when
+# omitted, which keeps the old single-port behaviour available.
+#
+# The same number on both halves is legal: the halves sit on different
+# network_krnl instances, each with its own listeningPortTable. Different
+# numbers are still preferable for debugging -- a failed connect then tells
+# you WHICH half is at fault instead of leaving IP and port both suspect.
+proc dual_echo_configure {listenPortA {listenPortB ""} {n 1}} {
+     set base [ouch_base_user $n]
+     if {$listenPortB eq ""} { set listenPortB $listenPortA }
+
+     puts "dual_echo\[$n\]: listenPortA=$listenPortA listenPortB=$listenPortB"
+     axi_write32 [expr {$base + $::DE_OFF_LISTEN_PORT_A}] $listenPortA
+     axi_write32 [expr {$base + $::DE_OFF_LISTEN_PORT_B}] $listenPortB
+
+     # Verify by reading back: without this, "the kernel does not respond"
+     # is indistinguishable from "the offsets are wrong".
+     set rd_a [axi_read32 [expr {$base + $::DE_OFF_LISTEN_PORT_A}]]
+     set rd_b [axi_read32 [expr {$base + $::DE_OFF_LISTEN_PORT_B}]]
+     if {$rd_a != $listenPortA || $rd_b != $listenPortB} {
+          puts "  *** WRITE NOT CONFIRMED (read A=$rd_a B=$rd_b,"
+          puts "      expected A=$listenPortA B=$listenPortB)"
+          puts "      Either this bitstream has no s_axi_control on the kernel,"
+          puts "      or DE_OFF_* offsets do not match xhls_dual_echo_krnl_hw.h."
+          return 0
+     }
+     puts "  write confirmed"
+     return 1
+}
+
+# enable LAST, after dual_echo_configure and after echo_bringup_dual.
+proc dual_echo_enable {{v 1} {n 1}} {
+     puts "dual_echo\[$n\]: enable=$v"
+     axi_write32 [expr {[ouch_base_user $n] + $::DE_OFF_ENABLE}] $v
+}
+
+# Telemetry. This is what tells "the port never opened" apart from "the port
+# is open but nobody connected" -- the distinction we could not make before.
+proc dual_echo_status {{n 1}} {
+     set base [ouch_base_user $n]
+
+     set att_a [axi_read32 [expr {$base + $::DE_OFF_LISTEN_ATT_A}]]
+     set st_a  [axi_read32 [expr {$base + $::DE_OFF_PORT_STATE_A}]]
+     set nt_a  [axi_read32 [expr {$base + $::DE_OFF_NOTIFY_A}]]
+     set att_b [axi_read32 [expr {$base + $::DE_OFF_LISTEN_ATT_B}]]
+     set st_b  [axi_read32 [expr {$base + $::DE_OFF_PORT_STATE_B}]]
+     set nt_b  [axi_read32 [expr {$base + $::DE_OFF_NOTIFY_B}]]
+
+     puts "dual_echo half a: listenAttempts=$att_a state=[_de_state $st_a] notifications=$nt_a"
+     puts "dual_echo half b: listenAttempts=$att_b state=[_de_state $st_b] notifications=$nt_b"
+
+     foreach {nm st att} [list a $st_a $att_a b $st_b $att_b] {
+          if {$st == 0} {
+               puts "  half $nm -> waiting for enable: was dual_echo_enable 1 called?"
+          } elseif {$st == 1 && $att > 3} {
+               puts "  half $nm -> the stack is not answering the listen request."
+               puts "     listenAttempts keeps growing, so the kernel retries but"
+               puts "     gets no port_status. Check that echo_bringup_dual ran"
+               puts "     BEFORE enable, and run vio_dump."
+          }
+     }
+     return [list $att_a $st_a $nt_a $att_b $st_b $nt_b]
+}
+
+proc _de_state {v} {
+     switch -- $v {
+          0 { return "0(wait-enable)" }
+          1 { return "1(requested)" }
+          2 { return "2(OPEN)" }
+          default { return "$v(?)" }
+     }
+}
+
+# Bringup everything in the right order, one call.
+#
+# Arguments are grouped PER INTERFACE -- ip mac port, then ip mac port again,
+# so each triple reads as the config of one device:
+#
+#   dual_echo_bringup 0a01d498 000a35029de5 7001 \
+#                     0a01d499 000a35029de6 7002
+#
+# First triple is QSFP0 (half a, network_krnl_1), second is QSFP1 (half b,
+# network_krnl_2). The two ports may be equal -- separate stacks, separate
+# port tables -- but different numbers make a failed connect tell you which
+# half is at fault.
+proc dual_echo_bringup {ip_str1 mac_str1 port1 ip_str2 mac_str2 port2} {
+     echo_bringup_dual $ip_str1 $mac_str1 $ip_str2 $mac_str2
+     puts ""
+     if {![dual_echo_configure $port1 $port2]} { return 0 }
+     dual_echo_enable 1
+     puts ""
+     dual_echo_status
+     puts ""
+     puts "Now from the PC (note the port that goes with each IP):"
+     puts "  ncat [_de_dotted $ip_str1] $port1"
+     puts "  ncat [_de_dotted $ip_str2] $port2"
+     return 1
+}
+
+# 0a01d498 -> 10.1.212.152. Only for printing the hint above: retyping the
+# hex by hand is exactly where a wrong-IP test comes from.
+proc _de_dotted {ip_str} {
+     set ip [_hex2int $ip_str]
+     return [format "%d.%d.%d.%d" \
+                 [expr {($ip >> 24) & 0xff}] [expr {($ip >> 16) & 0xff}] \
+                 [expr {($ip >> 8) & 0xff}]  [expr {$ip & 0xff}]]
 }
