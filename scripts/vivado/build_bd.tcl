@@ -729,25 +729,51 @@ assign_bd_address -quiet
 puts ""
 puts "=== адреса s_axi_control ==="
 
+# Переназначение идёт ДВУМЯ ПОЛНЫМИ ПРОХОДАМИ по всем сегментам, а не двумя
+# шагами внутри одного цикла по каналам.
+#
+# Почему так. Автораспределение раскладывает сегменты в порядке обхода BD, и
+# порядок зависит от состава дизайна: стоит user-ядру получить s_axi_control
+# (как только у него появляются s_axilite-аргументы), и число сегментов
+# меняется, а вместе с ним — кто куда попал. Если целевой адрес одного
+# сегмента занят ДРУГИМ сегментом, который ещё не переехал, то
+# set_property offset молча не применяется, и проверка ниже падает.
+#
+# Смешанный порядок (увести сеть канала 1, поставить сеть канала 1, увести
+# сеть канала 2, ...) от этого не защищает: к моменту расстановки канала 1
+# сегменты канала 2 всё ещё стоят там, куда их положило автораспределение.
+# Поэтому сперва уводим В СТОРОНУ ВСЕ сегменты и только потом ставим их на
+# целевые адреса — тогда целевая область гарантированно пуста.
+set segs_net  {}
+set segs_user {}
 for {set n 1} {$n <= $NUM_QSFP} {incr n} {
-     set seg_net  [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
-                       -filter "NAME =~ *network_krnl_${n}*"]
-     set seg_user [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
-                       -filter "NAME =~ *${USER_KRNL}_${n}*"]
+     lappend segs_net [get_bd_addr_segs -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+                            -filter "NAME =~ *network_krnl_${n}*"]
+     lappend segs_user [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces jtag_axi_0/Data] \
+                            -filter "NAME =~ *${USER_KRNL}_${n}*"]
+}
 
-     set addr_net  [_addr_network $n]
-     set addr_user [_addr_user $n]
+# Проход 1: все сегменты уходят в заведомо свободную область. Диапазоны
+# 0x10000000+ и 0x20000000+ выбраны выше границы, куда попадают целевые
+# адреса s_axi_control (максимум NUM_QSFP * 0x20000), и не пересекаются
+# между собой.
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     set seg_net  [lindex $segs_net  [expr {$n - 1}]]
+     set seg_user [lindex $segs_user [expr {$n - 1}]]
 
-     # Переназначаем в два прохода: сперва уводим сегмент в свободную область,
-     # потом ставим на целевой адрес.
-     #
-     # В один проход нельзя: автораспределение раскладывает сегменты в порядке
-     # обхода, и он зависит от состава дизайна. Если целевой адрес занят другим
-     # сегментом, set_property offset молча не применяется, и проверка ниже падает.
      set_property offset [expr {0x10000000 + $n * 0x1000000}] $seg_net
      if {[llength $seg_user] > 0} {
           set_property offset [expr {0x20000000 + $n * 0x1000000}] $seg_user
      }
+}
+
+# Проход 2: расстановка на целевые адреса и проверка.
+for {set n 1} {$n <= $NUM_QSFP} {incr n} {
+     set seg_net  [lindex $segs_net  [expr {$n - 1}]]
+     set seg_user [lindex $segs_user [expr {$n - 1}]]
+
+     set addr_net  [_addr_network $n]
+     set addr_user [_addr_user $n]
 
      set_property offset $addr_net $seg_net
      if {[llength $seg_user] > 0} {
