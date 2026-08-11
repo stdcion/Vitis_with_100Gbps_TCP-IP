@@ -832,7 +832,17 @@ set ::DE_OFF_NOTIFY_A         0x40
 set ::DE_OFF_LISTEN_ATT_B     0x50
 set ::DE_OFF_PORT_STATE_B     0x60
 set ::DE_OFF_NOTIFY_B         0x70
-set ::DE_OFF_ENABLE           0x80
+# ap_ctrl (0x00) exists because the kernel is ap_ctrl_hs. bit0=ap_start,
+# bit1=ap_done, bit7=auto_restart. Under ap_ctrl_none there was no such
+# register at all.
+set ::DE_OFF_AP_CTRL         0x00
+# enable is still a kernel argument, and it still has to be written -- but now
+# BEFORE ap_start, not after. Under ap_ctrl_hs every s_axilite scalar latches on
+# the ap_start edge, so enable/listenPortA/listenPortB must all be in their
+# registers by then. It is kept (rather than replaced by ap_start alone) because
+# it is the explicit "host said go" flag the logic checks, and dropping it would
+# shift every offset below.
+set ::DE_OFF_ENABLE          0x80
 
 # Write the listen ports -- one per half. portB defaults to portA when
 # omitted, which keeps the old single-port behaviour available.
@@ -864,10 +874,41 @@ proc dual_echo_configure {listenPortA {listenPortB ""} {n 1}} {
      return 1
 }
 
-# enable LAST, after dual_echo_configure and after echo_bringup_dual.
+# Start the kernel. LAST, after dual_echo_configure and echo_bringup_dual.
+#
+# The kernel is ap_ctrl_hs (NOT ap_ctrl_none -- see the long comment in
+# hls_dual_echo_krnl.cpp). So starting it means writing ap_ctrl, exactly like
+# network_start does for network_krnl:
+#     bit 0 = ap_start, bit 7 = auto_restart
+# 0x81 sets both: the kernel starts and restarts itself, running continuously
+# instead of finishing once and stopping.
+#
+# WHY THIS AND NOT AN 'enable' REGISTER. Under ap_ctrl_none the s_axilite
+# scalars were latched once at reset, long before the host wrote anything, so
+# enable never reached the logic. With ap_ctrl_hs the scalars latch on the
+# ap_start edge -- which is precisely why the order "write parameters, then
+# start" works by construction here.
 proc dual_echo_enable {{v 1} {n 1}} {
-     puts "dual_echo\[$n\]: enable=$v"
-     axi_write32 [expr {[ouch_base_user $n] + $::DE_OFF_ENABLE}] $v
+     set base [ouch_base_user $n]
+     set addr [expr {$base + $::DE_OFF_AP_CTRL}]
+
+     # enable FIRST, ap_start second: the scalars latch on the ap_start edge,
+     # so everything the kernel reads must already be in its register.
+     axi_write32 [expr {$base + $::DE_OFF_ENABLE}] $v
+     set rd [axi_read32 [expr {$base + $::DE_OFF_ENABLE}]]
+     puts "dual_echo\[$n\]: enable=$rd"
+
+     if {$v} {
+          puts "dual_echo\[$n\]: ap_start=1 auto_restart=1 (ap_ctrl=0x81)"
+          axi_write32 $addr 0x81
+     } else {
+          puts "dual_echo\[$n\]: stop (ap_ctrl=0x00)"
+          axi_write32 $addr 0x00
+     }
+
+     set ctrl [axi_read32 $addr]
+     puts [format "  ap_ctrl=0x%02x (ap_start=%d ap_done=%d)" \
+               $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}]]
 }
 
 # Telemetry. This is what tells "the port never opened" apart from "the port
