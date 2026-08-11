@@ -894,6 +894,16 @@ void epd_core(
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
+     // Та же причина, что и в топ-функции: epd_core — тоже DATAFLOW-регион,
+     // и его входные скаляры иначе защёлкиваются на старте. Подробное
+     // пояснение — у #pragma HLS stable в hls_echo_probe_dual_krnl().
+#pragma HLS stable variable = enable
+#pragma HLS stable variable = serverIp
+#pragma HLS stable variable = serverPort
+#pragma HLS stable variable = listenPort
+#pragma HLS stable variable = msgBytes
+#pragma HLS stable variable = triggerGo
+
      // ── каналы между стадиями ──
      // Глубина 2 достаточна: в тракте один пакет, значит в каждом канале
      // не бывает больше одной записи одновременно. Двойка — запас на
@@ -1111,6 +1121,44 @@ void hls_echo_probe_dual_krnl(
 // DATAFLOW, а не PIPELINE — как в hls_pingpong_krnl: половины и
 // измеритель работают как независимые процессы.
 #pragma HLS DATAFLOW disable_start_propagation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STABLE НА ВХОДНЫХ СКАЛЯРАХ — БЕЗ ЭТОГО ЯДРО НЕ РАБОТАЕТ.
+//
+// Найдено на плате при отладке hls_dual_echo_krnl (там та же конструкция).
+// Входные скаляры DATAFLOW-региона по умолчанию синхронизируются со стартом
+// региона — UG1399, Stable Arrays: "without the stable pragma ... proc2 would
+// be part of the initial synchronization (via ap_start)". В RTL это защёлка:
+//
+//     always @ (posedge ap_clk)
+//         if ((1'b1 == ap_CS_fsm_state2))
+//             enable_read_reg_862 <= enable;
+//
+// При ap_ctrl_none автомат проходит state2 ОДИН раз — сразу после снятия
+// сброса, когда хост ещё ничего не записал. Дальше регион работает бесконечно
+// и в state2 не возвращается, поэтому запись по JTAG до логики не доходит
+// НИКОГДА. Симптом: регистр читается верно, а ядро видит ноль.
+//
+// stable убирает синхронизацию, значение читается прямо из s_axilite.
+// Требование UG1399 — гарантировать, что переменная не меняется во время
+// работы региона; для параметров это так (хост пишет их один раз до enable).
+//
+// ОГОВОРКА ПРО triggerGo. Он МЕНЯЕТСЯ во время работы — в этом весь смысл
+// триггера, так что формальная гарантия stable для него нарушена. Но без
+// stable он не дойдёт до логики вовсе, и альтернативы нет. Практически это
+// безопасно: значение только читается, сравнивается с прошлым и ни от чего не
+// зависит. Если на плате триггер окажется нерабочим — резервный план в том,
+// чтобы убрать DATAFLOW с верхнего уровня (тогда скаляры станут проводами).
+//
+// НЕ УБИРАТЬ. Без этих строк сборка проходит без единой ошибки, а ядро молча
+// не запускается.
+#pragma HLS stable variable = enable
+#pragma HLS stable variable = serverIp
+#pragma HLS stable variable = serverPort
+#pragma HLS stable variable = listenPort
+#pragma HLS stable variable = msgBytes
+#pragma HLS stable variable = triggerGo
+// ─────────────────────────────────────────────────────────────────────────────
 
      epd_core(s_axis_udp_rx_a, m_axis_udp_tx_a,
               s_axis_udp_rx_meta_a, m_axis_udp_tx_meta_a,
