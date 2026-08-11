@@ -81,6 +81,7 @@ extern "C" void hls_echo_probe_dual_krnl(
 
     int, int, int, int, int,
     ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,
+    ap_uint<32>&, ap_uint<32>&,                       // listenAttempts, portState
     ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,
     int);
 
@@ -110,6 +111,7 @@ static hls::stream<pkt64>  tx_status_b;
 static int k_serverIp = 0x0a01d499, k_serverPort = 7001, k_listenPort = 7001;
 static int k_msgBytes = 64, k_triggerGo = 0, k_enable = 0;
 static ap_uint<32> r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes;
+static ap_uint<32> r_listenAttempts, r_portState;
 static ap_uint<32> r_tsRequest, r_tsEchoIn, r_tsEchoOut, r_tsReply, r_sampleReady;
 
 static void call_kernel()
@@ -127,6 +129,7 @@ static void call_kernel()
 
         k_serverIp, k_serverPort, k_listenPort, k_msgBytes, k_triggerGo,
         r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes,
+        r_listenAttempts, r_portState,
         r_tsRequest, r_tsEchoIn, r_tsEchoOut, r_tsReply, r_sampleReady,
         k_enable);
 }
@@ -158,6 +161,10 @@ static int  m_cableFwd      = 40;   // задержка стек0 -> стек1
 static int  m_cableRev      = 30;   // задержка стек1 -> стек0
 static bool m_serverListens = true; // сервер отвечает на listen успехом
 static bool m_dropReply     = false;// терять ответ (проверка таймаута)
+// Стек МОЛЧИТ на запрос listen: забирает запрос и не отвечает вовсе. Это не
+// то же самое, что m_serverListens=false (там приходит явный отказ) — именно
+// молчание залипало навсегда до появления таймаута в epd_server_listen.
+static bool m_listenSilent   = false;
 
 static long g_tick = 0;
 
@@ -198,6 +205,7 @@ static void model_reset()
     cable_fwd.clear(); cable_rev.clear();
     g_asmAactive = g_asmBactive = false;
     m_dropReply = false;
+    m_listenSilent = false;
 }
 
 // Общая часть: приём tx_meta/tx_data со стороны ядра и отправка в кабель.
@@ -285,10 +293,13 @@ static void model_tick()
     // --- listen на стеке 1 (сервер) ---
     if (!listen_port_b.empty()) {
         listen_port_b.read();
-        pkt8 st; st.data = 0;
-        st.data(0, 0) = m_serverListens ? 1 : 0;
-        port_status_b.write(st);
-        if (m_serverListens) s1_portOpen = true;
+        if (!m_listenSilent) {
+            pkt8 st; st.data = 0;
+            st.data(0, 0) = m_serverListens ? 1 : 0;
+            port_status_b.write(st);
+            if (m_serverListens) s1_portOpen = true;
+        }
+        // m_listenSilent: запрос проглочен, ответа нет.
     }
 
     // --- open_connection на стеке 0 (клиент) ---
@@ -379,6 +390,42 @@ int main()
     model_reset();
 
     // ─────────────────────────────────────────────────────────────────
+    // ВНИМАНИЕ: этот сценарий обязан идти ПЕРВЫМ. model_reset() сбрасывает
+    // только модель стеков, а portRequested/portOpened внутри ядра — это
+    // static-переменные, они живут до конца процесса. Один раз открыв порт,
+    // ядро больше никогда не отправит запрос listen, и проверить повтор
+    // будет невозможно. (В железе роль сброса играет ap_rst_n.)
+    //
+    // Регрессия на конкретный баг: до появления таймаута в
+    // epd_server_listen молчание стека залипало НАВСЕГДА, и снаружи это
+    // выглядело как вечный таймаут epd_measure без объяснения причины.
+    std::cout << "\n[0] Стек молчит на listen -> ядро повторяет запрос"
+              << std::endl;
+    m_listenSilent = true;
+    k_enable = 1;
+
+    tick(50);
+    checkEq((long)r_listenAttempts, 1, "первый запрос listen отправлен");
+    checkEq((long)r_portState, 1, "portState=1 (ждём ответа)");
+    check(!s1_portOpen, "порт не открыт (стек молчит)");
+
+    // Ядро не должно залипнуть на блокирующей записи.
+    tick(20000);
+    checkEq((long)r_listenAttempts, 1, "повтора ещё нет (таймаут не вышел)");
+
+    // Стек оживает; после EPD_LISTEN_TIMEOUT запрос обязан уйти снова.
+    m_listenSilent = false;
+    tick(1000100);
+    check((long)r_listenAttempts >= 2, "запрос listen ПОВТОРЁН после таймаута");
+    check(s1_portOpen, "порт открылся со второй попытки");
+    checkEq((long)r_portState, 2, "portState=2 (OPEN)");
+
+    // Возвращаем ядро и модель в исходное для остальных сценариев.
+    k_enable = 0;
+    model_reset();
+    tick(10);
+
+    // ─────────────────────────────────────────────────────────────────
     std::cout << "\n[1] enable=0 — ядро не трогает порты стека" << std::endl;
     k_enable = 0;
     tick(50);
@@ -391,7 +438,10 @@ int main()
     std::cout << "\n[2] enable=1 — listen и соединение поднимаются" << std::endl;
     k_enable = 1;
     tick(200);
-    check(s1_portOpen, "сервер открыл listen-порт");
+    // s1_portOpen тут не проверяем: порт уже открыт в сценарии [0], а
+    // portRequested/portOpened внутри ядра — static, второго запроса listen
+    // не будет. Смотрим на portState, который отражает состояние ядра.
+    checkEq((long)r_portState, 2, "порт слушания открыт (portState=2)");
     check((long)r_connAttempts >= 1, "клиент пытался открыть соединение");
 
     // ─────────────────────────────────────────────────────────────────
@@ -500,7 +550,6 @@ int main()
     std::cout << "\n        (полный таймаут 1e6 тактов не гоняем — долго;"
               << " проверено, что ядро не залипло)" << std::endl;
 
-    // ─────────────────────────────────────────────────────────────────
     std::cout << "\n=== Итог: "
               << (failures == 0 ? "ВСЕ ТЕСТЫ ПРОШЛИ" : "ЕСТЬ ОШИБКИ")
               << " (failures=" << failures << ") ===" << std::endl;

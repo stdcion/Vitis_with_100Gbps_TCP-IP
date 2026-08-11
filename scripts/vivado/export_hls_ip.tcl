@@ -155,13 +155,38 @@ if {[llength $hw_headers] == 0} {
      puts "СМЕЩЕНИЯ РЕГИСТРОВ (перенести в USR_OFF_* в scripts/vivado/jtag_ctrl.tcl):"
      puts "  источник: $hdr"
      puts ""
+     # Печатаем ВСЕ строки с адресами, а не список знакомых имён.
+     #
+     # Раньше здесь стоял фильтр по (listenport|enable|rxbyte|rxpacket|ap_ctrl),
+     # и он молча пропускал всё, что называется иначе. На hls_dual_echo_krnl это
+     # скрыло шесть регистров телеметрии (listenAttempts/portState/notifyCount
+     # на каждую половину): в выводе их не было, и выглядело так, будто HLS их
+     # выбросил — хотя они были на месте. Смысл блока в том, чтобы не гадать,
+     # поэтому любой фильтр по именам ему прямо противоречит.
+     #
+     # _DATA — адрес значения, _CTRL — регистр ap_vld рядом с каждым выходом.
+     # Читать по JTAG нужно _DATA; наличие _CTRL как раз и объясняет, почему у
+     # выходных аргументов шаг 16 байт, а у входных 8.
      set fh [open $hdr r]
+     set shown 0
      foreach line [split [read $fh] "\n"] {
-          if {[regexp -nocase {(listenport|enable|rxbyte|rxpacket|ap_ctrl)} $line]} {
-               puts "  [string trim $line]"
+          set t [string trim $line]
+          # Строки "// 0xNN : Data signal of foo", "//   bit 31~0 - ..." и
+          # "#define ..._ADDR_..._DATA 0xNN" — всё, где есть адрес или его
+          # расшифровка.
+          if {[regexp {^//\s*0x[0-9a-fA-F]+} $t] ||
+              [regexp {^//\s*bit\s} $t] ||
+              [regexp {^#define\s+\S*ADDR\S*\s+0x[0-9a-fA-F]+} $t]} {
+               puts "  $t"
+               incr shown
           }
      }
      close $fh
+     if {$shown == 0} {
+          puts "  ПРЕДУПРЕЖДЕНИЕ: в заголовке не нашлось ни одной строки с адресом."
+          puts "  Формат *_hw.h изменился — смотреть файл целиком:"
+          puts "    $hdr"
+     }
 }
 puts "=========================================================="
 

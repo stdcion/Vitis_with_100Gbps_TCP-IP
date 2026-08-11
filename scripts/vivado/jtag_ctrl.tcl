@@ -371,6 +371,10 @@ proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
 # 16: HLS inserts an ap_vld register after every output value. So the offsets
 # cannot be computed from the argument order, they must be taken from the
 # header. Re-check them after any change to the kernel signature.
+#
+# NOTE: listenAttempts/portState were added after echoCount, which pushed
+# every offset below them up by 0x20 (two 16-byte outputs). The values here
+# assume that layout -- verify against the header after the next export.
 set ::EPD_OFF_SERVER_IP     0x10
 set ::EPD_OFF_SERVER_PORT   0x18
 set ::EPD_OFF_LISTEN_PORT   0x20
@@ -381,12 +385,14 @@ set ::EPD_OFF_SENT          0x48
 set ::EPD_OFF_RECV          0x58
 set ::EPD_OFF_TIMEOUTS      0x68
 set ::EPD_OFF_ECHOES        0x78
-set ::EPD_OFF_TS_REQUEST    0x88
-set ::EPD_OFF_TS_ECHO_IN    0x98
-set ::EPD_OFF_TS_ECHO_OUT   0xa8
-set ::EPD_OFF_TS_REPLY      0xb8
-set ::EPD_OFF_SAMPLE_READY  0xc8
-set ::EPD_OFF_ENABLE        0xd8
+set ::EPD_OFF_LISTEN_ATT    0x88
+set ::EPD_OFF_PORT_STATE    0x98
+set ::EPD_OFF_TS_REQUEST    0xa8
+set ::EPD_OFF_TS_ECHO_IN    0xb8
+set ::EPD_OFF_TS_ECHO_OUT   0xc8
+set ::EPD_OFF_TS_REPLY      0xd8
+set ::EPD_OFF_SAMPLE_READY  0xe8
+set ::EPD_OFF_ENABLE        0xf8
 
 # ap_clk period, ns. Must match DEV_FREQ_MHZ in devices/<board>/device.tcl
 # (170 MHz -> 5.882 ns). If the frequency was changed, fix it here too,
@@ -439,21 +445,41 @@ proc epd_status {{n 1}} {
      set rcv [axi_read32 [expr {$base + $::EPD_OFF_RECV}]]
      set tmo [axi_read32 [expr {$base + $::EPD_OFF_TIMEOUTS}]]
      set rdy [axi_read32 [expr {$base + $::EPD_OFF_SAMPLE_READY}]]
+     set lat [axi_read32 [expr {$base + $::EPD_OFF_LISTEN_ATT}]]
+     set pst [axi_read32 [expr {$base + $::EPD_OFF_PORT_STATE}]]
 
      puts "epd\[$n\]: connAttempts=$att sent=$snt echoes=$ech recv=$rcv timeouts=$tmo ready=$rdy"
+     puts "epd\[$n\]: server listen: attempts=$lat state=[_epd_state $pst]"
 
-     # Diagnostics: where exactly the chain broke.
-     if {$att == 0} {
+     # Diagnostics: where exactly the chain broke. The server-side listen state
+     # comes first -- if the port never opened, nothing downstream can work,
+     # and before portState existed this was indistinguishable from a dead link.
+     if {$pst == 0} {
+          puts "  -> the server has not requested a listen port: enable=0?"
+     } elseif {$pst == 1} {
+          puts "  -> the server asked for a listen port and the stack has not"
+          puts "     answered (attempts=$lat, and it retries on a timeout)."
+          puts "     Check that echo_bringup_dual ran BEFORE epd_enable, then vio_dump."
+     } elseif {$att == 0} {
           puts "  -> the client never tried to open a connection: enable=0?"
      } elseif {$snt == 0 && $att > 3} {
-          puts "  -> connection did not open. Either the server is not listening,"
-          puts "     or there is no link between the ports (run vio_dump)"
+          puts "  -> connection did not open even though the port is OPEN."
+          puts "     Check addressing (same /24, different last octets) and vio_dump."
      } elseif {$snt > 0 && $ech == 0} {
           puts "  -> the request never reached port 1: link, cable or CMAC placement"
      } elseif {$ech > 0 && $rcv == 0} {
           puts "  -> the echo replied but the reply never came back: reverse path"
      }
-     return [list $att $snt $ech $rcv $tmo $rdy]
+     return [list $att $snt $ech $rcv $tmo $rdy $lat $pst]
+}
+
+proc _epd_state {v} {
+     switch -- $v {
+          0 { return "0(no-request)" }
+          1 { return "1(requested)" }
+          2 { return "2(OPEN)" }
+          default { return "$v(?)" }
+     }
 }
 
 # One sample: pull the trigger, wait for sampleReady, read the four values.
@@ -493,6 +519,13 @@ proc _epd_sub32 {a b} { return [expr {($a - $b) & 0xFFFFFFFF}] }
 
 # Computes the four intervals from the raw timestamps.
 # Returns {rtt fwd echo rev} in clock cycles.
+#
+# NOTE ON THE BALANCE CHECK. fwd+echo+rev == rtt is an ALGEBRAIC IDENTITY for
+# any four numbers: (t2'-t1') + (t1-t2') + (t2-t1) collapses to (t2-t1'), and
+# it holds under modulo-2^32 arithmetic too. So the check can only fail if a
+# register was read torn -- it does NOT validate that the four values belong
+# to the same packet. Trust it as a transport check, not as a data check; use
+# the raw columns from epd_raw and an eyeball on the spread for the latter.
 proc epd_intervals {sample} {
      lassign $sample t1p t2p t1 t2
      set rtt [_epd_sub32 $t2  $t1p]
@@ -511,20 +544,77 @@ proc epd_measure {{n 1}} {
           epd_status $n
           return {}
      }
+     lassign $s t1p t2p t1 t2
      lassign [epd_intervals $s] rtt fwd ech rev
      set ns $::EPD_CLK_NS
+
+     # Raw counter values first. They are what the kernel actually latched;
+     # everything below is arithmetic the host does on them. Printing both
+     # means a suspicious interval can be re-derived by hand instead of
+     # being taken on trust -- and the wrap case (t2 < t1') stays visible
+     # rather than hidden behind a modulo subtraction.
+     puts "  raw: t1'=$t1p t2'=$t2p t1=$t1 t2=$t2"
+     if {$t2 < $t1p} {
+          puts "       (counter wrapped between t1' and t2 -- normal, the"
+          puts "        subtraction below is modulo 2^32)"
+     }
 
      puts [format "  RTT     %6d cycles  %9.1f ns" $rtt [expr {$rtt*$ns}]]
      puts [format "  NET_FWD %6d          %9.1f" $fwd [expr {$fwd*$ns}]]
      puts [format "  ECHO    %6d          %9.1f" $ech [expr {$ech*$ns}]]
      puts [format "  NET_REV %6d          %9.1f" $rev [expr {$rev*$ns}]]
 
-     set sum [expr {$fwd + $ech + $rev}]
-     if {$sum != $rtt} {
-          puts "  *** BALANCE MISMATCH: $fwd+$ech+$rev=$sum, but RTT=$rtt"
-          puts "      the timestamps come from different packets -- discard them"
+     # No "balance" line here on purpose: fwd+echo+rev == rtt is an identity
+     # (see epd_intervals), so printing it every time advertised a check that
+     # cannot fail on real data. It is still worth guarding, because a torn
+     # JTAG read WOULD break it -- but that is a transport fault, so say so.
+     if {[expr {$fwd + $ech + $rev}] != $rtt} {
+          puts "  *** TORN READ: fwd+echo+rev != rtt, which is arithmetically"
+          puts "      impossible -- a register was read mid-update. Discard."
      }
-     return [list $rtt $fwd $ech $rev]
+     # Raw quadruple first, then the intervals: callers that only want the
+     # intervals can still lrange them out, and nothing silently discards
+     # the raw data.
+     return [list $t1p $t2p $t1 $t2 $rtt $fwd $ech $rev]
+}
+
+# Raw samples as CSV, for analysis outside Vivado.
+#
+# Prints one line per sample with BOTH the raw counters and the derived
+# intervals, so a spreadsheet or a script can recompute everything and check
+# the host arithmetic instead of trusting it. Failed samples are still
+# printed, flagged in the status column -- silently dropping them would hide
+# exactly the cases worth looking at.
+#
+# status is TIMEOUT (no sampleReady) or TORN (a register read caught mid-update;
+# arithmetically impossible otherwise). It is NOT a plausibility check: an
+# outlier with a perfectly consistent sum still reads as ok, so judge the
+# numbers by their spread, not by this column.
+#
+# Redirect it to a file the usual Tcl way if you want one:
+#     set fh [open C:/epd_raw.csv w]; puts $fh [epd_raw 50]; close $fh
+proc epd_raw {count {n 1}} {
+     set out "sample,t1p,t2p,t1,t2,rtt,net_fwd,echo,net_rev,ns_rtt,status"
+     puts $out
+
+     for {set i 0} {$i < $count} {incr i} {
+          set s [epd_sample $n]
+          if {[llength $s] == 0} {
+               set line "$i,,,,,,,,,,TIMEOUT"
+               puts $line
+               append out "\n$line"
+               continue
+          }
+          lassign $s t1p t2p t1 t2
+          lassign [epd_intervals $s] rtt fwd ech rev
+          set ok [expr {($fwd + $ech + $rev) == $rtt ? "ok" : "TORN"}]
+          set line [format "%d,%u,%u,%u,%u,%d,%d,%d,%d,%.1f,%s" \
+                        $i $t1p $t2p $t1 $t2 $rtt $fwd $ech $rev \
+                        [expr {$rtt * $::EPD_CLK_NS}] $ok]
+          puts $line
+          append out "\n$line"
+     }
+     return $out
 }
 
 # How much one JTAG transaction costs. Worth knowing before collecting
@@ -550,17 +640,22 @@ proc epd_collect {count {n 1}} {
      set names {RTT NET_FWD ECHO NET_REV}
      set data  {{} {} {} {}}
      set bad 0
+     set raw_t1p {}
+     set raw_t2  {}
 
      for {set i 0} {$i < $count} {incr i} {
           set s [epd_sample $n]
           if {[llength $s] == 0} { incr bad; continue }
           set iv [epd_intervals $s]
           lassign $iv rtt fwd ech rev
-          # Drop inconsistent sets instead of polluting the statistics.
+          # Drop torn reads (see epd_intervals: the sum is an identity, so
+          # this only trips on a register read caught mid-update).
           if {[expr {$fwd + $ech + $rev}] != $rtt} { incr bad; continue }
           for {set k 0} {$k < 4} {incr k} {
                lset data $k [concat [lindex $data $k] [lindex $iv $k]]
           }
+          lappend raw_t1p [lindex $s 0]
+          lappend raw_t2  [lindex $s 3]
      }
 
      set got [llength [lindex $data 0]]
@@ -568,17 +663,43 @@ proc epd_collect {count {n 1}} {
      puts "=== $got samples out of $count (discarded: $bad) ==="
      if {$got == 0} { epd_status $n; return }
 
-     puts [format "%-9s %8s %8s %9s   %s" "" "min" "max" "mean" "ns (mean)"]
+     puts [format "%-9s %8s %8s %8s %9s   %s" \
+               "" "min" "med" "max" "mean" "ns (mean)"]
      for {set k 0} {$k < 4} {incr k} {
-          set v [lindex $data $k]
-          set mn [lindex [lsort -integer $v] 0]
-          set mx [lindex [lsort -integer $v] end]
+          set v [lsort -integer [lindex $data $k]]
+          set mn [lindex $v 0]
+          set mx [lindex $v end]
+          set md [lindex $v [expr {$got / 2}]]
           set sum 0
           foreach x $v { incr sum $x }
           set avg [expr {double($sum)/$got}]
-          puts [format "%-9s %8d %8d %9.1f   %9.1f" \
-                    [lindex $names $k] $mn $mx $avg [expr {$avg*$::EPD_CLK_NS}]]
+          puts [format "%-9s %8d %8d %8d %9.1f   %9.1f" \
+                    [lindex $names $k] $mn $md $mx $avg \
+                    [expr {$avg*$::EPD_CLK_NS}]]
      }
+
+     # THIS is the check that catches a bad sample -- not the sum, which is an
+     # identity (see epd_intervals). A single stray packet in the pipe shows up
+     # as max far above the median; the mean alone would just drift and hide it.
+     set rtts [lsort -integer [lindex $data 0]]
+     set rmed [lindex $rtts [expr {$got / 2}]]
+     set rmax [lindex $rtts end]
+     if {$rmed > 0 && $rmax > 3 * $rmed} {
+          puts ""
+          puts "  *** OUTLIER: max RTT ($rmax) is more than 3x the median ($rmed)."
+          puts "      The mean above is not trustworthy. Run epd_raw to see which"
+          puts "      sample it was and what its raw counters look like."
+     }
+
+     # Where on the counter the run happened. Useful for two things: seeing
+     # that the run really spanned a wrap (or did not), and sanity-checking
+     # the elapsed wall time against the JTAG cost from epd_calibrate.
+     set first [lindex $raw_t1p 0]
+     set last  [lindex $raw_t2 end]
+     puts [format "raw span: t1'(first)=%u  t2(last)=%u  elapsed=%d cycles (%.1f ms)" \
+               $first $last [_epd_sub32 $last $first] \
+               [expr {[_epd_sub32 $last $first] * $::EPD_CLK_NS / 1000000.0}]]
+     puts "For per-sample raw counters use: epd_raw $count"
 }
 
 # =============================================================================
@@ -603,6 +724,33 @@ set ::VIO_PROBE_NAMES {
      icmp_rx icmp_tx stream_down mac_addr
 }
 
+# Finding the probes of one VIO is fiddly: -of_objects (plural) returns
+# nothing for hw_vio objects in some Vivado versions -- which is exactly the
+# "No matching hw_probes were found" warning. Try the documented spellings in
+# order and use whichever answers.
+proc _vio_probes {vio} {
+     # 1) singular -of_object, the form the VIO docs use
+     set ps [get_hw_probes -quiet -of_object $vio]
+     if {[llength $ps] > 0} { return $ps }
+
+     # 2) plural, works on some versions
+     set ps [get_hw_probes -quiet -of_objects $vio]
+     if {[llength $ps] > 0} { return $ps }
+
+     # 3) fall back to matching by name: probe names are prefixed with the
+     #    VIO's own path, e.g. ".../vio_network/probe_in0".
+     set ps [get_hw_probes -quiet "[get_property NAME $vio]/*"]
+     if {[llength $ps] > 0} { return $ps }
+
+     # 4) last resort: every probe in the device, filtered by the VIO path.
+     set out {}
+     set vname [get_property NAME $vio]
+     foreach p [get_hw_probes -quiet *] {
+          if {[string match "$vname*" [get_property NAME $p]]} { lappend out $p }
+     }
+     return $out
+}
+
 proc vio_dump {} {
      set vios [get_hw_vios]
      if {[llength $vios] == 0} {
@@ -613,7 +761,15 @@ proc vio_dump {} {
 
      foreach vio $vios {
           puts "--- [get_property NAME $vio] ---"
-          foreach p [get_hw_probes -of_objects $vio] {
+          set ps [_vio_probes $vio]
+          if {[llength $ps] == 0} {
+               puts "  (no probes found for this VIO)"
+               puts "  Try it by hand to see what the names look like:"
+               puts "    get_hw_probes -of_object \[lindex \[get_hw_vios\] 0\]"
+               puts "    get_hw_probes *"
+               continue
+          }
+          foreach p $ps {
                set short [get_property NAME.SHORT $p]
                # probe_inN -> a meaningful name from the table above.
                set nm $short

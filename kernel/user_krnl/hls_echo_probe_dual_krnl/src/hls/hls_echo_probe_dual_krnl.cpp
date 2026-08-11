@@ -112,6 +112,11 @@ static_assert((EPD_MAX_WORDS & (EPD_MAX_WORDS - 1)) == 0,
 // первой же потере. 170 МГц * 1 мс ≈ 170000; берём с запасом.
 #define EPD_RX_TIMEOUT 1000000
 
+// Таймаут ожидания ответа стека на запрос listen, такты. Нужен по той же
+// причине: молчание стека не должно останавливать тест навсегда. См.
+// пояснение в epd_server_listen.
+#define EPD_LISTEN_TIMEOUT 1000000
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ПОЧЕМУ СТАДИИ ОБМЕНИВАЮТСЯ ПОТОКАМИ, А НЕ ССЫЛКАМИ НА СКАЛЯРЫ
 //
@@ -477,6 +482,8 @@ void epd_client_traffic(int enable,
  */
 void epd_server_listen(int enable,
                        int listenPort,
+                       ap_uint<32>& listenAttempts,
+                       ap_uint<32>& portState,
                        hls::stream<pkt16>& m_axis_tcp_listen_port,
                        hls::stream<pkt8>& s_axis_tcp_port_status)
 {
@@ -487,9 +494,20 @@ void epd_server_listen(int enable,
 #pragma HLS RESET variable=portRequested
      static bool portOpened = false;
 #pragma HLS RESET variable=portOpened
+     static ap_uint<32> waitTimer = 0;
+#pragma HLS RESET variable=waitTimer
+     static ap_uint<32> attempts = 0;
+#pragma HLS RESET variable=attempts
 
      if (!enable)
+     {
+          // Не затираем 2, если порт уже был открыт: enable=0 не закрывает
+          // listen в стеке, так что рапортовать "ждём enable" было бы
+          // неправдой. Ноль показываем только до первого запроса.
+          if (!portRequested)
+               portState = 0;
           return;
+     }
 
      if (!portRequested)
      {
@@ -498,13 +516,46 @@ void epd_server_listen(int enable,
           listen_pkt.data(15, 0) = listenPort;
           m_axis_tcp_listen_port.write(listen_pkt);
           portRequested = true;
+          waitTimer = 0;
+          attempts++;
+          listenAttempts = attempts;
+          portState = 1;
      }
-     else if (!portOpened && !s_axis_tcp_port_status.empty())
+     else if (!portOpened)
      {
-          pkt8 status = s_axis_tcp_port_status.read();
-          ap_uint<1> success = status.data(0, 0);
-          if (success) portOpened = true;
-          else         portRequested = false;
+          if (!s_axis_tcp_port_status.empty())
+          {
+               pkt8 status = s_axis_tcp_port_status.read();
+               ap_uint<1> success = status.data(0, 0);
+               if (success)
+               {
+                    portOpened = true;
+                    portState = 2;
+               }
+               else
+               {
+                    portRequested = false;
+               }
+          }
+          else if (waitTimer >= (ap_uint<32>)EPD_LISTEN_TIMEOUT)
+          {
+               // Стек промолчал. Без этой ветки автомат остался бы в
+               // "запрос отправлен, ответа ждём" НАВСЕГДА, и снаружи это
+               // выглядит как вечный таймаут epd_measure без объяснения:
+               // клиент исправно повторяет попытки соединения (connAttempts
+               // растёт), а сервер молча не слушает.
+               //
+               // Такая же дыра есть во всех родственных ядрах репозитория и
+               // в апстримных iperf_client/scatter. Там она не всплывала,
+               // потому что под XRT хост конфигурировал стек ДО старта
+               // user-ядра. У нас ap_ctrl_none плюс JTAG через десятки
+               // секунд — порядок обратный, и дыра стала достижимой.
+               portRequested = false;
+          }
+          else
+          {
+               waitTimer++;
+          }
      }
 }
 
@@ -834,6 +885,7 @@ void epd_core(
      ap_uint<32>& connAttempts, ap_uint<32>& sentCount,
      ap_uint<32>& recvCount, ap_uint<32>& timeoutCount,
      ap_uint<32>& echoCount,
+     ap_uint<32>& listenAttempts, ap_uint<32>& portState,
      // сырые таймстемпы последнего завершённого круга + номер набора
      ap_uint<32>& tsRequest, ap_uint<32>& tsEchoIn,
      ap_uint<32>& tsEchoOut, ap_uint<32>& tsReply,
@@ -873,7 +925,7 @@ void epd_core(
                         s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a);
 
      // --- сервер-эхо (порт 1) ---
-     epd_server_listen(enable, listenPort,
+     epd_server_listen(enable, listenPort, listenAttempts, portState,
                        m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
      epd_server_echo(tsEchoInFifo, tsEchoOutFifo, echoCount,
@@ -962,6 +1014,16 @@ void hls_echo_probe_dual_krnl(
                ap_uint<32>& timeoutCount,   // ответ не пришёл за таймаут
                ap_uint<32>& echoCount,      // сообщений отражено сервером
 
+               // Состояние listen серверной половины. Без этого «замер не
+               // удался» не отличить от «сервер вообще не слушает»:
+               //   listenAttempts — сколько раз просили порт у стека;
+               //   portState      — 0=ждём enable, 1=запрос отправлен,
+               //                    2=порт открыт.
+               // Растущий listenAttempts при portState=1 означает, что стек
+               // не отвечает на запрос listen.
+               ap_uint<32>& listenAttempts,
+               ap_uint<32>& portState,
+
                // ── СЫРЫЕ таймстемпы последнего завершённого круга ──
                //
                // Такты ap_clk (5.88 нс на 170 МГц). Все четыре
@@ -1034,6 +1096,8 @@ void hls_echo_probe_dual_krnl(
 #pragma HLS INTERFACE s_axilite port = recvCount    bundle = control
 #pragma HLS INTERFACE s_axilite port = timeoutCount bundle = control
 #pragma HLS INTERFACE s_axilite port = echoCount    bundle = control
+#pragma HLS INTERFACE s_axilite port = listenAttempts bundle = control
+#pragma HLS INTERFACE s_axilite port = portState      bundle = control
 
 #pragma HLS INTERFACE s_axilite port = tsRequest  bundle = control
 #pragma HLS INTERFACE s_axilite port = tsEchoIn   bundle = control
@@ -1072,6 +1136,7 @@ void hls_echo_probe_dual_krnl(
               msgBytes, triggerGo,
 
               connAttempts, sentCount, recvCount, timeoutCount, echoCount,
+              listenAttempts, portState,
               tsRequest, tsEchoIn, tsEchoOut, tsReply, sampleReady);
 }
 }
