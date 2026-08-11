@@ -283,9 +283,10 @@ void dual_echo_half_a(int enable,
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
-     // Та же причина, что и в dual_echo_core: половина — тоже DATAFLOW-регион,
-     // и её входные скаляры иначе защёлкиваются на старте. См. подробное
-     // пояснение в dual_echo_core.
+     // Половина — DATAFLOW-регион, её входные скаляры формально тоже входы
+     // региона. stable здесь оставлен как страховка: вреда он не несёт, а
+     // синхронизацию между стадиями снимает. ГЛАВНОЕ же лечение — отсутствие
+     // DATAFLOW у вызывающей dual_echo_core, см. пояснение там.
      #pragma HLS stable variable = enable
      #pragma HLS stable variable = listenPort
 
@@ -320,7 +321,7 @@ void dual_echo_half_b(int enable,
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
-     // См. пояснение в dual_echo_core.
+     // См. пояснение в dual_echo_half_a и в dual_echo_core.
      #pragma HLS stable variable = enable
      #pragma HLS stable variable = listenPort
 
@@ -388,44 +389,34 @@ void dual_echo_core(
 {
 // INLINE ставить нельзя — HLS 214-272, как и в hls_echo_krnl.cpp.
 #pragma HLS INLINE off
-#pragma HLS DATAFLOW disable_start_propagation
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STABLE НА ВХОДНЫХ СКАЛЯРАХ — БЕЗ ЭТОГО ЯДРО НЕ РАБОТАЕТ. Проверено на плате.
+// DATAFLOW ЗДЕСЬ НЕТ, И ЭТО ВАЖНО.
 //
-// Входные переменные DATAFLOW-региона по умолчанию синхронизируются со стартом
-// региона (UG1399, Stable Arrays: "without the stable pragma ... proc2 would be
-// part of the initial synchronization (via ap_start)"). В сгенерированном RTL
-// это выглядело так:
+// Раньше стоял #pragma HLS DATAFLOW disable_start_propagation — по аналогии с
+// hls_pingpong_krnl, а не по необходимости. Из-за него входные скаляры этой
+// функции становились входами DATAFLOW-региона и защёлкивались на старте
+// региона. В сгенерированном RTL:
 //
 //     always @ (posedge ap_clk)
 //         if ((1'b1 == ap_CS_fsm_state2))
-//             enable_read_reg_862 <= enable;      // защёлка, а не провод
+//             enable_read_reg_862 <= enable;     // защёлка, а не провод
 //
-// То есть значение снимается один раз, в состоянии 2 автомата верхнего модуля.
-// При ap_ctrl_none автомат проходит это состояние ОДИН раз — сразу после снятия
-// сброса, когда хост ещё ничего не записал. Дальше регион работает бесконечно и
-// в state2 не возвращается, поэтому запись по JTAG (секунды позже) до логики не
-// доходит НИКОГДА.
+// При ap_ctrl_none автомат проходит state2 ОДИН раз, сразу после снятия
+// сброса, когда хост ещё ничего не записал. Дальше в state2 он не
+// возвращается, поэтому запись по JTAG (секунды позже) до логики не доходила
+// НИКОГДА. На плате это выглядело так: enable в регистре 1, а ядро видит 0
+// (portState с ap_vld=1 и значением 0, listenAttempts с ap_vld=0).
+// listenPortA/B защёлкивались там же и тоже нулями.
 //
-// Симптом на плате: enable по s_axi_control читается 1, а ядро видит 0 —
-// portState_a/_b имеют ap_vld=1 при значении 0, то есть ядро само записало ноль
-// в ветке if (!enable). listenAttempts при этом ap_vld=0: до ветки enable дело
-// не доходило ни разу. То же с listenPortA/B — они защёлкивались нулями рядом
-// (trunc_ln415_reg_867 / trunc_ln415_1_reg_872 в том же state2).
+// #pragma HLS stable эту защёлку НЕ убирает — проверено на csynth: pragma
+// принимается без предупреждений, а enable_read_reg остаётся. stable снимает
+// синхронизацию МЕЖДУ процессами, а не чтение аргумента верхнего уровня.
 //
-// stable убирает эту синхронизацию: значение читается напрямую из регистра
-// s_axilite. Требование UG1399 — гарантировать, что переменная не меняется во
-// время работы региона. У нас так и есть: хост пишет параметры один раз до
-// enable, и больше не трогает.
-//
-// НЕ УБИРАТЬ. Без этих строк ядро молча не запускается: ни одной ошибки при
-// сборке, порт слушания открыт не будет, и снаружи это выглядит как «TCP не
-// подключается» на исправной прошивке.
-#pragma HLS stable variable = enable
-#pragma HLS stable variable = listenPortA
-#pragma HLS stable variable = listenPortB
-// ─────────────────────────────────────────────────────────────────────────────
+// Здесь DATAFLOW и не нужен: половины a и b полностью независимы (свои порты,
+// своё состояние, никаких общих данных), параллелизм между ними даёт сам
+// факт двух наборов логики. Внутри каждой половины DATAFLOW остаётся — там он
+// по делу, стадии связаны потоками.
+
 
      dual_echo_half_a(enable, listenPortA,
                       listenAttempts_a, portState_a, notifyCount_a,
