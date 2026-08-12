@@ -150,6 +150,32 @@ portRequested лишь когда стек ответил success=0. Если с
  * версии Vitis: два разных объекта -> два разных набора регистров, что бы
  * инструмент ни решил про инстанцирование.
  */
+/*
+ * Состояние rx_notify и rx_drain — тоже В СТРУКТУРАХ, по той же причине, что и
+ * listenState ниже: обе функции вызываются ДВАЖДЫ, по разу на половину.
+ *
+ * Пока половины были отдельными вложенными DATAFLOW-регионами, HLS создавал две
+ * копии железа и static-переменные внутри функций не сталкивались. После
+ * перехода на плоский DATAFLOW (все шесть стадий в dual_echo_core) копии
+ * слились, и HLS отказался синтезировать:
+ *
+ *     ERROR: [HLS 200-471] Dataflow form checks found feedback dependence
+ *            in dataflow-region for global/static variable notifications
+ *     ERROR: [HLS 200-471] ... for global/static variable drainState
+ *
+ * То есть инструмент прямо говорит: две стадии одного региона не могут делить
+ * static. Лечится так же, как для listen — состояние наружу, по ссылке.
+ */
+struct notifyState
+{
+     ap_uint<32> notifications;
+};
+
+struct drainState_t
+{
+     enum { IDLE, FORWARD } st;
+};
+
 struct listenState
 {
      bool portRequested;
@@ -243,7 +269,8 @@ void dual_echo_listen(int enable,
  * одно уведомление о данных. Вместе с portState это разделяет "порт не
  * открыт", "порт открыт, но клиент не подключился" и "данные идут".
  */
-void dual_echo_rx_notify(ap_uint<32>& notifyCount,
+void dual_echo_rx_notify(notifyState& ns,
+                         ap_uint<32>& notifyCount,
                          hls::stream<pkt128>& s_axis_tcp_notification,
                          hls::stream<pkt32>& m_axis_tcp_read_pkg,
                          hls::stream<ap_uint<16> >& rxSessionFifo,
@@ -252,8 +279,6 @@ void dual_echo_rx_notify(ap_uint<32>& notifyCount,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     static ap_uint<32> notifications = 0;
-#pragma HLS RESET variable=notifications
 
      if (s_axis_tcp_notification.empty())
           return;
@@ -265,8 +290,8 @@ void dual_echo_rx_notify(ap_uint<32>& notifyCount,
      ap_uint<16> sessionID = notification_pkt.data(15, 0);
      ap_uint<16> length    = notification_pkt.data(31, 16);
 
-     notifications++;
-     notifyCount = notifications;
+     ns.notifications++;
+     notifyCount = ns.notifications;
 
      if (length != 0)
      {
@@ -285,7 +310,8 @@ void dual_echo_rx_notify(ap_uint<32>& notifyCount,
  * Вычитывает пришедшие данные и выбрасывает. См. echo_rx_drain в
  * hls_echo_krnl.cpp — логика без изменений.
  */
-void dual_echo_rx_drain(hls::stream<pkt16>& s_axis_tcp_rx_meta,
+void dual_echo_rx_drain(drainState_t& ds,
+                        hls::stream<pkt16>& s_axis_tcp_rx_meta,
                         hls::stream<pkt512>& s_axis_tcp_rx_data,
                         hls::stream<ap_uint<16> >& rxSessionFifo,
                         hls::stream<ap_uint<16> >& rxLengthFifo)
@@ -293,30 +319,26 @@ void dual_echo_rx_drain(hls::stream<pkt16>& s_axis_tcp_rx_meta,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     enum drainStateType {IDLE, FORWARD};
-     static drainStateType drainState = IDLE;
-#pragma HLS RESET variable=drainState
-
-     switch (drainState)
+     switch (ds.st)
      {
-     case IDLE:
+     case drainState_t::IDLE:
           if (!rxSessionFifo.empty() && !rxLengthFifo.empty()
               && !s_axis_tcp_rx_meta.empty())
           {
                s_axis_tcp_rx_meta.read();
                rxSessionFifo.read();
                rxLengthFifo.read();
-               drainState = FORWARD;
+               ds.st = drainState_t::FORWARD;
           }
           break;
 
-     case FORWARD:
+     case drainState_t::FORWARD:
           if (!s_axis_tcp_rx_data.empty())
           {
                pkt512 rx_word = s_axis_tcp_rx_data.read();
                if (rx_word.last)
                {
-                    drainState = IDLE;
+                    ds.st = drainState_t::IDLE;
                }
           }
           break;
@@ -459,6 +481,19 @@ void dual_echo_core(
      static listenState st_b = {false, false, 0, 0};
      #pragma HLS RESET variable=st_b
 
+     // Состояние notify/drain — тоже раздельное на половину, по той же причине
+     // (см. notifyState/drainState_t): в плоском DATAFLOW две стадии не могут
+     // делить static, HLS отвергает это как feedback dependence.
+     static notifyState ns_a = {0};
+     #pragma HLS RESET variable=ns_a
+     static notifyState ns_b = {0};
+     #pragma HLS RESET variable=ns_b
+
+     static drainState_t ds_a = {drainState_t::IDLE};
+     #pragma HLS RESET variable=ds_a
+     static drainState_t ds_b = {drainState_t::IDLE};
+     #pragma HLS RESET variable=ds_b
+
      static hls::stream<ap_uint<16> > rxSessionFifo_a("rxSessionFifo_a");
      #pragma HLS STREAM variable=rxSessionFifo_a depth=512
      static hls::stream<ap_uint<16> > rxLengthFifo_a("rxLengthFifo_a");
@@ -478,22 +513,22 @@ void dual_echo_core(
      dual_echo_listen(enableA, listenPortA, st_a, listenAttempts_a, portState_a,
                       m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a);
 
-     dual_echo_rx_notify(notifyCount_a,
+     dual_echo_rx_notify(ns_a, notifyCount_a,
                          s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
                          rxSessionFifo_a, rxLengthFifo_a);
 
-     dual_echo_rx_drain(s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a,
+     dual_echo_rx_drain(ds_a, s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a,
                         rxSessionFifo_a, rxLengthFifo_a);
 
      // половина b -> network_krnl_2 (QSFP1)
      dual_echo_listen(enableB, listenPortB, st_b, listenAttempts_b, portState_b,
                       m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
-     dual_echo_rx_notify(notifyCount_b,
+     dual_echo_rx_notify(ns_b, notifyCount_b,
                          s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
                          rxSessionFifo_b, rxLengthFifo_b);
 
-     dual_echo_rx_drain(s_axis_tcp_rx_meta_b, s_axis_tcp_rx_data_b,
+     dual_echo_rx_drain(ds_b, s_axis_tcp_rx_meta_b, s_axis_tcp_rx_data_b,
                         rxSessionFifo_b, rxLengthFifo_b);
 
      // Заглушки на всё, что не используется — по одной на каждую
