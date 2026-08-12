@@ -41,7 +41,28 @@ set_top hls_echo_probe_dual_krnl
 add_files hls_echo_probe_dual_krnl.cpp -cflags $CFLAGS
 add_files -tb tb/test_hls_echo_probe_dual_krnl.cpp -cflags $CFLAGS
 
-open_solution -reset "solution1" -flow_target vitis
+# flow_target vivado, А НЕ vitis — И ЭТО ВАЖНО.
+#
+# При -flow_target vitis HLS принудительно навешивает s_axilite на ВСЕ скаляры:
+# для Vitis-потока ядро обязано иметь control-интерфейс под XRT. В логе это
+# видно как
+#     INFO: [HLS 200-777] Using interface defaults for 'Vitis' flow target.
+#     Setting interface mode on port '.../enable' to 's_axilite & ap_none'
+#     Bundling port 'serverIp', ... and 'cycleCount' to AXI-Lite port control.
+# То есть ровно та конструкция, которую UG1393 запрещает при ap_ctrl_none и
+# которая молча защёлкивает скаляры один раз после сброса. Наш
+# #pragma HLS INTERFACE ap_none register при этом не отвергается — он даёт
+# ap_none второй половиной режима, но бандл остаётся.
+#
+# Сборочный путь (scripts/vivado/export_hls_ip.tcl) использует
+# -flow_target vivado и даёт чистый ap_none — это видно в 1208_full.txt для
+# hls_dual_echo_krnl. Здесь берём тот же target, чтобы этот скрипт проверял ТО
+# ЖЕ, что попадёт в железо. Иначе он показывает интерфейс, которого в сборке не
+# будет, и пункт 1 проверок ниже не выполнялся бы никогда.
+#
+# Остальные run_csim.tcl репозитория стоят на vitis — для проверки одной логики
+# это безвредно, но выводу про форму интерфейса там верить нельзя.
+open_solution -reset "solution1" -flow_target vivado
 set_part {xcu200-fsgd2104-2-e}
 create_clock -period 6.061 -name default
 
@@ -98,6 +119,11 @@ puts "   и у функции:"
 puts "       Setting interface mode on function '...' to 'ap_ctrl_none'"
 puts "   Любое упоминание s_axilite у скаляра = защёлка после сброса,"
 puts "   ядро не увидит записи по JTAG (UG1393, Free-Running Kernels)."
+puts "   Проверить, что target тот же, что в сборке:"
+puts "       Using interface defaults for 'Vivado' flow target"
+puts "   Если написано 'Vitis' — s_axilite навесится принудительно, и"
+puts "   этот прогон покажет НЕ то, что попадёт в железо (см. коммент"
+puts "   к open_solution выше)."
 puts ""
 puts "2. II СТАДИЙ. Ждём 'Final II = 1' у epd_client_traffic и"
 puts "   epd_server_echo. II=2 измерение больше НЕ ломает (шкала времени"
@@ -106,7 +132,9 @@ puts "   просядет — стоит знать."
 puts ""
 puts "3. sampleReady И ТЕНЕВОЙ РЕГИСТР. Единственное значение, которое"
 puts "   пишется в ДВУХ ветках epd_latch, поэтому проверять надо отдельно:"
-puts "       grep -n \"_preg\" epd_csim_proj/solution1/impl/ip/hdl/verilog/*epd_latch*.v"
+puts "       grep -n \"_preg\" epd_csim_proj/solution1/syn/verilog/*epd_latch*.v"
+puts "   (syn/verilog, а не impl/ip — csynth без export_design каталог"
+puts "    impl не создаёт)"
 puts "   Ждём sampleReady_preg. Если его НЕТ — значение транзиентное, и"
 puts "   обёртке нужен латч, иначе epd_measure будет печатать"
 puts "   'sample failed' на исправном ядре."
