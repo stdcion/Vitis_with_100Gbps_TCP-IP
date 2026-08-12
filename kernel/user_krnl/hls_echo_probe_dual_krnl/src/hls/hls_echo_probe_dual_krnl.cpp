@@ -132,15 +132,14 @@ static_assert((EPD_MAX_WORDS & (EPD_MAX_WORDS - 1)) == 0,
 // регистры s_axilite. Повторяем эту идиому.
 //
 // Отсюда конструкция ниже:
-//   * шкала времени ОДНА на всё ядро: 32-битный счётчик живёт в HDL-обёртке и
-//     приходит в обе половины проводом cycleCount. Раньше каждая стадия держала
-//     свой счётчик, и разности между стадиями были осмысленны лишь пока HLS
-//     давал обеим II=1 — то есть по свойству расписания, а не кода. Разбор,
-//     что именно ломалось (NET_FWD завышался ровно настолько, насколько
-//     занижался NET_REV, при верных RTT/ECHO и сходящемся балансе), — в шапке
-//     cycle_counter в src/hdl/hls_echo_probe_dual_krnl_wrapper.sv;
-//   * таймстемпы передаются измерителю потоками tsFifo*;
-//   * sessionID от connect к traffic — тоже потоком.
+//   * ВРЕМЯ ЯДРО НЕ ИЗМЕРЯЕТ ВООБЩЕ. Оно только считает события и отдаёт
+//     счётчики наружу; таймстемпы по их ap_vld ставит HDL-обёртка, где живёт
+//     единственный счётчик тактов. Так шкала одна ФИЗИЧЕСКИ, а не по свойству
+//     расписания HLS. Две предыдущие попытки сделать иначе — по счётчику на
+//     стадию, затем общий счётчик проводом внутрь — обе давали две разные
+//     шкалы; подробный разбор там, где раньше была стадия epd_latch;
+//   * sessionID от connect к traffic — потоком (скаляр по ссылке между
+//     стадиями HLS не разрешает).
 //
 // 32 бита при 165 МГц переполняются за 26 секунд; разности берутся по модулю
 // 2^32, а измеряемые интервалы — микросекунды, так что это не мешает.
@@ -262,12 +261,7 @@ void epd_client_connect(int enable,
 void epd_client_traffic(int enable,
                         int msgBytes,
                         int triggerGo,
-                        ap_uint<32> cycleCount,
                         hls::stream<ap_uint<16> >& sessionFifo,
-                        // таймстемпы наружу: пара (t1', t2) на каждый
-                        // завершённый круг
-                        hls::stream<ap_uint<32> >& tsRequestFifo,   // t1'
-                        hls::stream<ap_uint<32> >& tsReplyFifo,     // t2
                         ap_uint<32>& sentCount,
                         ap_uint<32>& recvCount,
                         ap_uint<32>& timeoutCount,
@@ -299,20 +293,6 @@ void epd_client_traffic(int enable,
      static ap_uint<32> sent = 0;
      static ap_uint<32> recv = 0;
      static ap_uint<32> timeouts = 0;
-     static ap_uint<32> tRequest = 0;
-
-     // Шкала времени приходит ПРОВОДОМ из HDL-обёртки (cycle_counter в
-     // hls_echo_probe_dual_krnl_wrapper.sv) и та же самая, что у epd_server_echo.
-     //
-     // Раньше здесь был свой static cyc с комментарием «шкалы синхронны, потому
-     // что оба счётчика тикают от ap_clk и стартуют с одного сброса». При
-     // Final II = 1 это верно, но это свойство РАСПИСАНИЯ, а не кода: при II=2
-     // счётчики расходятся линейно, и тогда NET_FWD завышается ровно настолько,
-     // насколько NET_REV занижается (t2'−t1' и t2−t1 вычитают точки РАЗНЫХ
-     // половин). RTT и ECHO при этом остаются верными, а баланс сходится всегда,
-     // поэтому ни одна проверка на хосте такую ошибку не поймала бы. Подробный
-     // разбор — в шапке счётчика в обёртке.
-     const ap_uint<32> cyc = cycleCount;
 
      // sessionID приходит один раз от connect-стадии и дальше хранится.
      static ap_uint<16> sessionID = 0;
@@ -410,10 +390,10 @@ void epd_client_traffic(int enable,
 
           if (word.last)
           {
-               // ТОЧКА t1': последнее слово запроса отдано стеку.
+               // СОБЫТИЕ t1': последнее слово запроса отдано стеку.
                // Берём последнее, а не первое, чтобы измерение не
                // зависело от размера сообщения на стороне отправки.
-               tRequest = cyc;
+               // Время по ap_vld этого счётчика штампует обёртка.
                sent++;
                sentCount = sent;
                waitTimer = 0;
@@ -464,15 +444,9 @@ void epd_client_traffic(int enable,
                pkt512 word = s_axis_tcp_rx_data.read();
                if (word.last)
                {
-                    // ТОЧКА t2: последнее слово ответа получено.
+                    // СОБЫТИЕ t2: последнее слово ответа получено.
                     // Симметрично t1' — тоже последнее слово, поэтому
                     // RTT не зависит от размера сообщения.
-                    //
-                    // Пара таймстемпов уходит измерителю вместе: так он
-                    // не может рассинхронизироваться и посчитать t2
-                    // одного пакета с t1' другого.
-                    tsRequestFifo.write(tRequest);
-                    tsReplyFifo.write(cyc);
                     recv++;
                     recvCount = recv;
                     st = WAIT_TRIGGER;
@@ -584,9 +558,7 @@ void epd_server_listen(int enable,
  * backpressure). Отличие: таймстемпы вместо записи счётчика в payload —
  * измеритель у нас внутри, гонять значение через данные незачем.
  */
-void epd_server_echo(ap_uint<32> cycleCount,
-                     hls::stream<ap_uint<32> >& tsEchoInFifo,   // t2'
-                     hls::stream<ap_uint<32> >& tsEchoOutFifo,  // t1
+void epd_server_echo(ap_uint<32>& echoRxCount,
                      ap_uint<32>& echoCount,
                      hls::stream<pkt128>& s_axis_tcp_notification,
                      hls::stream<pkt32>& m_axis_tcp_read_pkg,
@@ -613,11 +585,7 @@ void epd_server_echo(ap_uint<32> cycleCount,
      static ap_uint<16> wordIdx = 0;
      static ap_uint<16> bytesRemaining = 0;
      static ap_uint<32> echoes = 0;
-     static ap_uint<32> tEchoIn = 0;
-
-     // Та же шкала, что у epd_client_traffic — провод из обёртки. См. пояснение
-     // там и в шапке счётчика в hls_echo_probe_dual_krnl_wrapper.sv.
-     const ap_uint<32> cyc = cycleCount;
+     static ap_uint<32> rxDone = 0;
 
      switch (st)
      {
@@ -665,9 +633,18 @@ void epd_server_echo(ap_uint<32> cycleCount,
                }
                if (word.last)
                {
-                    // ТОЧКА t2': последнее слово запроса получено эхом.
+                    // СОБЫТИЕ t2': последнее слово запроса получено эхом.
                     // Симметрично t1' на клиенте — оба по последнему слову.
-                    tEchoIn = cyc;
+                    //
+                    // Раньше здесь ставился таймстемп (tEchoIn = cyc). Теперь
+                    // инкрементируется счётчик, а время по его ap_vld штампует
+                    // обёртка — см. пояснение выше про epd_latch.
+                    //
+                    // Счётчик полезен и сам по себе: без него echoes=0 не
+                    // отличить от «запрос до эха не дошёл». Та же причина, по
+                    // которой существуют listenAttempts и portState.
+                    rxDone++;
+                    echoRxCount = rxDone;
                     st = REQ;
                }
           }
@@ -738,8 +715,7 @@ void epd_server_echo(ap_uint<32> cycleCount,
                // Пара (t2', t1) уходит измерителю вместе — по той же
                // причине, что и на клиенте: чтобы нельзя было сложить
                // точки разных пакетов.
-               tsEchoInFifo.write(tEchoIn);
-               tsEchoOutFifo.write(cyc);
+               // СОБЫТИЕ t1: последнее слово ответа отдано стеку.
                echoes++;
                echoCount = echoes;
                st = NOTIFY;
@@ -754,101 +730,64 @@ void epd_server_echo(ap_uint<32> cycleCount,
 // ─────────────────────────────────────────────────────────────────────────────
 
 /*
- * Отдаёт хосту СЫРЫЕ значения четырёх точек, а не посчитанные интервалы.
+ * ЗАЩЁЛКА ТАЙМСТЕМПОВ ПЕРЕЕХАЛА В HDL-ОБЁРТКУ.
  *
- * ПОЧЕМУ СЫРЫЕ, А НЕ min/max/sum:
+ * Здесь была стадия epd_latch: она собирала четыре таймстемпа из FIFO и
+ * выставляла sampleReady. Убрана целиком, вместе с четырьмя tsFifo* и входным
+ * скаляром cycleCount. Причина — не стиль, а обнаруженный на сгенерированном
+ * RTL дефект.
  *
- *   1. Гибкость. Из четвёрки на PC считается любой интервал, в том числе
- *      тот, о котором мы сейчас не думаем (скажем, t2'-t1 — эхо плюс
- *      обратная сеть). Зашитые в логику агрегаты пришлось бы менять
- *      пересборкой, а это час.
+ * ЧТО БЫЛО НЕ ТАК. Шкалу времени пробовали передать в ядро скаляром
+ * cycleCount (провод из счётчика в обёртке), чтобы обе половины штампевали
+ * время из одного источника. HLS раздал этот скаляр НЕСИММЕТРИЧНО:
  *
- *   2. Отладка. Если бы min оказался абсурдным (3 такта на весь круг),
- *      по агрегату не понять, что сломалось. По сырым t1'=1000, t2'=1200,
- *      t1=1205, t2=1400 видно сразу.
+ *   epd_server_echo  — получил его проводом:
+ *       input [31:0] cycleCount;   tEchoIn <= cycleCount;
+ *   epd_client_traffic — получил его FIFO-каналом глубины 3:
+ *       input cycleCount_c_empty_n;  output cycleCount_c_read;
+ *       tRequest <= cycleCount_c_dout;
  *
- *   3. Место и тайминг. Четыре компаратора min/max плюс четыре
- *      64-битных аккумулятора — это площадь и лишние длинные пути при
- *      WNS +0.011 нс. Четыре регистра-защёлки почти бесплатны.
+ * (проверено в syn/verilog: entry_proc пишет в канал cycleCount_c_U, клиент
+ * читает из него, эхо читает провод). Значит t1'/t2 брались из значения,
+ * задержанного каналом, а t2'/t1 — с провода: те же две шкалы, только этажом
+ * выше. NET_FWD завышался ровно настолько, насколько занижался NET_REV, при
+ * верных RTT и ECHO и сходящемся балансе — то есть невидимо для хоста.
  *
- *   4. Главное: 64-БИТНЫЕ СУММЫ НЕЛЬЗЯ БЫЛО БЫ ЧИТАТЬ КОРРЕКТНО.
- *      s_axi_control отдаёт 32 бита за транзакцию, значит 64-битный
- *      регистр читается двумя обращениями, а между ними ядро успевает
- *      обновить значение: получилось бы младшее слово от одного замера,
- *      старшее от другого. При переносе через границу 2^32 — мусор,
- *      редко и невоспроизводимо. Все регистры здесь 32-битные и
- *      читаются одной транзакцией.
+ * Хуже: пустой канал БЛОКИРУЕТ стадию клиента
+ * (ap_block_state1_pp0_stage0_iter0 включает cycleCount_c_empty_n == 0), а
+ * писатель ограничен ap_start. При ap_ctrl_none это прямой путь к вечному
+ * ожиданию после исчерпания FIFO глубины 3 — те самые предупреждения
+ * HLS 200-656 про дедлоки, но с конкретным механизмом. Симптом на плате был
+ * бы «sentCount замер на единице», неотличимый от «соединение не открылось».
  *
- * СОГЛАСОВАННОСТЬ. Гонки чтения нет по построению режима: пока хост не
- * записал triggerGo, новый пакет не отправится, значит четвёрка не
- * изменится. Поэтому не нужны ни номер набора, ни теневые регистры —
- * достаточно флага sampleReady «результат готов».
+ * ВЫВОД: скаляр, меняющийся каждый такт и читаемый ДВУМЯ стадиями, передавать
+ * в HLS нельзя — размножение остаётся на усмотрение инструмента. (iperf не
+ * опровержение: там timeInCycles читает одна стадия.)
  *
- * sampleReady снимается тем же фронтом triggerGo, который пускает
- * следующий пакет: триггер и подтверждение чтения — одна транзакция.
+ * КАК СДЕЛАНО ТЕПЕРЬ. Ядро наружу отдаёт только СЧЁТЧИКИ СОБЫТИЙ, а время
+ * штампует обёртка — у неё один счётчик и один тактовый домен:
  *
- * ПОЧЕМУ СБРОС ЗАПИСЬЮ, А НЕ ЧТЕНИЕМ: s_axilite не даёт ядру узнать,
- * что регистр прочитали — читающая транзакция для логики невидима.
- * Поэтому «сбрасывается при чтении» в HLS не реализуемо, и сброс
- * привязан к записи triggerGo.
+ *     t1' <- sentCount_ap_vld     (клиент отдал последнее слово запроса)
+ *     t2' <- echoRxCount_ap_vld   (эхо приняло последнее слово запроса)
+ *     t1  <- echoCount_ap_vld     (эхо отдало последнее слово ответа)
+ *     t2  <- recvCount_ap_vld     (клиент принял последнее слово ответа)
  *
- * Защёлкиваем ВСЕ ЧЕТЫРЕ в момент t2 (круг завершён) — тогда они по
- * построению принадлежат одному пакету.
+ * ap_vld у этих выходов — готовый строб «значение изменилось в этом такте»,
+ * его выдаёт HLS сам (проверено в epd_core.v: sentCount_ap_vld и т.д.).
+ * Обёртке не нужен ни детектор изменения, ни канал.
+ *
+ * Шкала стала одна ФИЗИЧЕСКИ: один регистр, четыре читателя в том же домене.
+ * Обёртка видит событие на такт позже самого события, но ОДИНАКОВО для всех
+ * четырёх точек, поэтому разности точны — а абсолютные значения нигде не
+ * используются.
+ *
+ * sampleReady тоже переехал в обёртку: там он становится простым флагом
+ * «t2 пришёл после последнего triggerGo».
+ *
+ * Соображения про сырые значения вместо агрегатов (гибкость, отладка, место, и
+ * главное — невозможность корректно прочитать 64-битную сумму двумя
+ * AXI-транзакциями) остаются в силе; они теперь относятся к регистрам обёртки.
  */
-void epd_latch(int triggerGo,
-               hls::stream<ap_uint<32> >& tsRequestFifo,  // t1'
-               hls::stream<ap_uint<32> >& tsReplyFifo,    // t2
-               hls::stream<ap_uint<32> >& tsEchoInFifo,   // t2'
-               hls::stream<ap_uint<32> >& tsEchoOutFifo,  // t1
-               ap_uint<32>& tsRequestOut,   // t1'
-               ap_uint<32>& tsEchoInOut,    // t2'
-               ap_uint<32>& tsEchoOutOut,   // t1
-               ap_uint<32>& tsReplyOut,     // t2
-               ap_uint<32>& sampleReady)
-{
-#pragma HLS PIPELINE II=1
-#pragma HLS INLINE off
-
-     static bool ready = false;
-#pragma HLS RESET variable=ready
-     static int prevGo = 0;
-#pragma HLS RESET variable=prevGo
-     static ap_uint<32> t1p = 0, t2p = 0, t1 = 0, t2 = 0;
-
-     // Новый триггер снимает флаг: результат предыдущего замера хост уже
-     // прочитал, иначе он бы не дёрнул следующий.
-     if (triggerGo != prevGo)
-     {
-          prevGo = triggerGo;
-          ready = false;
-     }
-
-     // Ждём все четыре значения одного круга. Клиент пишет пару
-     // (t1', t2) по приёму ответа, эхо — пару (t2', t1) по отправке.
-     // Эхо физически успевает раньше, но полагаться на это нельзя:
-     // проверяем наличие всех четырёх.
-     //
-     // Потери не сбивают соответствие: пара пишется только на успешном
-     // круге. Если эхо не сработало, клиент уйдёт по таймауту и в его
-     // потоки ничего не запишет.
-     bool haveAll = !tsRequestFifo.empty() && !tsReplyFifo.empty()
-                 && !tsEchoInFifo.empty()  && !tsEchoOutFifo.empty();
-
-     if (haveAll)
-     {
-          t1p = tsRequestFifo.read();
-          t2  = tsReplyFifo.read();
-          t2p = tsEchoInFifo.read();
-          t1  = tsEchoOutFifo.read();
-          ready = true;
-     }
-
-     tsRequestOut = t1p;
-     tsEchoInOut  = t2p;
-     tsEchoOutOut = t1;
-     tsReplyOut   = t2;
-     sampleReady  = ready ? (ap_uint<32>)1 : (ap_uint<32>)0;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ВЕРХНИЙ УРОВЕНЬ
@@ -892,17 +831,12 @@ void epd_core(
      // параметры
      int enable, int serverIp, int serverPort, int listenPort,
      int msgBytes, int triggerGo,
-     // единая шкала времени для обеих половин (провод из обёртки)
-     ap_uint<32> cycleCount,
-     // счётчики
+     // счётчики событий. Время по их ap_vld штампует HDL-обёртка — таймстемпов
+     // и sampleReady здесь больше нет, см. пояснение выше (было epd_latch).
      ap_uint<32>& connAttempts, ap_uint<32>& sentCount,
      ap_uint<32>& recvCount, ap_uint<32>& timeoutCount,
-     ap_uint<32>& echoCount,
-     ap_uint<32>& listenAttempts, ap_uint<32>& portState,
-     // сырые таймстемпы последнего завершённого круга + номер набора
-     ap_uint<32>& tsRequest, ap_uint<32>& tsEchoIn,
-     ap_uint<32>& tsEchoOut, ap_uint<32>& tsReply,
-     ap_uint<32>& sampleReady)
+     ap_uint<32>& echoRxCount, ap_uint<32>& echoCount,
+     ap_uint<32>& listenAttempts, ap_uint<32>& portState)
 {
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
@@ -922,19 +856,19 @@ void epd_core(
      // Требование stable при этом соблюдено буквально: UG1399 требует, чтобы
      // читаемые ячейки не перезаписывались ДРУГИМ ПРОЦЕССОМ ИЛИ ВЫЗЫВАЮЩИМ
      // КОНТЕКСТОМ во время исполнения региона. Все эти скаляры — внешние входы,
-     // внутри дизайна их не пишет никто, включая cycleCount: его источник —
-     // счётчик в HDL-обёртке, вне ядра. Предупреждение HLS 200-991 ловит именно
-     // запись stable-скаляра, и в наших логах его нет.
+     // внутри дизайна их не пишет никто. Предупреждение HLS 200-991 ловит
+     // именно запись stable-скаляра, и в наших логах его нет.
      //
-     // То, что cycleCount меняется каждый такт, ограничением не является — см.
-     // clock() в iperf_client.cpp:479, где точно так же читается timeInCycles.
+     // triggerGo меняется во время работы, и это не ограничение: он только
+     // читается и сравнивается с прошлым значением. Скаляр, меняющийся КАЖДЫЙ
+     // такт, здесь больше не передаётся — попытка так сделать (cycleCount)
+     // кончилась несимметричным размножением через FIFO, см. пояснение выше.
 #pragma HLS stable variable = enable
 #pragma HLS stable variable = serverIp
 #pragma HLS stable variable = serverPort
 #pragma HLS stable variable = listenPort
 #pragma HLS stable variable = msgBytes
 #pragma HLS stable variable = triggerGo
-#pragma HLS stable variable = cycleCount
 
      // ── каналы между стадиями ──
      // Глубина 2 достаточна: в тракте один пакет, значит в каждом канале
@@ -943,23 +877,17 @@ void epd_core(
      static hls::stream<ap_uint<16> > sessionFifo("sessionFifo");
      #pragma HLS STREAM variable=sessionFifo depth=2
 
-     static hls::stream<ap_uint<32> > tsRequestFifo("tsRequestFifo");
-     #pragma HLS STREAM variable=tsRequestFifo depth=2
-     static hls::stream<ap_uint<32> > tsReplyFifo("tsReplyFifo");
-     #pragma HLS STREAM variable=tsReplyFifo depth=2
-     static hls::stream<ap_uint<32> > tsEchoInFifo("tsEchoInFifo");
-     #pragma HLS STREAM variable=tsEchoInFifo depth=2
-     static hls::stream<ap_uint<32> > tsEchoOutFifo("tsEchoOutFifo");
-     #pragma HLS STREAM variable=tsEchoOutFifo depth=2
+     // tsRequestFifo/tsReplyFifo/tsEchoInFifo/tsEchoOutFifo убраны вместе с
+     // epd_latch: таймстемпы больше не ходят внутри ядра, их ставит обёртка по
+     // ap_vld счётчиков событий.
 
      // --- клиент (порт 0) ---
      epd_client_connect(enable, serverIp, serverPort, connAttempts,
                         sessionFifo,
                         m_axis_tcp_open_connection_a, s_axis_tcp_open_status_a);
 
-     epd_client_traffic(enable, msgBytes, triggerGo, cycleCount,
+     epd_client_traffic(enable, msgBytes, triggerGo,
                         sessionFifo,
-                        tsRequestFifo, tsReplyFifo,
                         sentCount, recvCount, timeoutCount,
                         m_axis_tcp_tx_meta_a, m_axis_tcp_tx_data_a,
                         s_axis_tcp_tx_status_a,
@@ -970,17 +898,11 @@ void epd_core(
      epd_server_listen(enable, listenPort, listenAttempts, portState,
                        m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
-     // ТОТ ЖЕ cycleCount, что у клиента — в этом весь смысл правки: NET_FWD и
-     // NET_REV вычитают точки разных половин, поэтому шкала обязана быть одна.
-     epd_server_echo(cycleCount, tsEchoInFifo, tsEchoOutFifo, echoCount,
+     epd_server_echo(echoRxCount, echoCount,
                      s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
                      s_axis_tcp_rx_meta_b, s_axis_tcp_rx_data_b,
                      m_axis_tcp_tx_meta_b, m_axis_tcp_tx_data_b,
                      s_axis_tcp_tx_status_b);
-
-     // --- защёлка сырых таймстемпов ---
-     epd_latch(triggerGo, tsRequestFifo, tsReplyFifo, tsEchoInFifo, tsEchoOutFifo,
-               tsRequest, tsEchoIn, tsEchoOut, tsReply, sampleReady);
 
      // --- заглушки на неиспользуемое ---
      // Клиент не слушает порт, сервер не открывает соединений.
@@ -1056,7 +978,8 @@ void hls_echo_probe_dual_krnl(
                ap_uint<32>& sentCount,      // отправлено запросов
                ap_uint<32>& recvCount,      // получено ответов
                ap_uint<32>& timeoutCount,   // ответ не пришёл за таймаут
-               ap_uint<32>& echoCount,      // сообщений отражено сервером
+               ap_uint<32>& echoRxCount,    // запросов ПРИНЯТО эхом (событие t2')
+               ap_uint<32>& echoCount,      // сообщений отражено сервером (t1)
 
                // Состояние listen серверной половины. Без этого «замер не
                // удался» не отличить от «сервер вообще не слушает»:
@@ -1068,26 +991,22 @@ void hls_echo_probe_dual_krnl(
                ap_uint<32>& listenAttempts,
                ap_uint<32>& portState,
 
-               // ── СЫРЫЕ таймстемпы последнего завершённого круга ──
+               // ── ТАЙМСТЕМПОВ ЗДЕСЬ БОЛЬШЕ НЕТ ──
                //
-               // Такты ap_clk (6.06 нс на 165 МГц). Все четыре
-               // защёлкиваются вместе в момент t2, поэтому принадлежат
-               // одному пакету. Интервалы считает хост:
+               // Были tsRequest/tsEchoIn/tsEchoOut/tsReply и sampleReady. Их
+               // ставит HDL-обёртка по ap_vld счётчиков событий выше, потому что
+               // передать в ядро единую шкалу времени не получается: HLS
+               // размножает такой скаляр несимметрично (одной стадии провод,
+               // другой FIFO с блокировкой). Подробный разбор — там, где раньше
+               // была стадия epd_latch.
+               //
+               // Интервалы считает хост, как и прежде:
                //     RTT      = tsReply   - tsRequest
                //     NET_FWD  = tsEchoIn  - tsRequest
                //     ECHO     = tsEchoOut - tsEchoIn
                //     NET_REV  = tsReply   - tsEchoOut
-               // Вычитание беззнаковое по модулю 2^32 — переполнение
-               // счётчика (раз в 26 с на 165 МГц) измерение не портит.
-               ap_uint<32>& tsRequest,      // t1'
-               ap_uint<32>& tsEchoIn,       // t2'
-               ap_uint<32>& tsEchoOut,      // t1
-               ap_uint<32>& tsReply,        // t2
-
-               // Флаг готовности: 1 = четвёрка выше принадлежит
-               // завершённому кругу и ещё не запрашивалась. Снимается
-               // записью triggerGo (см. пояснение у epd_latch).
-               ap_uint<32>& sampleReady,
+               // Вычитание беззнаковое по модулю 2^32 — переполнение счётчика
+               // (раз в 26 с на 165 МГц) измерение не портит.
 
                // enable — разрешение начать работу. Пока 0, ядро не трогает
                // ни один порт стека: до этого момента параметры в регистрах
@@ -1098,20 +1017,7 @@ void hls_echo_probe_dual_krnl(
                // enable молча ломал jtag_ctrl.tcl. Теперь адресная карта
                // задана руками в probe_control_s_axi.v, и порядок аргументов
                // на смещения не влияет вообще.
-               int enable,
-
-               // Единая шкала времени для обеих половин — провод из счётчика
-               // в HDL-обёртке. НЕ регистр управления: хост его не пишет и не
-               // читает, в адресной карте его нет.
-               //
-               // Почему счётчик снаружи, а не два static внутри стадий:
-               // NET_FWD = t2'−t1' и NET_REV = t2−t1 вычитают точки РАЗНЫХ
-               // половин, поэтому шкала обязана быть физически одна. Раздельные
-               // счётчики совпадают лишь пока HLS даёт обеим стадиям II=1 —
-               // это свойство расписания, а не кода. Подробный разбор с
-               // разложением, что именно ломается, — в шапке cycle_counter в
-               // hls_echo_probe_dual_krnl_wrapper.sv.
-               ap_uint<32> cycleCount
+               int enable
                       ) {
 
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
@@ -1221,8 +1127,12 @@ void hls_echo_probe_dual_krnl(
 // А runExperiment — прямой аналог triggerGo: меняется во время работы, и на нём
 // тоже ap_none register.
 //
-// Так что меняющийся каждый такт cycleCount — не трейдофф и не костыль, а
-// документированная штатная конструкция.
+// ПОПЫТКА ПЕРЕДАТЬ ШКАЛУ ВРЕМЕНИ СКАЛЯРОМ БЫЛА И ПРОВАЛИЛАСЬ. Скаляр
+// cycleCount, меняющийся каждый такт, HLS раздал двум стадиям несимметрично:
+// одной проводом, другой FIFO-каналом с блокировкой. Разбор — там, где раньше
+// была epd_latch. Мораль: ap_none register корректен для скаляра, который
+// читает ОДНА стадия (так в iperf), но не гарантирует broadcast, когда
+// читателей несколько. Поэтому время штампует обёртка.
 //
 // register: значение защёлкивается на входе порта, что даёт чистую границу для
 // таймингового анализа и снимает длинный комбинационный путь от регистра в
@@ -1233,7 +1143,6 @@ void hls_echo_probe_dual_krnl(
 #pragma HLS INTERFACE ap_none register port = listenPort
 #pragma HLS INTERFACE ap_none register port = msgBytes
 #pragma HLS INTERFACE ap_none register port = triggerGo
-#pragma HLS INTERFACE ap_none register port = cycleCount
 // ─────────────────────────────────────────────────────────────────────────────
 
      epd_core(s_axis_udp_rx_a, m_axis_udp_tx_a,
@@ -1257,10 +1166,10 @@ void hls_echo_probe_dual_krnl(
               s_axis_tcp_tx_status_b,
 
               enable, serverIp, serverPort, listenPort,
-              msgBytes, triggerGo, cycleCount,
+              msgBytes, triggerGo,
 
-              connAttempts, sentCount, recvCount, timeoutCount, echoCount,
-              listenAttempts, portState,
-              tsRequest, tsEchoIn, tsEchoOut, tsReply, sampleReady);
+              connAttempts, sentCount, recvCount, timeoutCount,
+              echoRxCount, echoCount,
+              listenAttempts, portState);
 }
 }

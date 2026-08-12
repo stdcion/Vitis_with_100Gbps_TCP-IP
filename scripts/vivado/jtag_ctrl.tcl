@@ -396,6 +396,7 @@ set ::EPD_OFF_TIMEOUTS      0x4c
 set ::EPD_OFF_ECHOES        0x50
 set ::EPD_OFF_LISTEN_ATT    0x54
 set ::EPD_OFF_PORT_STATE    0x58
+set ::EPD_OFF_ECHO_RX       0x5c
 set ::EPD_OFF_TS_REQUEST    0x60
 set ::EPD_OFF_TS_ECHO_IN    0x64
 set ::EPD_OFF_TS_ECHO_OUT   0x68
@@ -458,8 +459,9 @@ proc epd_status {{n 1}} {
      set rdy [axi_read32 [expr {$base + $::EPD_OFF_SAMPLE_READY}]]
      set lat [axi_read32 [expr {$base + $::EPD_OFF_LISTEN_ATT}]]
      set pst [axi_read32 [expr {$base + $::EPD_OFF_PORT_STATE}]]
+     set erx [axi_read32 [expr {$base + $::EPD_OFF_ECHO_RX}]]
 
-     puts "epd\[$n\]: connAttempts=$att sent=$snt echoes=$ech recv=$rcv timeouts=$tmo ready=$rdy"
+     puts "epd\[$n\]: connAttempts=$att sent=$snt echoRx=$erx echoes=$ech recv=$rcv timeouts=$tmo ready=$rdy"
      puts "epd\[$n\]: server listen: attempts=$lat state=[_epd_state $pst]"
 
      # Diagnostics: where exactly the chain broke. The server-side listen state
@@ -476,12 +478,16 @@ proc epd_status {{n 1}} {
      } elseif {$snt == 0 && $att > 3} {
           puts "  -> connection did not open even though the port is OPEN."
           puts "     Check addressing (same /24, different last octets) and vio_dump."
-     } elseif {$snt > 0 && $ech == 0} {
+     } elseif {$snt > 0 && $erx == 0} {
           puts "  -> the request never reached port 1: link, cable or CMAC placement"
+     } elseif {$erx > 0 && $ech == 0} {
+          puts "  -> the echo RECEIVED the request but never sent a reply."
+          puts "     That is inside the kernel, not the network: the echo is stuck"
+          puts "     waiting for tx_status from stack 1. Report this to us."
      } elseif {$ech > 0 && $rcv == 0} {
           puts "  -> the echo replied but the reply never came back: reverse path"
      }
-     return [list $att $snt $ech $rcv $tmo $rdy $lat $pst]
+     return [list $att $snt $ech $rcv $tmo $rdy $lat $pst $erx]
 }
 
 proc _epd_state {v} {
@@ -647,12 +653,34 @@ proc epd_calibrate {{n 1} {iters 100}} {
 # that is enough to see the order of magnitude and the spread. Thousands are
 # only needed for the tail of the distribution, and that belongs to the
 # under-load measurement, which needs a different mode.
+# Warm-up samples discarded before the statistics. Not a fudge factor: the
+# first packets after epd_enable share the pipe with connection setup, and
+# their timestamps are legitimately different from steady state.
+#
+#   * SYN / SYN-ACK of the client connection,
+#   * the first ARP exchange (both stacks learn each other's MAC),
+#   * the very first pass through TOE, when its session tables in DDR4 are
+#     still cold.
+#
+# Three is enough for that -- the setup traffic is a handful of frames, not a
+# ramp. Raising it hides real behaviour instead of noise, so leave it at three
+# unless the raw CSV shows a longer transient.
+#
+# epd_raw does NOT skip them: it prints every sample with its status, and the
+# whole point of the raw dump is to see what the aggregate dropped.
+set ::EPD_WARMUP 3
+
 proc epd_collect {count {n 1}} {
      set names {RTT NET_FWD ECHO NET_REV}
      set data  {{} {} {} {}}
      set bad 0
      set raw_t1p {}
      set raw_t2  {}
+
+     # Warm-up: fire and throw away, before anything is accumulated.
+     for {set w 0} {$w < $::EPD_WARMUP} {incr w} {
+          epd_sample $n
+     }
 
      for {set i 0} {$i < $count} {incr i} {
           set s [epd_sample $n]
@@ -671,7 +699,7 @@ proc epd_collect {count {n 1}} {
 
      set got [llength [lindex $data 0]]
      puts ""
-     puts "=== $got samples out of $count (discarded: $bad) ==="
+     puts "=== $got samples out of $count (discarded: $bad, warm-up: $::EPD_WARMUP) ==="
      if {$got == 0} { epd_status $n; return }
 
      puts [format "%-9s %8s %8s %8s %9s   %s" \

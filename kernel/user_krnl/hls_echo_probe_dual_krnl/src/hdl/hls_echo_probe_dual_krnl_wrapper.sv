@@ -359,6 +359,104 @@ always @(posedge ap_clk) begin
           cycle_counter <= cycle_counter + 32'd1;
 end
 
+// ── ЗАЩЁЛКА ТАЙМСТЕМПОВ ──────────────────────────────────────────────────────
+//
+// Ядро время НЕ измеряет: оно считает события и отдаёт счётчики наружу, а
+// штампует их здесь. Сигналом события служит ap_vld соответствующего счётчика —
+// HLS выдаёт его сам для выходных скаляров (проверено в epd_core.v:
+// sentCount_ap_vld, recvCount_ap_vld, echoCount_ap_vld, echoRxCount_ap_vld).
+// Это готовый строб «значение изменилось в этом такте», поэтому детектор
+// изменения не нужен.
+//
+//     t1' <- sentCount_ap_vld     клиент отдал последнее слово запроса
+//     t2' <- echoRxCount_ap_vld   эхо приняло последнее слово запроса
+//     t1  <- echoCount_ap_vld     эхо отдало последнее слово ответа
+//     t2  <- recvCount_ap_vld     клиент принял последнее слово ответа
+//
+// ПОЧЕМУ ЗДЕСЬ, А НЕ В ЯДРЕ. Две попытки измерять время внутри HLS провалились:
+//
+//   1. По счётчику тактов на стадию. Совпадали лишь пока HLS давал обеим
+//      стадиям Final II = 1 — свойство расписания, не кода.
+//   2. Общий счётчик проводом внутрь (скаляр cycleCount). HLS раздал его
+//      НЕСИММЕТРИЧНО: epd_server_echo получил провод, а epd_client_traffic —
+//      FIFO-канал глубины 3. Плюс пустой канал блокировал стадию клиента
+//      (ap_block_state1_pp0_stage0_iter0 включал cycleCount_c_empty_n == 0), то
+//      есть к перекошенным шкалам добавлялся риск вечного ожидания.
+//
+// В обоих случаях NET_FWD = t2'-t1' и NET_REV = t2-t1 вычитали точки из РАЗНЫХ
+// шкал: одна завышалась ровно настолько, насколько занижалась другая, при
+// верных RTT и ECHO и сходящемся балансе. То есть ни одна проверка на хосте
+// этого не увидела бы — только стабильная асимметрия NET_FWD против NET_REV,
+// которую легко списать на асимметрию тракта.
+//
+// Здесь шкала одна ФИЗИЧЕСКИ: один регистр cycle_counter, четыре читателя, один
+// тактовый домен. Обёртка узнаёт о событии на такт позже самого события (ap_vld
+// приходит из зарегистрированного выхода ядра), но ОДИНАКОВО для всех четырёх
+// точек — значит разности точны. Абсолютные значения нигде не используются.
+logic [31:0] ts_request_r = 32'b0;   // t1'
+logic [31:0] ts_echo_in_r = 32'b0;   // t2'
+logic [31:0] ts_echo_out_r = 32'b0;  // t1
+logic [31:0] ts_reply_r   = 32'b0;   // t2
+
+always @(posedge ap_clk) begin
+     if (~ap_rst_n) begin
+          ts_request_r  <= 32'b0;
+          ts_echo_in_r  <= 32'b0;
+          ts_echo_out_r <= 32'b0;
+          ts_reply_r    <= 32'b0;
+     end else begin
+          if (sentCount_ap_vld)    ts_request_r  <= cycle_counter;
+          if (echoRxCount_ap_vld)  ts_echo_in_r  <= cycle_counter;
+          if (echoCount_ap_vld)    ts_echo_out_r <= cycle_counter;
+          if (recvCount_ap_vld)    ts_reply_r    <= cycle_counter;
+     end
+end
+
+// ── sampleReady ──────────────────────────────────────────────────────────────
+//
+// Тоже переехал из ядра. Здесь он проще, чем был в epd_latch: там надо было
+// ждать все четыре значения из четырёх FIFO, а тут достаточно факта «t2 пришёл
+// после последнего triggerGo» — остальные три точки к этому моменту уже
+// защёлкнуты по построению круга (t1' -> t2' -> t1 -> t2).
+//
+// Снимается записью triggerGo: триггер и подтверждение чтения — одна
+// транзакция. Фронт ловим по изменению значения регистра (хост пишет
+// инкремент), а не по единице, поэтому сбрасывать регистр между замерами не
+// надо.
+//
+// Гонки чтения нет по построению режима: пока хост не записал triggerGo, новый
+// пакет не отправится, значит четвёрка не изменится.
+// ПРИОРИТЕТ У УСТАНОВКИ, НЕ У СБРОСА — и это не вкусовщина.
+//
+// Сначала было наоборот:
+//     if      (triggerGo_reg != trigger_r) sample_ready_r <= 1'b0;
+//     else if (recvCount_ap_vld)           sample_ready_r <= 1'b1;
+// Условие смены triggerGo истинно ровно один такт, и в этот такт оно подавляло
+// установку. Смоделировано: при совпадении recvCount_ap_vld с тактом смены
+// triggerGo флаг НЕ встаёт вообще, и замер зависает до таймаута. Окно
+// однотактовое, то есть на плате это редкий невоспроизводимый `sample failed` —
+// худший вид дефекта.
+//
+// Здесь установка выиграет всегда. Потерять из-за этого нечего: `recvCount`
+// растёт только когда круг реально замкнулся, а хост между записью triggerGo и
+// первым чтением sampleReady тратит миллисекунды (JTAG), то есть тысячи тактов —
+// сброс успевает случиться задолго до опроса.
+logic [31:0] trigger_r      = 32'b0;
+logic        sample_ready_r = 1'b0;
+
+always @(posedge ap_clk) begin
+     if (~ap_rst_n) begin
+          trigger_r      <= 32'b0;
+          sample_ready_r <= 1'b0;
+     end else begin
+          trigger_r <= triggerGo_reg;
+          if (recvCount_ap_vld)
+               sample_ready_r <= 1'b1;      // круг замкнулся
+          else if (triggerGo_reg != trigger_r)
+               sample_ready_r <= 1'b0;      // новый замер начат
+     end
+end
+
 // ── регистры <-> провода ─────────────────────────────────────────────────────
 wire [31:0] enable_reg;
 wire [31:0] serverIp_reg;
@@ -367,18 +465,21 @@ wire [31:0] listenPort_reg;
 wire [31:0] msgBytes_reg;
 wire [31:0] triggerGo_reg;
 
+// Счётчики событий из ядра. ap_vld — строб «изменилось в этом такте», по нему
+// защёлкиваются таймстемпы выше. Сами значения читаются хостом как телеметрия;
+// держать их между обновлениями — забота HLS (теневой регистр *_preg).
 wire [31:0] connAttempts;
 wire [31:0] sentCount;
+wire        sentCount_ap_vld;
 wire [31:0] recvCount;
+wire        recvCount_ap_vld;
 wire [31:0] timeoutCount;
+wire [31:0] echoRxCount;
+wire        echoRxCount_ap_vld;
 wire [31:0] echoCount;
+wire        echoCount_ap_vld;
 wire [31:0] listenAttempts;
 wire [31:0] portState;
-wire [31:0] tsRequest;
-wire [31:0] tsEchoIn;
-wire [31:0] tsEchoOut;
-wire [31:0] tsReply;
-wire [31:0] sampleReady;
 
 probe_control_s_axi #(
      .C_S_AXI_ADDR_WIDTH ( C_S_AXI_CONTROL_ADDR_WIDTH ),
@@ -419,14 +520,16 @@ probe_control_s_axi #(
      .sentCount      ( sentCount              ),
      .recvCount      ( recvCount              ),
      .timeoutCount   ( timeoutCount           ),
+     .echoRxCount    ( echoRxCount            ),
      .echoCount      ( echoCount              ),
      .listenAttempts ( listenAttempts         ),
      .portState      ( portState              ),
-     .tsRequest      ( tsRequest              ),
-     .tsEchoIn       ( tsEchoIn               ),
-     .tsEchoOut      ( tsEchoOut              ),
-     .tsReply        ( tsReply                ),
-     .sampleReady    ( sampleReady            )
+     // таймстемпы и готовность — из обёртки, а не из ядра
+     .tsRequest      ( ts_request_r           ),
+     .tsEchoIn       ( ts_echo_in_r           ),
+     .tsEchoOut      ( ts_echo_out_r          ),
+     .tsReply        ( ts_reply_r             ),
+     .sampleReady    ( {31'b0, sample_ready_r} )
 );
 
 // ── HLS-ядро ─────────────────────────────────────────────────────────────────
@@ -643,23 +746,23 @@ hls_echo_probe_dual_krnl_ip hls_echo_probe_dual_krnl_inst (
      .triggerGo      ( triggerGo_reg  ),
      .enable         ( enable_reg     ),
 
-     // Единая шкала времени для обеих половин — см. пояснение выше.
-     // НЕ регистр управления: хост его не пишет и не читает, в
-     // probe_control_s_axi.v его нет. Это провод из счётчика в этой обёртке.
-     .cycleCount     ( cycle_counter  ),
-
-     .connAttempts   ( connAttempts   ),
-     .sentCount      ( sentCount      ),
-     .recvCount      ( recvCount      ),
-     .timeoutCount   ( timeoutCount   ),
-     .echoCount      ( echoCount      ),
-     .listenAttempts ( listenAttempts ),
-     .portState      ( portState      ),
-     .tsRequest      ( tsRequest      ),
-     .tsEchoIn       ( tsEchoIn       ),
-     .tsEchoOut      ( tsEchoOut      ),
-     .tsReply        ( tsReply        ),
-     .sampleReady    ( sampleReady    )
+     // ── счётчики событий наружу ──
+     //
+     // ap_vld каждого — строб для защёлки таймстемпа (см. выше). Таймстемпов и
+     // sampleReady у ядра больше нет: передать в него единую шкалу времени не
+     // получается, HLS размножает такой скаляр несимметрично.
+     .connAttempts       ( connAttempts       ),
+     .sentCount          ( sentCount          ),
+     .sentCount_ap_vld   ( sentCount_ap_vld   ),
+     .recvCount          ( recvCount          ),
+     .recvCount_ap_vld   ( recvCount_ap_vld   ),
+     .timeoutCount       ( timeoutCount       ),
+     .echoRxCount        ( echoRxCount        ),
+     .echoRxCount_ap_vld ( echoRxCount_ap_vld ),
+     .echoCount          ( echoCount          ),
+     .echoCount_ap_vld   ( echoCount_ap_vld   ),
+     .listenAttempts     ( listenAttempts     ),
+     .portState          ( portState          )
 );
 
 endmodule

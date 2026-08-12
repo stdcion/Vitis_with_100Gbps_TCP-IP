@@ -80,11 +80,10 @@ extern "C" void hls_echo_probe_dual_krnl(
     hls::stream<pkt32>&,  hls::stream<pkt512>&, hls::stream<pkt64>&,
 
     int, int, int, int, int,                          // serverIp..triggerGo
-    ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,
+    ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,  // connAtt,sent,recv,timeout
+    ap_uint<32>&, ap_uint<32>&,                       // echoRxCount, echoCount
     ap_uint<32>&, ap_uint<32>&,                       // listenAttempts, portState
-    ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,
-    int,                                              // enable
-    ap_uint<32>);                                     // cycleCount (по значению)
+    int);                                             // enable
 
 // ── потоки ───────────────────────────────────────────────────────────────────
 // half a (клиент, порт 0)
@@ -111,8 +110,19 @@ static hls::stream<pkt64>  tx_status_b;
 // ── регистры ─────────────────────────────────────────────────────────────────
 static int k_serverIp = 0x0a01d499, k_serverPort = 7001, k_listenPort = 7001;
 static int k_msgBytes = 64, k_triggerGo = 0, k_enable = 0;
-static ap_uint<32> r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes;
+static ap_uint<32> r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes, r_echoRx;
 static ap_uint<32> r_listenAttempts, r_portState;
+
+// ── МОДЕЛЬ HDL-ОБЁРТКИ ───────────────────────────────────────────────────────
+//
+// Таймстемпы ставит НЕ ядро, а обёртка (hls_echo_probe_dual_krnl_wrapper.sv) по
+// ap_vld счётчиков событий. Здесь это воспроизводится: следим за изменением
+// счётчиков и штампуем g_cycleCount, как это делает железо. Значения ниже —
+// то, что хост прочитает из регистров.
+//
+// Это принципиально: раньше тестбенч читал таймстемпы из ядра, и потому не мог
+// заметить, что HLS раздаёт шкалу времени двум стадиям несимметрично. Теперь
+// модель совпадает с железом по конструкции.
 static ap_uint<32> r_tsRequest, r_tsEchoIn, r_tsEchoOut, r_tsReply, r_sampleReady;
 
 // Шкала времени, которую в железе держит HDL-обёртка (cycle_counter в
@@ -142,10 +152,36 @@ static void call_kernel()
         tx_meta_b, tx_data_b, tx_status_b,
 
         k_serverIp, k_serverPort, k_listenPort, k_msgBytes, k_triggerGo,
-        r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes,
+        r_connAttempts, r_sent, r_recv, r_timeouts,
+        r_echoRx, r_echoes,
         r_listenAttempts, r_portState,
-        r_tsRequest, r_tsEchoIn, r_tsEchoOut, r_tsReply, r_sampleReady,
-        k_enable, g_cycleCount);
+        k_enable);
+}
+
+// Логика HDL-обёртки: захват таймстемпов по изменению счётчиков + sampleReady.
+// Вызывается после ядра, как обёртка защёлкивает по фронту ap_vld.
+static ap_uint<32> w_sent_r, w_recv_r, w_echoRx_r, w_echo_r, w_trig_r;
+
+static void wrapper_tick()
+{
+    if (r_sent   != w_sent_r)   { r_tsRequest = g_cycleCount; w_sent_r   = r_sent;   }
+    if (r_echoRx != w_echoRx_r) { r_tsEchoIn  = g_cycleCount; w_echoRx_r = r_echoRx; }
+    if (r_echoes != w_echo_r)   { r_tsEchoOut = g_cycleCount; w_echo_r   = r_echoes; }
+
+    // ПОРЯДОК ВАЖЕН, как и в RTL: сначала сброс по triggerGo, ПОТОМ установка по
+    // recvCount. Если сделать наоборот (сброс последним), он затрёт только что
+    // выставленный флаг в такте, где эти два события совпали. В обёртке это
+    // выражено приоритетом ветвей в always-блоке — см. комментарий там.
+    bool trig_changed = ((ap_uint<32>)k_triggerGo != w_trig_r);
+    if (trig_changed) {
+        r_sampleReady = 0;
+        w_trig_r = (ap_uint<32>)k_triggerGo;
+    }
+    if (r_recv != w_recv_r) {
+        r_tsReply     = g_cycleCount;
+        r_sampleReady = 1;          // установка выигрывает всегда
+        w_recv_r      = r_recv;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,6 +248,8 @@ static void model_reset()
 {
     g_tick = 0;
     g_cycleCount = 0;   // как ap_rst_n сбрасывает cycle_counter в обёртке
+    r_tsRequest = r_tsEchoIn = r_tsEchoOut = r_tsReply = r_sampleReady = 0;
+    w_sent_r = w_recv_r = w_echoRx_r = w_echo_r = w_trig_r = 0;
     s0_portOpen = s1_portOpen = false;
     s0_pendingStatus = s1_pendingStatus = -1;
     s0_deliverState = s1_deliverState = 0;
@@ -369,7 +407,12 @@ static void tick(int n = 1)
     // в начале стадии и первое событие получало 1 — здесь первое событие
     // получает то же значение, потому что счётчик стартует с 0 и растёт
     // одинаково для обеих половин.
-    for (int i = 0; i < n; i++) { call_kernel(); model_tick(); g_cycleCount++; }
+    for (int i = 0; i < n; i++) {
+        call_kernel();
+        wrapper_tick();      // <- обёртка штампует время по событиям ядра
+        model_tick();
+        g_cycleCount++;
+    }
 }
 
 // ── проверки ─────────────────────────────────────────────────────────────────

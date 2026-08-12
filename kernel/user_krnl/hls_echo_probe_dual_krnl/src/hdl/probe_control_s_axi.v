@@ -53,9 +53,10 @@
 //   0x44  sentCount      RO  отправлено запросов
 //   0x48  recvCount      RO  получено ответов
 //   0x4c  timeoutCount   RO  ответ не пришёл за таймаут
-//   0x50  echoCount      RO  сообщений отражено сервером
+//   0x50  echoCount      RO  сообщений отражено сервером (событие t1)
 //   0x54  listenAttempts RO  сколько раз просили порт у стека
 //   0x58  portState      RO  0=ждём enable 1=запрос отправлен 2=порт открыт
+//   0x5c  echoRxCount    RO  запросов ПРИНЯТО эхом (событие t2')
 //   -- таймстемпы последнего круга (RO), такты ap_clk --
 //   0x60  tsRequest      RO  t1'
 //   0x64  tsEchoIn       RO  t2'
@@ -67,10 +68,16 @@
 // которую даёт HLS для входных скаляров. RO-регистры идут подряд по 4 байта:
 // ap_vld-полей у них нет, потому что это просто провода из ядра.
 //
-// ПОЧЕМУ ТАЙМСТЕМПЫ ЧИТАЮТСЯ ПРЯМО С ПРОВОДОВ. Гонки чтения нет по построению
-// режима: пока хост не записал triggerGo, новый пакет не отправится, значит
-// четвёрка не изменится (см. "СОГЛАСОВАННОСТЬ" в .cpp:770). Поэтому не нужны
-// ни теневые регистры здесь, ни номер набора -- достаточно sampleReady.
+// ОТКУДА БЕРУТСЯ ТАЙМСТЕМПЫ. НЕ из ядра -- их ставит обёртка
+// (hls_echo_probe_dual_krnl_wrapper.sv) по ap_vld счётчиков событий, потому что
+// передать в HLS-ядро единую шкалу времени не удаётся: скаляр, меняющийся
+// каждый такт и читаемый двумя стадиями, HLS размножает несимметрично -- одной
+// стадии провод, другой FIFO с блокировкой. Здесь они приходят такими же
+// проводами, как телеметрия, и читаются так же.
+//
+// Гонки чтения нет по построению режима: пока хост не записал triggerGo, новый
+// пакет не отправится, значит четвёрка не изменится. Поэтому не нужны ни
+// теневые регистры здесь, ни номер набора -- достаточно sampleReady.
 // Порядок на хосте: дождаться sampleReady=1, прочитать четвёрку, записать
 // новый triggerGo (эта же запись снимает sampleReady).
 //
@@ -127,6 +134,7 @@ module probe_control_s_axi
     input  wire [31:0]                   sentCount,
     input  wire [31:0]                   recvCount,
     input  wire [31:0]                   timeoutCount,
+    input  wire [31:0]                   echoRxCount,
     input  wire [31:0]                   echoCount,
     input  wire [31:0]                   listenAttempts,
     input  wire [31:0]                   portState,
@@ -162,6 +170,7 @@ localparam
     ADDR_ECHO_DATA_0      = 12'h050,
     ADDR_LSNATT_DATA_0    = 12'h054,
     ADDR_PORTSTATE_DATA_0 = 12'h058,
+    ADDR_ECHORX_DATA_0    = 12'h05c,
     ADDR_TSREQ_DATA_0     = 12'h060,
     ADDR_TSECHOIN_DATA_0  = 12'h064,
     ADDR_TSECHOOUT_DATA_0 = 12'h068,
@@ -349,6 +358,9 @@ always @(posedge ACLK) begin
                 end
                 ADDR_ECHO_DATA_0: begin
                     rdata <= echoCount;
+                end
+                ADDR_ECHORX_DATA_0: begin
+                    rdata <= echoRxCount;
                 end
                 ADDR_LSNATT_DATA_0: begin
                     rdata <= listenAttempts;
