@@ -82,6 +82,24 @@ XPFM = $(firstword $(wildcard /opt/xilinx/platforms/xilinx_$(BOARD)_*/*.xpfm))
 PROJ_DIR = $(REPO_ROOT)/build/vivado/$(BOARD)/$(USER_KRNL)
 BITSTREAM = $(PROJ_DIR)/net_vivado.runs/impl_1/net_bd_wrapper.bit
 
+# --- HDL-обёртка: есть у ядра или нет ----------------------------------------
+#
+# Ядро с параметрами от хоста НЕ МОЖЕТ держать s_axilite в самом HLS, если оно
+# free-running (ap_ctrl_none): UG1393 это запрещает, а HLS не выдаёт ошибку — он
+# молча защёлкивает скаляры один раз после сброса, и запись по JTAG до логики не
+# доходит НИКОГДА. Так была потеряна пара сессий на плате.
+#
+# Лечение — регистры в HDL-обёртке, а в HLS скаляры остаются проводами (так
+# сделано в iperf_krnl). Обёртке нужен свой шаг упаковки МЕЖДУ user_ip и bd:
+# он инстанцирует HLS-IP внутрь обёртки и выдаёт наружу один IP.
+#
+# Признак — наличие src/hdl/ у ядра. Проверка автоматическая, а не список имён:
+# со списком добавленное ядро молча собралось бы без обёртки, и симптом (ядро не
+# видит enable) выглядел бы как баг в HLS, а не как пропущенный шаг.
+KRNL_HDL_DIR  = $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/src/hdl
+KRNL_PACK_TCL = $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/package_$(USER_KRNL).tcl
+HAS_WRAPPER   = $(if $(wildcard $(KRNL_HDL_DIR)),yes,no)
+
 # jobs=2, а не больше: на 8 vCPU / 30 ГБ восемь параллельных синтезов Vivado
 # съедали всю память и подвешивали инстанс так, что не отвечал ни ssh, ни
 # AWS-консоль. Имплементация всё равно последовательная, теряется мало.
@@ -95,7 +113,7 @@ JOBS ?= 2
 # соберётся под один порт для отладки.
 NUM_QSFP ?= 2
 
-.PHONY: help list xo user_ip bd impl all report clean-krnl
+.PHONY: help list xo user_ip pack bd impl all report clean-krnl
 
 help:
 	@echo "Vivado-флоу: четыре шага, .bit на выходе."
@@ -106,9 +124,10 @@ help:
 	@echo "Шаги по отдельности:"
 	@echo "  xo       RTL-ядра cmac_krnl и network_krnl (нужна платформа XRT)  ~1 мин"
 	@echo "  user_ip  user-ядро из HLS в IP-каталог                            ~20 сек"
+	@echo "  pack     HLS-IP в HDL-обёртку (только если у ядра есть src/hdl/)  ~1 мин"
 	@echo "  bd       блок-дизайн                                             ~25 сек"
 	@echo "  impl     синтез + имплементация + битстрим                        ~1 час"
-	@echo "  all      всё подряд"
+	@echo "  all      всё подряд (pack пропускается сам, если обёртки нет)"
 	@echo ""
 	@echo "Диагностика готового битстрима (ничего не пересобирает):"
 	@echo "  report   утилизация по SLR, SLL, сайты CMAC/GT, ядро->SLR         ~1 мин"
@@ -184,6 +203,30 @@ user_ip:
 	cd $(REPO_ROOT) && USER_KRNL=$(USER_KRNL) BOARD=$(BOARD) \
 	     vitis_hls -f scripts/vivado/export_hls_ip.tcl
 
+# --- шаг 2.5: HLS-IP в HDL-обёртку -------------------------------------------
+#
+# Нужен только ядрам с регистрами управления — см. HAS_WRAPPER выше. Для ядра
+# без src/hdl/ (например hls_echo_krnl с зашитым портом) цель ничего не делает
+# и говорит об этом.
+pack:
+	$(need_krnl)
+	$(need_board)
+ifeq ($(HAS_WRAPPER),yes)
+	@if [ ! -f "$(KRNL_PACK_TCL)" ]; then \
+	     echo "ОШИБКА: у ядра есть src/hdl/, но нет скрипта упаковки:"; \
+	     echo "  $(KRNL_PACK_TCL)"; \
+	     echo ""; \
+	     echo "Обёртка без упаковки в BD не попадёт, и ядро не увидит регистры"; \
+	     echo "управления (см. комментарий про UG1393 в Makefile.vivado)."; \
+	     exit 1; \
+	fi
+	@echo "=== шаг 2.5: $(USER_KRNL) — HLS-IP в HDL-обёртку ==="
+	cd $(REPO_ROOT) && vivado -mode batch \
+	     -source $(KRNL_PACK_TCL) -tclargs $(BOARD)
+else
+	@echo "=== шаг 2.5: пропущен — у $(USER_KRNL) нет src/hdl/, обёртка не нужна ==="
+endif
+
 # --- шаг 3: блок-дизайн ------------------------------------------------------
 bd:
 	$(need_krnl)
@@ -231,7 +274,7 @@ impl:
 	     exit 1; \
 	fi
 
-all: xo user_ip bd impl
+all: xo user_ip pack bd impl
 
 # --- отчёт по размещению -----------------------------------------------------
 #
@@ -256,9 +299,16 @@ report:
 	@echo "Отчёт сохранён: $(PROJ_DIR)/report_placement.log"
 
 # Снести артефакты одной пары плата+ядро, не задевая остальные и cmake-кеш.
+#
+# build_pack/ сносится тоже, и это важно: в ip_repo_paths попадают И сырое
+# HLS-ядро, И обёртка. Старый packaged-каталог от прошлой сборки даёт второй IP
+# с тем же именем, а _find_ipdef в build_bd.tcl на неоднозначность падает (он
+# для этого и написан — раньше молча бралось первое совпадение, и так оба CMAC
+# уехали на один GT-квад).
 clean-krnl:
 	$(need_krnl)
 	$(need_board)
 	rm -rf $(PROJ_DIR)
 	rm -rf $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/src/hls/$(USER_KRNL)_ip_proj
-	@echo "удалено: $(PROJ_DIR) и HLS-проект ядра"
+	rm -rf $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/build_pack
+	@echo "удалено: $(PROJ_DIR), HLS-проект и build_pack ядра"

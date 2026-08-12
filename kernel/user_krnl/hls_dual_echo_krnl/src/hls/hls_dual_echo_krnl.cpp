@@ -68,6 +68,45 @@ TOE сбрасывается только по net_aresetn (см. network_stack.
 enable ОБЯЗАТЕЛЬНО последним: до него не тронут ни один порт стека,
 потому что listenPortA/listenPortB могут быть ещё не записаны.
 
+ГДЕ ЖИВУТ РЕГИСТРЫ. enable/listenPortA/listenPortB и счётчики телеметрии
+приходят сюда ОБЫЧНЫМИ АРГУМЕНТАМИ, без s_axilite — то есть становятся
+проводами RTL, видимыми каждый такт. Сами регистры держит HDL-обёртка
+(src/hdl/dual_echo_control_s_axi.v + hls_dual_echo_krnl_wrapper.sv).
+
+Так сделано не из вкуса, а потому что иначе нельзя: UG1393 (Free-Running
+Kernels) запрещает s_axilite при ap_ctrl_none, и это ровно тот случай,
+когда HLS не выдаёт ошибку, а молча портит дизайн. Проверено на плате:
+скаляры защёлкивались один раз в state2 автомата верхнего модуля —
+
+    always @ (posedge ap_clk)
+        if ((1'b1 == ap_CS_fsm_state2))
+            enable_read_reg_738 <= enable;      // защёлка, а не провод
+
+— то есть сразу после снятия сброса, когда хост ещё ничего не записал.
+Симптом: enable в регистре читается 1, а ядро видит 0.
+
+ЧТО НЕ ПОМОГЛО (проверено csynth, не гадания):
+  * #pragma HLS stable на скалярах — pragma принимается молча, защёлка
+    остаётся: stable снимает синхронизацию МЕЖДУ процессами dataflow, а
+    не защёлкивание аргумента на входе региона;
+  * убрать DATAFLOW из dual_echo_core — автомат создаёт сама топ-функция.
+
+ПОЧЕМУ НЕ ap_ctrl_hs. Он даёт ap_start, и скаляры защёлкиваются по его
+фронту — соблазнительно, но неверно: стадии ниже это тела функций БЕЗ
+цикла, они выполняются за один проход. При ap_ctrl_hs один ap_start = один
+проход, и непрерывная работа получается только через auto_restart, то есть
+на каденции перезапусков вместо II=1. Тогда waitTimer тикает раз на
+перезапуск, а не раз на такт (LISTEN_TIMEOUT посчитан из тактов и теряет
+смысл), а rx_drain читает одно слово за перезапуск и не успевает за 100G.
+network_krnl с ap_ctrl_hs — не образец: он рукописный SystemVerilog и
+подделывает ap_done таймером на секунду (network_stack.sv:921).
+
+Образец здесь — iperf_krnl, работающий на этом железе: HLS-функция
+ap_ctrl_none без единого s_axilite (iperf_client.cpp:546), скаляры
+проводами, регистры в iperf_role.sv:369. При этом iperf_krnl.xml заявляет
+hwControlProtocol="ap_ctrl_hs" — противоречия нет, ap_ctrl_hs реализует
+обёртка, а логика внутри свободно течёт с II=1.
+
 ПОВТОР ПО ТАЙМАУТУ, а не только по отказу. Прежняя версия сбрасывала
 portRequested лишь когда стек ответил success=0. Если стек промолчал
 (не готов, ответ потерян, backpressure) — автомат залипал в
@@ -87,21 +126,41 @@ portRequested лишь когда стек ответил success=0. Если с
 #define LISTEN_TIMEOUT 1000000
 
 /*
+ * Состояние автомата listen, вынесенное из static-переменных В ЯВНУЮ
+ * СТРУКТУРУ.
+ *
+ * ЗАЧЕМ. Раньше состояние жило в static внутри dual_echo_listen, а функция
+ * вызывается ДВАЖДЫ — по разу на половину. Работало это лишь потому, что
+ * INLINE off + DATAFLOW заставляют HLS создать две отдельные копии железа,
+ * у каждой свои регистры. Но это не гарантия, а наблюдаемое поведение
+ * инструмента: стоит HLS переиспользовать один экземпляр, и половины a/b
+ * молча делят portRequested/portOpened — тогда откроется РОВНО ОДИН порт.
+ * А смысл всего ядра — доказать, что половины независимы; именно этот отказ
+ * оставлять на усмотрение синтезатора нельзя.
+ *
+ * Со структурой независимость становится свойством кода, а не свойством
+ * версии Vitis: два разных объекта -> два разных набора регистров, что бы
+ * инструмент ни решил про инстанцирование.
+ */
+struct listenState
+{
+     bool portRequested;
+     bool portOpened;
+     ap_uint<32> waitTimer;
+     ap_uint<32> attempts;
+};
+
+/*
  * Открывает listen-порт и держит его.
  *
- * Продублирована (а не переиспользована из hls_echo_krnl.cpp), потому что
- * вызывается дважды с независимым состоянием — static-переменные внутри
- * принадлежат КОНКРЕТНОМУ вызову в дизайне, а не функции как таковой, так
- * что общий код тут ничего бы не сэкономил по железу, только по числу
- * строк.
- *
- * portState отдаётся наружу в s_axilite, чтобы по JTAG было видно, на чём
- * именно встало: 0=ждём enable, 1=запрос отправлен, 2=порт открыт.
- * Без этого "соединение не устанавливается" не отличить от "порт не
- * открылся", а на плате это единственный способ понять разницу.
+ * portState отдаётся наружу проводом (регистр держит HDL-обёртка), чтобы по
+ * JTAG было видно, на чём именно встало: 0=ждём enable, 1=запрос отправлен,
+ * 2=порт открыт. Без этого "соединение не устанавливается" не отличить от
+ * "порт не открылся", а на плате это единственный способ понять разницу.
  */
 void dual_echo_listen(int enable,
                       int listenPort,
+                      listenState& st,
                       ap_uint<32>& listenAttempts,
                       ap_uint<32>& portState,
                       hls::stream<pkt16>& m_axis_tcp_listen_port,
@@ -109,15 +168,6 @@ void dual_echo_listen(int enable,
 {
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
-
-     static bool portRequested = false;
-#pragma HLS RESET variable=portRequested
-     static bool portOpened = false;
-#pragma HLS RESET variable=portOpened
-     static ap_uint<32> waitTimer = 0;
-#pragma HLS RESET variable=waitTimer
-     static ap_uint<32> attempts = 0;
-#pragma HLS RESET variable=attempts
 
      // До разрешения хоста не трогаем стек: listenPort может быть ещё не
      // записан, а сам стек — ещё не запущен (см. шапку файла). Значение
@@ -129,19 +179,24 @@ void dual_echo_listen(int enable,
           return;
      }
 
-     if (!portRequested)
+     if (!st.portRequested)
      {
+          // Порт занят предыдущим запросом? Не пишем в полный поток —
+          // блокирующая запись остановила бы всю стадию.
+          if (m_axis_tcp_listen_port.full())
+               return;
+
           pkt16 listen_port_pkt;
           listen_port_pkt.data = 0;
           listen_port_pkt.data(15, 0) = (ap_uint<16>)listenPort;
           m_axis_tcp_listen_port.write(listen_port_pkt);
-          portRequested = true;
-          waitTimer = 0;
-          attempts++;
-          listenAttempts = attempts;
+          st.portRequested = true;
+          st.waitTimer = 0;
+          st.attempts++;
+          listenAttempts = st.attempts;
           portState = 1;
      }
-     else if (!portOpened)
+     else if (!st.portOpened)
      {
           if (!s_axis_tcp_port_status.empty())
           {
@@ -149,25 +204,25 @@ void dual_echo_listen(int enable,
                bool success = status_pkt.data(0, 0);
                if (success)
                {
-                    portOpened = true;
+                    st.portOpened = true;
                     portState = 2;
                }
                else
                {
                     // не открылось — просим снова на следующем такте
-                    portRequested = false;
+                    st.portRequested = false;
                }
           }
-          else if (waitTimer >= (ap_uint<32>)LISTEN_TIMEOUT)
+          else if (st.waitTimer >= (ap_uint<32>)LISTEN_TIMEOUT)
           {
                // Стек молчит. Раньше здесь наступало вечное ожидание;
                // теперь повторяем запрос — растущий listenAttempts на
                // хосте прямо показывает, что ответа так и нет.
-               portRequested = false;
+               st.portRequested = false;
           }
           else
           {
-               waitTimer++;
+               st.waitTimer++;
           }
      }
 }
@@ -284,18 +339,21 @@ void dual_echo_half_a(int enable,
 #pragma HLS DATAFLOW disable_start_propagation
 
      // Половина — DATAFLOW-регион, её входные скаляры формально тоже входы
-     // региона. stable здесь оставлен как страховка: вреда он не несёт, а
-     // синхронизацию между стадиями снимает. ГЛАВНОЕ же лечение — отсутствие
-     // DATAFLOW у вызывающей dual_echo_core, см. пояснение там.
+     // региона. stable снимает синхронизацию между стадиями по этим входам:
+     // значения приходят проводами из обёртки и меняются асинхронно, ждать
+     // их на каждом витке не нужно.
      #pragma HLS stable variable = enable
      #pragma HLS stable variable = listenPort
+
+     static listenState st_a = {false, false, 0, 0};
+     #pragma HLS RESET variable=st_a
 
      static hls::stream<ap_uint<16> > rxSessionFifo_a("rxSessionFifo_a");
      #pragma HLS STREAM variable=rxSessionFifo_a depth=512
      static hls::stream<ap_uint<16> > rxLengthFifo_a("rxLengthFifo_a");
      #pragma HLS STREAM variable=rxLengthFifo_a depth=512
 
-     dual_echo_listen(enable, listenPort, listenAttempts, portState,
+     dual_echo_listen(enable, listenPort, st_a, listenAttempts, portState,
                       m_axis_tcp_listen_port, s_axis_tcp_port_status);
 
      dual_echo_rx_notify(notifyCount,
@@ -325,12 +383,17 @@ void dual_echo_half_b(int enable,
      #pragma HLS stable variable = enable
      #pragma HLS stable variable = listenPort
 
+     // Свой объект состояния, отдельный от st_a — см. комментарий к
+     // listenState: именно это делает независимость половин свойством кода.
+     static listenState st_b = {false, false, 0, 0};
+     #pragma HLS RESET variable=st_b
+
      static hls::stream<ap_uint<16> > rxSessionFifo_b("rxSessionFifo_b");
      #pragma HLS STREAM variable=rxSessionFifo_b depth=512
      static hls::stream<ap_uint<16> > rxLengthFifo_b("rxLengthFifo_b");
      #pragma HLS STREAM variable=rxLengthFifo_b depth=512
 
-     dual_echo_listen(enable, listenPort, listenAttempts, portState,
+     dual_echo_listen(enable, listenPort, st_b, listenAttempts, portState,
                       m_axis_tcp_listen_port, s_axis_tcp_port_status);
 
      dual_echo_rx_notify(notifyCount,
@@ -462,18 +525,18 @@ void hls_dual_echo_krnl(
                hls::stream<pkt512>& m_axis_tcp_tx_data_b,
                hls::stream<pkt64>& s_axis_tcp_tx_status_b,
 
-               // ── Параметры (пишутся по JTAG до enable) ──
+               // ── Параметры: ПРОВОДА из HDL-обёртки, не s_axilite ──
                //
-               // ВАЖНО: смещения регистров берутся из сгенерированного
-               // заголовка драйвера, а не вычисляются по порядку
-               // аргументов — HLS вставляет ap_vld-регистр после каждого
-               // ВЫХОДНОГО значения, поэтому шаг у входов 8 байт, а у
-               // выходов 16. При правке этой сигнатуры сверить
-               // DUAL_ECHO_OFF_* в scripts/vivado/jtag_ctrl.tcl заново.
+               // Регистры держит dual_echo_control_s_axi.v, здесь это
+               // обычные аргументы -> входные порты RTL, видимые каждый
+               // такт. Адресная карта задана в обёртке явно (таблица в
+               // шапке dual_echo_control_s_axi.v), поэтому смещения больше
+               // НЕ надо угадывать по порядку аргументов и сверять с
+               // драйверным заголовком.
                int listenPortA,             // порт слушания половины a (QSFP0)
                int listenPortB,             // порт слушания половины b (QSFP1)
 
-               // ── Телеметрия (только чтение) ──
+               // ── Телеметрия: провода НАРУЖУ, в read-only регистры ──
                ap_uint<32>& listenAttempts_a,  // сколько раз просили listen
                ap_uint<32>& portState_a,       // 0=ждём enable 1=запрос 2=открыт
                ap_uint<32>& notifyCount_a,     // уведомлений о данных
@@ -481,7 +544,7 @@ void hls_dual_echo_krnl(
                ap_uint<32>& portState_b,
                ap_uint<32>& notifyCount_b,
 
-               // enable ВСЕГДА последний — разрешение начать работу.
+               // enable — разрешение начать работу (провод из обёртки).
                int enable)
 {
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
@@ -518,59 +581,22 @@ void hls_dual_echo_krnl(
 #pragma HLS INTERFACE axis port = m_axis_tcp_tx_data_b
 #pragma HLS INTERFACE axis port = s_axis_tcp_tx_status_b
 
-#pragma HLS INTERFACE s_axilite port = listenPortA bundle = control
-#pragma HLS INTERFACE s_axilite port = listenPortB bundle = control
-
-#pragma HLS INTERFACE s_axilite port = listenAttempts_a bundle = control
-#pragma HLS INTERFACE s_axilite port = portState_a      bundle = control
-#pragma HLS INTERFACE s_axilite port = notifyCount_a    bundle = control
-#pragma HLS INTERFACE s_axilite port = listenAttempts_b bundle = control
-#pragma HLS INTERFACE s_axilite port = portState_b      bundle = control
-#pragma HLS INTERFACE s_axilite port = notifyCount_b    bundle = control
-
-#pragma HLS INTERFACE s_axilite port = enable bundle = control
 // ─────────────────────────────────────────────────────────────────────────────
-// ap_ctrl_hs (по умолчанию), а НЕ ap_ctrl_none — и это принципиально.
+// НИ ОДНОГО s_axilite — это обязательное условие ap_ctrl_none, см. подробное
+// пояснение в шапке файла. Скаляры выше (listenPortA/B, enable, счётчики)
+// остаются обычными аргументами и становятся портами RTL — проводами, которые
+// подключает hls_dual_echo_krnl_wrapper.sv. Регистры и адресная карта живут в
+// dual_echo_control_s_axi.v.
 //
-// ПОЧЕМУ НЕ ap_ctrl_none. Free-running ядро несовместимо с параметрами от
-// хоста. Документация Xilinx прямо это пишет: "The kernel interface should not
-// have any #pragma HLS interface s_axilite (as there should not be any memory
-// or control port)". Мы это проверили на плате и получили ровно обещанное:
-// входные скаляры защёлкиваются один раз, в состоянии 2 автомата верхнего
-// модуля:
+// ap_ctrl_none: ядро "течёт" каждый такт, стадии ниже сохраняют состояние в
+// static с RESET. Каденция II=1 сохранена, поэтому LISTEN_TIMEOUT считается в
+// тактах (как и задумано), а rx_drain успевает за 100G.
 //
-//     always @ (posedge ap_clk)
-//         if ((1'b1 == ap_CS_fsm_state2))
-//             enable_read_reg_738 <= enable;      // защёлка, а не провод
-//
-// При ap_ctrl_none это состояние проходится ОДИН раз, сразу после снятия
-// сброса, когда хост ещё ничего не записал. Дальше ядро работает вечно и в
-// state2 не возвращается — запись по JTAG (секунды позже) до логики не доходит
-// НИКОГДА. Симптом: enable в регистре читается 1, а ядро видит 0 (portState с
-// ap_vld=1 и значением 0, listenAttempts с ap_vld=0). listenPortA/B
-// защёлкивались там же и тоже нулями.
-//
-// ЧТО НЕ ПОМОГЛО (проверено csynth, не гадания):
-//   * #pragma HLS stable на скалярах — pragma принимается без предупреждений,
-//     enable_read_reg остаётся. stable снимает синхронизацию МЕЖДУ процессами
-//     dataflow, а не защёлкивание аргумента на входе региона.
-//   * убрать DATAFLOW из dual_echo_core — защёлка осталась в том же state2,
-//     потому что автомат создаёт сама топ-функция.
-//
-// ПОЧЕМУ ap_ctrl_hs РАБОТАЕТ. Появляется ap_start, и скаляры защёлкиваются по
-// его фронту. Значит порядок «записать параметры -> дёрнуть ap_start» верен по
-// построению, а не вопреки документации. Ровно так и работает network_krnl в
-// этом же дизайне: ap_ctrl_hs, бесконечная логика, auto_restart, и его
-// ip_addr/mac_addr через s_axilite до логики доходят (видно в VIO).
-//
-// Хост обязан записать 0x81 в ap_ctrl (ap_start=1 + auto_restart=1), см.
-// dual_echo_enable в jtag_ctrl.tcl. auto_restart нужен, чтобы ядро
-// перезапускалось само и работало непрерывно.
-//
-// ПОБОЧНАЯ ПОЛЬЗА: гонка «ядро запросило listen до записи параметров»
-// становится невозможной — до ap_start ядро не исполняется вовсе.
+// Блочный протокол ap_ctrl_hs, который ждёт от ядра XRT/BD, реализует
+// обёртка — ровно как iperf_krnl.xml заявляет ap_ctrl_hs при ap_ctrl_none у
+// самой HLS-функции.
 // ─────────────────────────────────────────────────────────────────────────────
-#pragma HLS INTERFACE s_axilite port = return bundle = control
+#pragma HLS INTERFACE ap_ctrl_none port = return
 
      dual_echo_core(s_axis_udp_rx_a, m_axis_udp_tx_a,
                     s_axis_udp_rx_meta_a, m_axis_udp_tx_meta_a,

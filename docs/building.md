@@ -260,9 +260,9 @@ make all TARGET=hw DEVICE=<путь к .xpfm> \
 
 ## Флоу B: Vivado → `.bit`
 
-Это то, чем мы пользуемся. После шага 0 — ещё четыре шага, **строго по
-порядку**: шаг 3 собирает BD из того, что положили шаги 1 и 2, и падает, если
-чего-то нет.
+Это то, чем мы пользуемся. После шага 0 — ещё **пять** шагов, строго по
+порядку: шаг 3 собирает BD из того, что положили шаги 1, 2 и 2.5, и падает,
+если чего-то нет.
 
 Обёрнуто в [Makefile.vivado](../Makefile.vivado):
 
@@ -276,9 +276,58 @@ make -f Makefile.vivado all USER_KRNL=hls_echo_krnl BOARD=u200   # шаги 1-4
 ```bash
 make -f Makefile.vivado xo      BOARD=u200                            # ~1 мин
 make -f Makefile.vivado user_ip USER_KRNL=hls_echo_krnl BOARD=u200    # ~20 сек
+make -f Makefile.vivado pack    USER_KRNL=hls_echo_krnl BOARD=u200    # ~1 мин
 make -f Makefile.vivado bd      USER_KRNL=hls_echo_krnl BOARD=u200    # ~25 сек
 make -f Makefile.vivado impl    USER_KRNL=hls_echo_krnl BOARD=u200    # ~1 час
 ```
+
+### Шаг 2.5 (`pack`): зачем он и каким ядрам нужен
+
+**Ядру с параметрами от хоста нужна HDL-обёртка.** Причина не в удобстве, а в
+запрете: free-running ядро (`ap_ctrl_none`) **не может** иметь `s_axilite` —
+UG1393 ([Free-Running Kernels](https://docs.amd.com/r/2022.2-English/ug1393-vitis-application-acceleration/Free-Running-Kernels))
+пишет прямо: «The kernel interface should not have any `#pragma HLS interface
+s_axilite`».
+
+Опасность в том, что **HLS не выдаёт ошибку**. Он молча защёлкивает входные
+скаляры один раз, в `state2` автомата верхнего модуля — то есть сразу после
+снятия сброса, когда хост по JTAG ещё ничего не записал:
+
+```verilog
+always @ (posedge ap_clk)
+    if ((1'b1 == ap_CS_fsm_state2))
+        enable_read_reg_738 <= enable;      // защёлка, а не провод
+```
+
+Симптом на плате: `enable` в регистре читается `1`, а логика видит `0` —
+`portState=0`, `listenAttempts=0`, порт слушания не открывается. На это ушло
+две сессии с платой.
+
+Лечение — то же, что в апстримном `iperf_krnl`: регистры держит HDL, а в
+HLS-ядро значения приходят **проводами**, видимыми каждый такт.
+
+| | HLS-ядро | Регистры | Шаг `pack` |
+|---|---|---|---|
+| `hls_dual_echo_krnl` | `ap_ctrl_none`, без `s_axilite` | `src/hdl/dual_echo_control_s_axi.v` | **нужен** |
+| `hls_echo_krnl` | `ap_ctrl_none`, порт зашит константой | нет | пропускается |
+
+**Признак — наличие `src/hdl/` у ядра.** `make` определяет это сам, поэтому
+`all` работает одинаково для обоих типов, а `pack` для ядра без обёртки просто
+печатает, что пропущен. Проверка автоматическая, а не по списку имён: со
+списком новое ядро молча собралось бы без обёртки, и симптом выглядел бы как баг
+в HLS, а не как пропущенный шаг.
+
+Если обёртка есть, а `pack` не прогнан, **шаг 3 падает сразу** с указанием, что
+делать — раньше в BD ушло бы сырое HLS-IP без регистров, и это выяснилось бы
+только на плате.
+
+Результат: `kernel/user_krnl/<krnl>/build_pack/packaged/`. Внутри — обёртка
+вместе с HLS-IP, поэтому в `ip_repo_paths` попадает **только** она: два IP с
+одним именем дали бы неоднозначность, на которой `_find_ipdef` в
+`build_bd.tcl` падает намеренно.
+
+Скрипт упаковки прогоняет `synth_design -rtl` — несовпадение имён портов между
+обёрткой и HLS-IP всплывает там за минуту, а не через час на синтезе BD.
 
 **`USER_KRNL` и `BOARD` обязательны везде, дефолтов нет.** Это осознанно: с
 дефолтом забытый параметр собирал бы не то ядро молча, а следом шла бы часовая
@@ -297,6 +346,11 @@ make network_krnl DEVICE=<путь к .xpfm>
 
 # 2. user-ядро из HLS в IP-каталог (не .xo!)
 USER_KRNL=hls_echo_krnl BOARD=u200 vitis_hls -f scripts/vivado/export_hls_ip.tcl
+
+# 2.5. ТОЛЬКО для ядра с src/hdl/ — упаковать HLS-IP в HDL-обёртку
+vivado -mode batch \
+     -source kernel/user_krnl/hls_dual_echo_krnl/package_hls_dual_echo_krnl.tcl \
+     -tclargs u200
 
 # 3. блок-дизайн
 vivado -mode batch -source scripts/vivado/build_bd.tcl -tclargs hls_echo_krnl u200
@@ -386,11 +440,18 @@ TCP/UDP-стримов плюс `m00_axi`, `m01_axi`, `s_axi_control`. По эт
 плата: u200 (xcu200-fsgd2104-2-e), период 5.882 нс (170.000 МГц)
 ```
 
-Скрипт печатает в конце **смещения регистров** из `*_hw.h`. Их надо перенести в
-`USR_OFF_*` в [jtag_ctrl.tcl](../scripts/vivado/jtag_ctrl.tcl) — HLS назначает
-их сам, порядок аргументов в C++ адреса не задаёт. **Смена ядра меняет
-смещения**: у `hls_echo_krnl` и `hls_ouch_krnl` разный набор аргументов, и без
-правки `jtag_ctrl.tcl` запись через JTAG уйдёт не туда — молча, без ошибки.
+Скрипт печатает в конце **смещения регистров** из `*_hw.h`. Это относится
+только к ядрам, которые держат `s_axilite` в самом HLS (`hls_ouch_krnl`,
+`hls_echo_probe_dual_krnl`): у них смещения назначает HLS, порядок аргументов в
+C++ адреса не задаёт, и значения надо переносить в `USR_OFF_*` в
+[jtag_ctrl.tcl](../scripts/vivado/jtag_ctrl.tcl). Без правки запись через JTAG
+уйдёт не туда — молча, без ошибки.
+
+**У ядра с HDL-обёрткой это не так, и гадать больше не нужно.** Адресную карту
+задаёт `src/hdl/*_control_s_axi.v` в блоке `localparam` — она и есть источник
+истины, а `DE_OFF_*` в `jtag_ctrl.tcl` скопированы из неё. Ровно поэтому
+обёртка удобнее ещё и в отладке: раньше смещения в скрипте стояли
+placeholder'ами с пометкой «must be replaced» и ни с чем не сверялись.
 
 Результат: `kernel/user_krnl/<krnl>/src/hls/<krnl>_ip_proj/sol1/impl/ip`.
 
@@ -587,6 +648,7 @@ make -f Makefile.vivado clean-krnl USER_KRNL=hls_echo_krnl BOARD=u200
 | `tmp_kernel_pack_*`                      | те же цели                      | да, это временное                             |
 | `build_dir.hw.<xsa>/`                    | `make all` (XRT)                | да                                            |
 | `<krnl>_ip_proj/` рядом с HLS-исходником | шаг 2 (`export_hls_ip.tcl`)     | да, `clean-krnl`                              |
+| `<krnl>/build_pack/`                     | шаг 2.5 (`package_<krnl>.tcl`)  | да, `clean-krnl`                              |
 
 **Снос `build/` уносит и битстримы** — они лежат в `build/vivado/`. Это не
 неудобство, а нужное поведение: после пересборки `ip_repo` прежний битстрим
@@ -618,8 +680,78 @@ make -f Makefile.vivado clean-krnl USER_KRNL=hls_echo_krnl BOARD=u200
 ## Проверка кода без FPGA
 
 Тестбенч user-ядра гоняется нативно, без Vitis HLS — через шим `ap_int`/
-`hls_stream`. Полезно на машине, где Vivado нет вовсе:
+`hls_stream` в `kernel/common/csim_shim/`. Полезно на машине, где Vivado нет
+вовсе, и **обязательно перед каждой прошивкой**, если доступ к плате
+ограничен.
+
+Для `hls_dual_echo_krnl`:
 
 ```bash
-# см. run_csim.tcl рядом с исходником ядра
+g++ -std=c++14 -I kernel/common/csim_shim -I kernel/common/include kernel/user_krnl/hls_dual_echo_krnl/src/hls/hls_dual_echo_krnl.cpp kernel/user_krnl/hls_dual_echo_krnl/src/hls/tb/test_hls_dual_echo_krnl.cpp -o /tmp/test_dual_echo && /tmp/test_dual_echo
 ```
+
+Ожидается `=== ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ===`. Восемь сценариев: порядок bringup
+(до `enable` стек не трогается), раздельные номера портов на половинах,
+независимость половин, повтор запроса по отказу и по таймауту, приём данных,
+и `enable=0` в любой момент.
+
+Последний сценарий — прямая проверка того самого бага: он подтверждает, что
+`enable` читается **каждый такт**, а не защёлкивается один раз.
+
+Чего этот тест **не** проверяет: тайминг, упаковку IP, разводку BD. Для них
+нужен Vivado.
+
+> В `communication.hpp` функции объявлены без `inline`, поэтому подключать его и
+> в ядро, и в тестбенч нельзя — будет duplicate symbol при линковке. Тестбенчу
+> нужны только типы `pkt*`, и он объявляет их локально.
+
+---
+
+## Сборка начисто
+
+После смены фазы работы (например, переход ядра на HDL-обёртку) надёжнее
+собрать с нуля: старые `packaged_*` и `build_pack/` дают дубликаты IP, на
+которых `build_bd.tcl` падает — или, хуже, собирается не из того, что вы
+думаете.
+
+```bash
+make -f Makefile.vivado clean-krnl USER_KRNL=hls_dual_echo_krnl BOARD=u200
+```
+
+Это уносит проект BD, HLS-проект и `build_pack` одного ядра, не задевая
+`build/ip_repo` (то есть 8 минут `make ip` заново не нужны).
+
+Если нужно совсем всё, включая стек:
+
+```bash
+rm -rf build packaged_kernel_* tmp_kernel_pack_* _x.hw.* && mkdir -p build && cd build && cmake .. -DFDEV_NAME=u200 -DTCP_STACK_EN=1 && make ip
+```
+
+Дальше обычный прогон (~1 час, почти весь — шаг 4):
+
+```bash
+make -f Makefile.vivado all USER_KRNL=hls_dual_echo_krnl BOARD=u200
+```
+
+### Контрольные точки
+
+Что должно быть видно в логе, чтобы не ждать час напрасно:
+
+| Шаг | Признак, что всё верно |
+|---|---|
+| 0 | `[100%] Built target ip`, девять `.zip` в `build/ip_repo/` |
+| 1 | `GT clock running at 156250000 Hz` для **каждого** QSFP-индекса |
+| 2 | `плата: u200 (xcu200-fsgd2104-2-e), период 5.882 нс` |
+| 2.5 | `=== иерархия сходится ===`, затем адресная карта |
+| 3 | `user-ядро: HDL-обёртка (build_pack/packaged)` и **три** пути в `IP repos:` |
+| 4 | `@@@ WNS:` и `@@@ WHS:` — **оба положительные** |
+
+Строка на шаге 3 — самая полезная. `сырое HLS-IP (обёртки нет)` для
+`hls_dual_echo_krnl` означает, что `pack` не прогнан, и ядро не увидит
+регистров; теперь на этом падает сборка, а не сессия с платой.
+
+Отрицательный WNS на шаге 4 — **не** повод грузить битстрим. Vivado, в отличие
+от `v++`, частоту сам не снижает: он отдаёт битстрим с нарушенным таймингом, и
+тот грузится и работает нестабильно (случайная порча пакетов, залипания стека).
+Лечится снижением `DEV_FREQ_MHZ` в `devices/u200/device.tcl.in` и повтором с
+шага 2.

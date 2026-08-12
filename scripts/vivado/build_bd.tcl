@@ -194,11 +194,44 @@ foreach d [glob -nocomplain "$REPO_ROOT/packaged_kernel_*"] {
 foreach d [glob -nocomplain "$REPO_ROOT/build/ip_repo"] {
      lappend ip_repos $d
 }
-# IP пользовательского ядра от export_hls_ip.tcl. Проект лежит в каталоге
-# исходников ядра (HLS резолвит пути от каталога проекта — см. комментарий
-# в export_hls_ip.tcl).
-foreach d [glob -nocomplain "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hls/*/*/impl/ip"] {
-     lappend ip_repos $d
+# IP пользовательского ядра.
+#
+# Два варианта, и они ВЗАИМОИСКЛЮЧАЮЩИЕ:
+#
+#   * ядро с HDL-обёрткой (есть src/hdl/ и package_<krnl>.tcl) — в BD идёт
+#     упакованная обёртка из build_pack/packaged. Внутри неё уже лежит HLS-IP,
+#     поэтому каталог сырого HLS-ядра сюда добавлять НЕЛЬЗЯ: получилось бы два
+#     IP с именем $USER_KRNL, и _find_ipdef ниже честно упал бы на
+#     неоднозначности;
+#   * ядро без обёртки (порт зашит константой, регистров нет) — в BD идёт
+#     сырое HLS-IP от export_hls_ip.tcl.
+#
+# Зачем обёртка вообще: free-running ядро (ap_ctrl_none) не может иметь
+# s_axilite — UG1393 это запрещает, а HLS молча защёлкивает скаляры один раз
+# после сброса, и запись по JTAG до логики не доходит. Регистры поэтому живут в
+# HDL (как в iperf_krnl), а сюда попадает обёртка вокруг HLS-ядра.
+set USER_PACKAGED "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/build_pack/packaged"
+if {[file exists "$USER_PACKAGED/component.xml"]} {
+     puts "user-ядро: HDL-обёртка (build_pack/packaged)"
+     lappend ip_repos $USER_PACKAGED
+} else {
+     # Проект HLS лежит в каталоге исходников ядра (HLS резолвит пути от
+     # каталога проекта — см. комментарий в export_hls_ip.tcl).
+     set raw_hls [glob -nocomplain "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hls/*/*/impl/ip"]
+     foreach d $raw_hls {
+          lappend ip_repos $d
+     }
+     # Обёртка нужна, но не собрана — падаем здесь, а не через час на плате,
+     # где симптомом будет "ядро не видит enable".
+     if {[file isdirectory "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hdl"]} {
+          puts ""
+          error "у $USER_KRNL есть src/hdl/, но нет build_pack/packaged/component.xml.\
+                 Пропущен шаг 2.5 (упаковка обёртки):\
+                 make -f Makefile.vivado pack USER_KRNL=$USER_KRNL BOARD=$BOARD\
+                 Без него в BD попадёт сырое HLS-ядро без регистров управления,\
+                 и хост не сможет задать порты и enable."
+     }
+     puts "user-ядро: сырое HLS-IP (обёртки нет)"
 }
 
 if {[llength $ip_repos] == 0} {

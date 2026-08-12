@@ -394,10 +394,13 @@ set ::EPD_OFF_TS_REPLY      0xd8
 set ::EPD_OFF_SAMPLE_READY  0xe8
 set ::EPD_OFF_ENABLE        0xf8
 
-# ap_clk period, ns. Must match DEV_FREQ_MHZ in devices/<board>/device.tcl
-# (170 MHz -> 5.882 ns). If the frequency was changed, fix it here too,
-# otherwise the conversion to nanoseconds lies.
-set ::EPD_CLK_NS 5.882
+# ap_clk period, ns. Must match DEV_FREQ_MHZ in devices/<board>/device.tcl.in.
+# 165 MHz -> 6.061 ns. If the frequency changes, fix it here too, otherwise the
+# conversion to nanoseconds lies -- silently, which is the worst kind.
+#
+# Was 5.882 (170 MHz) until 11.08.2026, lowered because timing stopped closing
+# once hls_dual_echo_krnl moved to ap_ctrl_hs (WNS went to -0.010).
+set ::EPD_CLK_NS 6.061
 
 # Trigger counter: the edge is detected by a CHANGE in value, so there is no
 # need to clear the register between samples.
@@ -811,38 +814,34 @@ proc vio_dump {} {
 # listen port before the stack is up is exactly the race that leaves the
 # port half-open with no way to tell from outside.
 #
-# OFFSETS BELOW ARE PLACEHOLDERS -- they must be replaced with the values
-# from the generated driver header after the next HLS export:
-#     .../hls_dual_echo_krnl_ip_proj/sol1/impl/misc/drivers/
-#         hls_dual_echo_krnl_v1_0/src/xhls_dual_echo_krnl_hw.h
-# export_hls_ip.tcl prints them at the end of its run.
+# OFFSETS ARE NO LONGER GUESSES. They used to be placeholders copied from a
+# generated driver header (HLS assigns s_axilite offsets itself, and inserts an
+# ap_vld register after every output, so they could not be derived from the C++
+# argument order). The registers now live in hand-written HDL --
+# kernel/user_krnl/hls_dual_echo_krnl/src/hdl/dual_echo_control_s_axi.v -- and
+# that file's localparam block IS the address map. The values below are copied
+# from it directly; if you change one, change both.
 #
-# They CANNOT be derived from the C++ argument order: HLS inserts an
-# ap_vld register after every OUTPUT value, so inputs step by 8 bytes and
-# outputs by 16. The values below assume that layout (two 8-byte inputs at
-# 0x10/0x18, then six 16-byte outputs, then enable) but assuming is not
-# verifying -- dual_echo_configure checks the write and says so if it is wrong.
-# NOTE: adding listenPortB shifted every offset after it by 8 bytes compared
-# to the single-port version.
-set ::DE_OFF_LISTEN_PORT_A    0x10
-set ::DE_OFF_LISTEN_PORT_B    0x18
-set ::DE_OFF_LISTEN_ATT_A     0x20
-set ::DE_OFF_PORT_STATE_A     0x30
-set ::DE_OFF_NOTIFY_A         0x40
-set ::DE_OFF_LISTEN_ATT_B     0x50
-set ::DE_OFF_PORT_STATE_B     0x60
-set ::DE_OFF_NOTIFY_B         0x70
-# ap_ctrl (0x00) exists because the kernel is ap_ctrl_hs. bit0=ap_start,
-# bit1=ap_done, bit7=auto_restart. Under ap_ctrl_none there was no such
-# register at all.
+#   0x00  ap_ctrl      bit0=ap_start bit1=ap_done bit7=auto_restart
+#   0x10  enable       RW   host-said-go flag the logic actually checks
+#   0x18  listenPortA  RW
+#   0x20  listenPortB  RW
+#   0x30  listenAtt_a  RO   read straight off the kernel's wires
+#   0x34  portState_a  RO
+#   0x38  notify_a     RO
+#   0x40  listenAtt_b  RO
+#   0x44  portState_b  RO
+#   0x48  notify_b     RO
 set ::DE_OFF_AP_CTRL         0x00
-# enable is still a kernel argument, and it still has to be written -- but now
-# BEFORE ap_start, not after. Under ap_ctrl_hs every s_axilite scalar latches on
-# the ap_start edge, so enable/listenPortA/listenPortB must all be in their
-# registers by then. It is kept (rather than replaced by ap_start alone) because
-# it is the explicit "host said go" flag the logic checks, and dropping it would
-# shift every offset below.
-set ::DE_OFF_ENABLE          0x80
+set ::DE_OFF_ENABLE          0x10
+set ::DE_OFF_LISTEN_PORT_A   0x18
+set ::DE_OFF_LISTEN_PORT_B   0x20
+set ::DE_OFF_LISTEN_ATT_A    0x30
+set ::DE_OFF_PORT_STATE_A    0x34
+set ::DE_OFF_NOTIFY_A        0x38
+set ::DE_OFF_LISTEN_ATT_B    0x40
+set ::DE_OFF_PORT_STATE_B    0x44
+set ::DE_OFF_NOTIFY_B        0x48
 
 # Write the listen ports -- one per half. portB defaults to portA when
 # omitted, which keeps the old single-port behaviour available.
@@ -876,39 +875,53 @@ proc dual_echo_configure {listenPortA {listenPortB ""} {n 1}} {
 
 # Start the kernel. LAST, after dual_echo_configure and echo_bringup_dual.
 #
-# The kernel is ap_ctrl_hs (NOT ap_ctrl_none -- see the long comment in
-# hls_dual_echo_krnl.cpp). So starting it means writing ap_ctrl, exactly like
-# network_start does for network_krnl:
-#     bit 0 = ap_start, bit 7 = auto_restart
-# 0x81 sets both: the kernel starts and restarts itself, running continuously
-# instead of finishing once and stopping.
+# WHAT ACTUALLY STARTS THE WORK: the enable register at 0x10, nothing else.
+# The HLS core is ap_ctrl_none -- it has been running since reset was released
+# and reads enable/listenPortA/listenPortB off plain wires from the HDL wrapper,
+# every single cycle. So writing enable=1 is what makes it request the listen
+# ports, and it takes effect on the next clock edge.
 #
-# WHY THIS AND NOT AN 'enable' REGISTER. Under ap_ctrl_none the s_axilite
-# scalars were latched once at reset, long before the host wrote anything, so
-# enable never reached the logic. With ap_ctrl_hs the scalars latch on the
-# ap_start edge -- which is precisely why the order "write parameters, then
-# start" works by construction here.
+# ap_start is written too, but only as a courtesy to the block protocol the BD
+# expects: the wrapper implements ap_ctrl_hs around the free-running core (same
+# arrangement as iperf_krnl, whose XML declares ap_ctrl_hs while iperf_client.cpp
+# is ap_ctrl_none). ap_start_pulse also clears the wrapper's counters, so it is
+# useful as a soft reset. The kernel does NOT need it to run.
+#
+# This is the fix for the bug that cost the earlier board sessions: enable used
+# to be an s_axilite argument of the ap_ctrl_none HLS function, which UG1393
+# forbids. HLS accepted it silently and latched the scalars once in state2 of
+# the top FSM -- right after reset, before JTAG had written anything -- so the
+# register read back 1 while the logic saw 0. The registers now live in HDL
+# (dual_echo_control_s_axi.v), where a write is visible immediately.
 proc dual_echo_enable {{v 1} {n 1}} {
      set base [ouch_base_user $n]
      set addr [expr {$base + $::DE_OFF_AP_CTRL}]
 
-     # enable FIRST, ap_start second: the scalars latch on the ap_start edge,
-     # so everything the kernel reads must already be in its register.
      axi_write32 [expr {$base + $::DE_OFF_ENABLE}] $v
      set rd [axi_read32 [expr {$base + $::DE_OFF_ENABLE}]]
      puts "dual_echo\[$n\]: enable=$rd"
+     if {$rd != $v} {
+          puts "  *** enable NOT CONFIRMED (read $rd, expected $v)"
+          puts "      Either this bitstream has no s_axi_control on the kernel,"
+          puts "      or DE_OFF_* do not match dual_echo_control_s_axi.v."
+          return 0
+     }
 
      if {$v} {
-          puts "dual_echo\[$n\]: ap_start=1 auto_restart=1 (ap_ctrl=0x81)"
+          # ap_start=1 + auto_restart=1. Not what enables the logic (see above),
+          # but it pulses the counter reset and gives the BD the handshake it
+          # expects.
           axi_write32 $addr 0x81
+          puts "dual_echo\[$n\]: ap_start=1 auto_restart=1 (ap_ctrl=0x81)"
      } else {
-          puts "dual_echo\[$n\]: stop (ap_ctrl=0x00)"
           axi_write32 $addr 0x00
+          puts "dual_echo\[$n\]: ap_start=0 (enable=0 is what actually stops it)"
      }
 
      set ctrl [axi_read32 $addr]
      puts [format "  ap_ctrl=0x%02x (ap_start=%d ap_done=%d)" \
                $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}]]
+     return 1
 }
 
 # Telemetry. This is what tells "the port never opened" apart from "the port
