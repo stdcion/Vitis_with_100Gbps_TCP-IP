@@ -196,41 +196,49 @@ foreach d [glob -nocomplain "$REPO_ROOT/build/ip_repo"] {
 }
 # IP пользовательского ядра.
 #
-# Два варианта, и они ВЗАИМОИСКЛЮЧАЮЩИЕ:
+# Сырое HLS-IP от export_hls_ip.tcl нужно ВСЕГДА. Проект HLS лежит в каталоге
+# исходников ядра (HLS резолвит пути от каталога проекта — см. комментарий в
+# export_hls_ip.tcl).
+set raw_hls [glob -nocomplain "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hls/*/*/impl/ip"]
+foreach d $raw_hls {
+     lappend ip_repos $d
+}
+
+# Ядро с HDL-обёрткой (есть src/hdl/ и package_<krnl>.tcl) даёт ВТОРОЙ IP —
+# саму обёртку, и в BD инстанцируется именно она (см. _find_ipdef ниже, где
+# ${USER_KRNL}_wrapper стоит первым кандидатом).
 #
-#   * ядро с HDL-обёрткой (есть src/hdl/ и package_<krnl>.tcl) — в BD идёт
-#     упакованная обёртка из build_pack/packaged. Внутри неё уже лежит HLS-IP,
-#     поэтому каталог сырого HLS-ядра сюда добавлять НЕЛЬЗЯ: получилось бы два
-#     IP с именем $USER_KRNL, и _find_ipdef ниже честно упал бы на
-#     неоднозначности;
-#   * ядро без обёртки (порт зашит константой, регистров нет) — в BD идёт
-#     сырое HLS-IP от export_hls_ip.tcl.
+# Зачем обёртка: free-running ядро (ap_ctrl_none) не может иметь s_axilite —
+# UG1393 это запрещает, а HLS молча защёлкивает скаляры один раз после сброса,
+# и запись по JTAG до логики не доходит. Регистры поэтому живут в HDL (как в
+# iperf_krnl), а сюда попадает обёртка вокруг HLS-ядра.
 #
-# Зачем обёртка вообще: free-running ядро (ap_ctrl_none) не может иметь
-# s_axilite — UG1393 это запрещает, а HLS молча защёлкивает скаляры один раз
-# после сброса, и запись по JTAG до логики не доходит. Регистры поэтому живут в
-# HDL (как в iperf_krnl), а сюда попадает обёртка вокруг HLS-ядра.
+# ВАЖНО: сырое HLS-IP из ip_repos убирать НЕЛЬЗЯ, хотя соблазн есть — кажется,
+# что обёртка самодостаточна. Она не самодостаточна: внутри неё лежит ССЫЛКА на
+# subcore user:kernel:$USER_KRNL:1.0, а не его копия. Без этого пути BD
+# собирается и даже соединяет все интерфейсы, но генерация IP падает:
+#     CRITICAL WARNING [IP_Flow 19-4065] The definition for subcore dependency
+#                      'user:kernel:hls_dual_echo_krnl:1.0' is not available
+#     ERROR [IP_Flow 19-98] Generation of the IP CORE failed
+# (а ещё раньше, на create_bd_cell, проскакивает IP_Flow 19-3571 "IP ...
+# is restricted" — единственный признак на шаге 3, легко пропустить).
+#
+# Конфликта имён при этом нет: обёртка упакована как ${USER_KRNL}_wrapper
+# именно для того, чтобы оба IP сосуществовали в каталоге.
 set USER_PACKAGED "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/build_pack/packaged"
 if {[file exists "$USER_PACKAGED/component.xml"]} {
-     puts "user-ядро: HDL-обёртка (build_pack/packaged)"
+     puts "user-ядро: HDL-обёртка (build_pack/packaged) + HLS-IP как subcore"
      lappend ip_repos $USER_PACKAGED
-} else {
-     # Проект HLS лежит в каталоге исходников ядра (HLS резолвит пути от
-     # каталога проекта — см. комментарий в export_hls_ip.tcl).
-     set raw_hls [glob -nocomplain "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hls/*/*/impl/ip"]
-     foreach d $raw_hls {
-          lappend ip_repos $d
-     }
+} elseif {[file isdirectory "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hdl"]} {
      # Обёртка нужна, но не собрана — падаем здесь, а не через час на плате,
      # где симптомом будет "ядро не видит enable".
-     if {[file isdirectory "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hdl"]} {
-          puts ""
-          error "у $USER_KRNL есть src/hdl/, но нет build_pack/packaged/component.xml.\
-                 Пропущен шаг 2.5 (упаковка обёртки):\
-                 make -f Makefile.vivado pack USER_KRNL=$USER_KRNL BOARD=$BOARD\
-                 Без него в BD попадёт сырое HLS-ядро без регистров управления,\
-                 и хост не сможет задать порты и enable."
-     }
+     puts ""
+     error "у $USER_KRNL есть src/hdl/, но нет build_pack/packaged/component.xml.\
+            Пропущен шаг 2.5 (упаковка обёртки):\
+            make -f Makefile.vivado pack USER_KRNL=$USER_KRNL BOARD=$BOARD\
+            Без него в BD попадёт сырое HLS-ядро без регистров управления,\
+            и хост не сможет задать порты и enable."
+} else {
      puts "user-ядро: сырое HLS-IP (обёртки нет)"
 }
 
