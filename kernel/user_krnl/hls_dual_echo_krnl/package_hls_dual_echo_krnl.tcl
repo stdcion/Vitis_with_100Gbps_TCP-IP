@@ -92,6 +92,15 @@ update_ip_catalog -rebuild
 create_ip -name $KRNL -vendor user -library kernel -version 1.0 \
      -module_name ${KRNL}_ip
 
+# ОБЯЗАТЕЛЬНО: create_ip создаёт только .xci, а RTL модуля — нет. Без генерации
+# output products обёртка не эластируется:
+#     ERROR: [Synth 8-439] module 'hls_dual_echo_krnl_ip' not found
+# (перед этим Vivado предупреждает "IPs are missing output products").
+set ip_xci [get_files -all ${KRNL}_ip.xci]
+generate_target {synthesis instantiation_template} $ip_xci
+export_ip_user_files -of_objects $ip_xci -no_script -sync -force -quiet
+puts "output products для ${KRNL}_ip сгенерированы"
+
 set_property top hls_dual_echo_krnl_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
