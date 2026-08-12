@@ -104,12 +104,64 @@ puts "output products для ${KRNL}_ip сгенерированы"
 set_property top hls_dual_echo_krnl_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
-# Проверяем, что обёртка действительно эластируется поверх HLS-IP: без этого
-# несовпадение имён портов всплыло бы только на этапе синтеза BD, через час.
+# Проверяем, что имена портов в обёртке совпадают с портами HLS-IP.
+#
+# ЗАЧЕМ НЕ synth_design. Сначала здесь стоял `synth_design -rtl`, и он давал
+# ЛОЖНЫЙ отказ: "module 'hls_dual_echo_krnl_ip' not found" даже после
+# generate_target. В режиме -rtl (elaborate-only) Vivado не разворачивает IP из
+# .xci, поэтому чёрный ящик остаётся ненайденным независимо от того, верна
+# обёртка или нет. Апстримный package_iperf_krnl.tcl синтез вообще не гоняет.
+#
+# Вместо этого сверяем имена портов напрямую: список портов IP берём из
+# component.xml (источник истины — там же, откуда их видит BD), список
+# подключённых портов — из инстанса в обёртке. Это ловит ровно ту ошибку, ради
+# которой затевалась проверка, и делает это за секунды вместо минут.
 puts ""
-puts "=== проверка иерархии обёртки ==="
-synth_design -rtl -name rtl_check -top hls_dual_echo_krnl_wrapper
-puts "=== иерархия сходится ==="
+puts "=== сверка имён портов: обёртка против HLS-IP ==="
+
+set ip_ports {}
+foreach p [ipx::get_ports -of_objects \
+               [ipx::open_core -quiet "$HLS_IP_DIR/component.xml"]] {
+     lappend ip_ports [get_property NAME $p]
+}
+ipx::unload_core -quiet "$HLS_IP_DIR/component.xml"
+
+if {[llength $ip_ports] == 0} {
+     puts "  ПРЕДУПРЕЖДЕНИЕ: не удалось прочитать порты из component.xml,"
+     puts "  сверка пропущена. Несовпадение всплывёт на синтезе BD."
+} else {
+     # Порты, которые обёртка подключает к инстансу HLS-ядра: строки вида
+     #     .s_axis_udp_rx_a_tvalid ( ... ),
+     # внутри блока hls_dual_echo_krnl_ip ... );
+     set fh [open "$HDL_DIR/hls_dual_echo_krnl_wrapper.sv" r]
+     set wrapper_src [read $fh]
+     close $fh
+
+     set in_inst 0
+     set missing {}
+     foreach line [split $wrapper_src "\n"] {
+          if {[regexp {hls_dual_echo_krnl_ip\s+\w+\s*\(} $line]} { set in_inst 1 ; continue }
+          if {$in_inst && [regexp {^\s*\);} $line]}              { set in_inst 0 ; continue }
+          if {!$in_inst} { continue }
+          if {![regexp {^\s*\.(\w+)\s*\(} $line -> port]} { continue }
+          if {[lsearch -exact $ip_ports $port] < 0} {
+               lappend missing $port
+          }
+     }
+
+     if {[llength $missing] > 0} {
+          puts ""
+          puts "  Портов нет у IP ([llength $missing]):"
+          foreach p $missing { puts "    .$p" }
+          puts ""
+          puts "  Реальные порты IP (первые 40 из [llength $ip_ports]):"
+          foreach p [lrange $ip_ports 0 39] { puts "    $p" }
+          puts ""
+          error "имена портов в обёртке не совпадают с HLS-IP — правь\
+                 src/hdl/hls_dual_echo_krnl_wrapper.sv по списку выше"
+     }
+     puts "  все [llength $ip_ports] портов IP сходятся с обёрткой"
+}
 
 ipx::package_project -root_dir $PACKAGE_DIR -vendor user -library kernel \
      -taxonomy /KernelIP -import_files -set_current false
