@@ -132,9 +132,13 @@ static_assert((EPD_MAX_WORDS & (EPD_MAX_WORDS - 1)) == 0,
 // регистры s_axilite. Повторяем эту идиому.
 //
 // Отсюда конструкция ниже:
-//   * каждая стадия держит СВОЙ счётчик тактов и инкрементирует его сама.
-//     Счётчики стартуют вместе (сброс общий) и тикают от одного ap_clk,
-//     поэтому идут синхронно и разности между стадиями осмысленны;
+//   * шкала времени ОДНА на всё ядро: 32-битный счётчик живёт в HDL-обёртке и
+//     приходит в обе половины проводом cycleCount. Раньше каждая стадия держала
+//     свой счётчик, и разности между стадиями были осмысленны лишь пока HLS
+//     давал обеим II=1 — то есть по свойству расписания, а не кода. Разбор,
+//     что именно ломалось (NET_FWD завышался ровно настолько, насколько
+//     занижался NET_REV, при верных RTT/ECHO и сходящемся балансе), — в шапке
+//     cycle_counter в src/hdl/hls_echo_probe_dual_krnl_wrapper.sv;
 //   * таймстемпы передаются измерителю потоками tsFifo*;
 //   * sessionID от connect к traffic — тоже потоком.
 //
@@ -258,6 +262,7 @@ void epd_client_connect(int enable,
 void epd_client_traffic(int enable,
                         int msgBytes,
                         int triggerGo,
+                        ap_uint<32> cycleCount,
                         hls::stream<ap_uint<16> >& sessionFifo,
                         // таймстемпы наружу: пара (t1', t2) на каждый
                         // завершённый круг
@@ -296,12 +301,18 @@ void epd_client_traffic(int enable,
      static ap_uint<32> timeouts = 0;
      static ap_uint<32> tRequest = 0;
 
-     // Свой счётчик тактов: стадии DATAFLOW не могут делить скаляр.
-     // Тикает от того же ap_clk и стартует с того же сброса, что и
-     // счётчик в epd_server_echo, поэтому шкалы синхронны.
-     static ap_uint<32> cyc = 0;
-#pragma HLS RESET variable=cyc
-     cyc++;
+     // Шкала времени приходит ПРОВОДОМ из HDL-обёртки (cycle_counter в
+     // hls_echo_probe_dual_krnl_wrapper.sv) и та же самая, что у epd_server_echo.
+     //
+     // Раньше здесь был свой static cyc с комментарием «шкалы синхронны, потому
+     // что оба счётчика тикают от ap_clk и стартуют с одного сброса». При
+     // Final II = 1 это верно, но это свойство РАСПИСАНИЯ, а не кода: при II=2
+     // счётчики расходятся линейно, и тогда NET_FWD завышается ровно настолько,
+     // насколько NET_REV занижается (t2'−t1' и t2−t1 вычитают точки РАЗНЫХ
+     // половин). RTT и ECHO при этом остаются верными, а баланс сходится всегда,
+     // поэтому ни одна проверка на хосте такую ошибку не поймала бы. Подробный
+     // разбор — в шапке счётчика в обёртке.
+     const ap_uint<32> cyc = cycleCount;
 
      // sessionID приходит один раз от connect-стадии и дальше хранится.
      static ap_uint<16> sessionID = 0;
@@ -573,7 +584,8 @@ void epd_server_listen(int enable,
  * backpressure). Отличие: таймстемпы вместо записи счётчика в payload —
  * измеритель у нас внутри, гонять значение через данные незачем.
  */
-void epd_server_echo(hls::stream<ap_uint<32> >& tsEchoInFifo,   // t2'
+void epd_server_echo(ap_uint<32> cycleCount,
+                     hls::stream<ap_uint<32> >& tsEchoInFifo,   // t2'
                      hls::stream<ap_uint<32> >& tsEchoOutFifo,  // t1
                      ap_uint<32>& echoCount,
                      hls::stream<pkt128>& s_axis_tcp_notification,
@@ -603,10 +615,9 @@ void epd_server_echo(hls::stream<ap_uint<32> >& tsEchoInFifo,   // t2'
      static ap_uint<32> echoes = 0;
      static ap_uint<32> tEchoIn = 0;
 
-     // Свой счётчик тактов — см. пояснение выше про DATAFLOW.
-     static ap_uint<32> cyc = 0;
-#pragma HLS RESET variable=cyc
-     cyc++;
+     // Та же шкала, что у epd_client_traffic — провод из обёртки. См. пояснение
+     // там и в шапке счётчика в hls_echo_probe_dual_krnl_wrapper.sv.
+     const ap_uint<32> cyc = cycleCount;
 
      switch (st)
      {
@@ -881,6 +892,8 @@ void epd_core(
      // параметры
      int enable, int serverIp, int serverPort, int listenPort,
      int msgBytes, int triggerGo,
+     // единая шкала времени для обеих половин (провод из обёртки)
+     ap_uint<32> cycleCount,
      // счётчики
      ap_uint<32>& connAttempts, ap_uint<32>& sentCount,
      ap_uint<32>& recvCount, ap_uint<32>& timeoutCount,
@@ -894,15 +907,34 @@ void epd_core(
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
-     // Та же причина, что и в топ-функции: epd_core — тоже DATAFLOW-регион,
-     // и его входные скаляры иначе защёлкиваются на старте. Подробное
-     // пояснение — у #pragma HLS stable в hls_echo_probe_dual_krnl().
+     // ЗДЕСЬ stable ОСТАЁТСЯ, И ЭТО НЕ ПРОТИВОРЕЧИТ ap_none ВЫШЕ.
+     //
+     // epd_core — ВЛОЖЕННЫЙ dataflow-регион, а не топ-функция. Форма интерфейса
+     // задаётся только на границе ядра, поэтому #pragma HLS INTERFACE здесь
+     // неприменим: у внутренней функции нет RTL-портов, есть аргументы региона.
+     // Единственный способ снять их синхронизацию со стартом региона — stable.
+     //
+     // Разделение обязанностей получается такое:
+     //   * на границе ядра (топ-функция) — ap_none register: «это провод»;
+     //   * на границе вложенного региона — stable: «не синхронизируй меня
+     //     со стартом, значение приходит асинхронно».
+     //
+     // Требование stable при этом соблюдено буквально: UG1399 требует, чтобы
+     // читаемые ячейки не перезаписывались ДРУГИМ ПРОЦЕССОМ ИЛИ ВЫЗЫВАЮЩИМ
+     // КОНТЕКСТОМ во время исполнения региона. Все эти скаляры — внешние входы,
+     // внутри дизайна их не пишет никто, включая cycleCount: его источник —
+     // счётчик в HDL-обёртке, вне ядра. Предупреждение HLS 200-991 ловит именно
+     // запись stable-скаляра, и в наших логах его нет.
+     //
+     // То, что cycleCount меняется каждый такт, ограничением не является — см.
+     // clock() в iperf_client.cpp:479, где точно так же читается timeInCycles.
 #pragma HLS stable variable = enable
 #pragma HLS stable variable = serverIp
 #pragma HLS stable variable = serverPort
 #pragma HLS stable variable = listenPort
 #pragma HLS stable variable = msgBytes
 #pragma HLS stable variable = triggerGo
+#pragma HLS stable variable = cycleCount
 
      // ── каналы между стадиями ──
      // Глубина 2 достаточна: в тракте один пакет, значит в каждом канале
@@ -925,7 +957,7 @@ void epd_core(
                         sessionFifo,
                         m_axis_tcp_open_connection_a, s_axis_tcp_open_status_a);
 
-     epd_client_traffic(enable, msgBytes, triggerGo,
+     epd_client_traffic(enable, msgBytes, triggerGo, cycleCount,
                         sessionFifo,
                         tsRequestFifo, tsReplyFifo,
                         sentCount, recvCount, timeoutCount,
@@ -938,7 +970,9 @@ void epd_core(
      epd_server_listen(enable, listenPort, listenAttempts, portState,
                        m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
-     epd_server_echo(tsEchoInFifo, tsEchoOutFifo, echoCount,
+     // ТОТ ЖЕ cycleCount, что у клиента — в этом весь смысл правки: NET_FWD и
+     // NET_REV вычитают точки разных половин, поэтому шкала обязана быть одна.
+     epd_server_echo(cycleCount, tsEchoInFifo, tsEchoOutFifo, echoCount,
                      s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
                      s_axis_tcp_rx_meta_b, s_axis_tcp_rx_data_b,
                      m_axis_tcp_tx_meta_b, m_axis_tcp_tx_data_b,
@@ -1055,10 +1089,29 @@ void hls_echo_probe_dual_krnl(
                // записью triggerGo (см. пояснение у epd_latch).
                ap_uint<32>& sampleReady,
 
-               // enable ВСЕГДА последний — разрешение начать работу.
-               // Пока 0, ядро не трогает ни один порт стека: до этого
-               // момента параметры в регистрах могут быть не записаны.
-               int enable
+               // enable — разрешение начать работу. Пока 0, ядро не трогает
+               // ни один порт стека: до этого момента параметры в регистрах
+               // могут быть не записаны.
+               //
+               // Раньше здесь стояло «ВСЕГДА последний»: при s_axilite
+               // смещения регистров зависели от порядка аргументов, и сдвиг
+               // enable молча ломал jtag_ctrl.tcl. Теперь адресная карта
+               // задана руками в probe_control_s_axi.v, и порядок аргументов
+               // на смещения не влияет вообще.
+               int enable,
+
+               // Единая шкала времени для обеих половин — провод из счётчика
+               // в HDL-обёртке. НЕ регистр управления: хост его не пишет и не
+               // читает, в адресной карте его нет.
+               //
+               // Почему счётчик снаружи, а не два static внутри стадий:
+               // NET_FWD = t2'−t1' и NET_REV = t2−t1 вычитают точки РАЗНЫХ
+               // половин, поэтому шкала обязана быть физически одна. Раздельные
+               // счётчики совпадают лишь пока HLS даёт обеим стадиям II=1 —
+               // это свойство расписания, а не кода. Подробный разбор с
+               // разложением, что именно ломается, — в шапке cycle_counter в
+               // hls_echo_probe_dual_krnl_wrapper.sv.
+               ap_uint<32> cycleCount
                       ) {
 
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
@@ -1095,27 +1148,40 @@ void hls_echo_probe_dual_krnl(
 #pragma HLS INTERFACE axis port = m_axis_tcp_tx_data_b
 #pragma HLS INTERFACE axis port = s_axis_tcp_tx_status_b
 
-#pragma HLS INTERFACE s_axilite port = serverIp     bundle = control
-#pragma HLS INTERFACE s_axilite port = serverPort   bundle = control
-#pragma HLS INTERFACE s_axilite port = listenPort   bundle = control
-#pragma HLS INTERFACE s_axilite port = msgBytes     bundle = control
-#pragma HLS INTERFACE s_axilite port = triggerGo    bundle = control
-
-#pragma HLS INTERFACE s_axilite port = connAttempts bundle = control
-#pragma HLS INTERFACE s_axilite port = sentCount    bundle = control
-#pragma HLS INTERFACE s_axilite port = recvCount    bundle = control
-#pragma HLS INTERFACE s_axilite port = timeoutCount bundle = control
-#pragma HLS INTERFACE s_axilite port = echoCount    bundle = control
-#pragma HLS INTERFACE s_axilite port = listenAttempts bundle = control
-#pragma HLS INTERFACE s_axilite port = portState      bundle = control
-
-#pragma HLS INTERFACE s_axilite port = tsRequest  bundle = control
-#pragma HLS INTERFACE s_axilite port = tsEchoIn   bundle = control
-#pragma HLS INTERFACE s_axilite port = tsEchoOut  bundle = control
-#pragma HLS INTERFACE s_axilite port = tsReply    bundle = control
-#pragma HLS INTERFACE s_axilite port = sampleReady bundle = control
-
-#pragma HLS INTERFACE s_axilite port = enable bundle = control
+// ─────────────────────────────────────────────────────────────────────────────
+// НИ ОДНОГО s_axilite — это обязательное условие ap_ctrl_none.
+//
+// Здесь было 18 штук #pragma HLS INTERFACE s_axilite. Они убраны, потому что
+// UG1393 (Free-Running Kernels) запрещает их при ap_ctrl_none: "The kernel
+// interface should not have any #pragma HLS interface s_axilite". HLS при этом
+// не выдаёт ошибку, а молча защёлкивает входные скаляры ОДИН РАЗ в state2
+// автомата верхнего модуля — сразу после снятия сброса, когда хост по JTAG ещё
+// ничего не записал:
+//
+//     always @ (posedge ap_clk)
+//         if ((1'b1 == ap_CS_fsm_state2))
+//             enable_read_reg_862 <= enable;      // защёлка, а не провод
+//
+// Симптом: регистр читается обратно верно, а логика видит 0. Этот баг стоил
+// нескольких сессий на плате в hls_dual_echo_krnl и был там исправлен ровно
+// так же — переносом регистров в HDL.
+//
+// ДЛЯ ЭТОГО ЯДРА ЭТО КРИТИЧНЕЕ, ЧЕМ ДЛЯ dual_echo. Там все скаляры пишутся
+// один раз до enable, и защёлка ломала только запуск. Здесь есть triggerGo,
+// который по замыслу меняется МНОГОКРАТНО — по разу на каждый замер. С
+// защёлкой второй замер не запустился бы НИКОГДА, а sampleReady не поднялся
+// бы ни разу. Прежняя оговорка ниже («формальная гарантия stable для
+// triggerGo нарушена... резервный план — убрать DATAFLOW») теперь неактуальна:
+// обёртка решает эту задачу, не трогая DATAFLOW и не теряя II=1.
+//
+// Скаляры остаются обычными аргументами и становятся портами RTL — проводами,
+// видимыми каждый такт. Регистры и адресную карту держит
+// src/hdl/probe_control_s_axi.v, подключает src/hdl/*_wrapper.sv.
+//
+// Блочный протокол ap_ctrl_hs, который ждёт от ядра XRT/BD, реализует обёртка —
+// ровно как iperf_krnl.xml заявляет ap_ctrl_hs при ap_ctrl_none у самой
+// HLS-функции.
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma HLS INTERFACE ap_ctrl_none port = return
 
 // DATAFLOW, а не PIPELINE — как в hls_pingpong_krnl: половины и
@@ -1123,41 +1189,51 @@ void hls_echo_probe_dual_krnl(
 #pragma HLS DATAFLOW disable_start_propagation
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STABLE НА ВХОДНЫХ СКАЛЯРАХ — БЕЗ ЭТОГО ЯДРО НЕ РАБОТАЕТ.
+// СКАЛЯРЫ — ЯВНО ПРОВОДА: ap_none register.
 //
-// Найдено на плате при отладке hls_dual_echo_krnl (там та же конструкция).
-// Входные скаляры DATAFLOW-региона по умолчанию синхронизируются со стартом
-// региона — UG1399, Stable Arrays: "without the stable pragma ... proc2 would
-// be part of the initial synchronization (via ap_start)". В RTL это защёлка:
+// Это прямое утверждение «порт есть провод, читай каждый такт». Ровно так
+// объявлены скаляры в iperf_krnl — ядре, которое на этом железе работает
+// (iperf_client.cpp:572-582):
 //
-//     always @ (posedge ap_clk)
-//         if ((1'b1 == ap_CS_fsm_state2))
-//             enable_read_reg_862 <= enable;
+//     #pragma HLS INTERFACE ap_none register port=runExperiment
+//     #pragma HLS INTERFACE ap_none register port=timeInCycles
 //
-// При ap_ctrl_none автомат проходит state2 ОДИН раз — сразу после снятия
-// сброса, когда хост ещё ничего не записал. Дальше регион работает бесконечно
-// и в state2 не возвращается, поэтому запись по JTAG до логики не доходит
-// НИКОГДА. Симптом: регистр читается верно, а ядро видит ноль.
+// ЗДЕСЬ РАНЬШЕ СТОЯЛ #pragma HLS stable, И ЭТО БЫЛО НЕВЕРНО. stable появился
+// как попытка вылечить защёлку скаляров, НЕ убирая s_axilite. Он не помогал:
+// csynth на hls_dual_echo_krnl показал, что pragma принимается молча, а
+// защёлка на входе dataflow-региона остаётся. Защёлку убирает отсутствие
+// s_axilite, то есть перенос регистров в HDL-обёртку (см. блок выше). После
+// этого stable стал лечением уже вылеченной болезни — и тянул за собой
+// оговорку про то, что для меняющихся скаляров его гарантия якобы нарушена.
 //
-// stable убирает синхронизацию, значение читается прямо из s_axilite.
-// Требование UG1399 — гарантировать, что переменная не меняется во время
-// работы региона; для параметров это так (хост пишет их один раз до enable).
+// Оговорка была основана на неверном чтении UG1399. Требование stable — не
+// «значение не меняется», а «читаемые ячейки не перезаписываются ДРУГИМ
+// ПРОЦЕССОМ ИЛИ ВЫЗЫВАЮЩИМ КОНТЕКСТОМ пока регион исполняется». Это про то,
+// кто пишет внутри дизайна, а не про то, меняется ли внешний провод. Отдельное
+// предупреждение HLS 200-991 ("The stable scalar argument is written in a
+// dataflow region") ловит именно ЗАПИСЬ stable-скаляра; мы их только читаем.
 //
-// ОГОВОРКА ПРО triggerGo. Он МЕНЯЕТСЯ во время работы — в этом весь смысл
-// триггера, так что формальная гарантия stable для него нарушена. Но без
-// stable он не дойдёт до логики вовсе, и альтернативы нет. Практически это
-// безопасно: значение только читается, сравнивается с прошлым и ни от чего не
-// зависит. Если на плате триггер окажется нерабочим — резервный план в том,
-// чтобы убрать DATAFLOW с верхнего уровня (тогда скаляры станут проводами).
+// Но правильный ответ проще: для «провода, читаемого каждый такт» есть штатный
+// ap_none register, и никакой оговорки он не требует. У апстрима есть точный
+// аналог нашей задачи — функция clock() (iperf_client.cpp:479): та же
+// PIPELINE II=1 + INLINE off стадия внутри того же
+// DATAFLOW disable_start_propagation, читающая скаляр timeInCycles каждый такт.
+// А runExperiment — прямой аналог triggerGo: меняется во время работы, и на нём
+// тоже ap_none register.
 //
-// НЕ УБИРАТЬ. Без этих строк сборка проходит без единой ошибки, а ядро молча
-// не запускается.
-#pragma HLS stable variable = enable
-#pragma HLS stable variable = serverIp
-#pragma HLS stable variable = serverPort
-#pragma HLS stable variable = listenPort
-#pragma HLS stable variable = msgBytes
-#pragma HLS stable variable = triggerGo
+// Так что меняющийся каждый такт cycleCount — не трейдофф и не костыль, а
+// документированная штатная конструкция.
+//
+// register: значение защёлкивается на входе порта, что даёт чистую границу для
+// таймингового анализа и снимает длинный комбинационный путь от регистра в
+// обёртке до логики стадии.
+#pragma HLS INTERFACE ap_none register port = enable
+#pragma HLS INTERFACE ap_none register port = serverIp
+#pragma HLS INTERFACE ap_none register port = serverPort
+#pragma HLS INTERFACE ap_none register port = listenPort
+#pragma HLS INTERFACE ap_none register port = msgBytes
+#pragma HLS INTERFACE ap_none register port = triggerGo
+#pragma HLS INTERFACE ap_none register port = cycleCount
 // ─────────────────────────────────────────────────────────────────────────────
 
      epd_core(s_axis_udp_rx_a, m_axis_udp_tx_a,
@@ -1181,7 +1257,7 @@ void hls_echo_probe_dual_krnl(
               s_axis_tcp_tx_status_b,
 
               enable, serverIp, serverPort, listenPort,
-              msgBytes, triggerGo,
+              msgBytes, triggerGo, cycleCount,
 
               connAttempts, sentCount, recvCount, timeoutCount, echoCount,
               listenAttempts, portState,

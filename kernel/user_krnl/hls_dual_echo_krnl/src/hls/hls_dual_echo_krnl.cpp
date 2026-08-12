@@ -88,8 +88,16 @@ Kernels) запрещает s_axilite при ap_ctrl_none, и это ровно 
 ЧТО НЕ ПОМОГЛО (проверено csynth, не гадания):
   * #pragma HLS stable на скалярах — pragma принимается молча, защёлка
     остаётся: stable снимает синхронизацию МЕЖДУ процессами dataflow, а
-    не защёлкивание аргумента на входе региона;
+    не защёлкивание аргумента на входе региона. Лечит s_axilite-защёлку
+    только отсутствие s_axilite;
   * убрать DATAFLOW из dual_echo_core — автомат создаёт сама топ-функция.
+
+ЧЕМ ОБЪЯВЛЕНЫ СКАЛЯРЫ. На границе ядра — #pragma HLS INTERFACE ap_none
+register, то есть явное «это провод, читай каждый такт»; форма взята у
+iperf_krnl (iperf_client.cpp:572-582). Внутри, на границах вложенных
+dataflow-регионов (половины), — stable, потому что INTERFACE применим только
+к портам ядра. Эти два механизма не конкурируют: первый задаёт форму порта,
+второй снимает синхронизацию со стартом региона.
 
 ПОЧЕМУ НЕ ap_ctrl_hs. Он даёт ap_start, и скаляры защёлкиваются по его
 фронту — соблазнительно, но неверно: стадии ниже это тела функций БЕЗ
@@ -338,10 +346,16 @@ void dual_echo_half_a(int enable,
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
-     // Половина — DATAFLOW-регион, её входные скаляры формально тоже входы
-     // региона. stable снимает синхронизацию между стадиями по этим входам:
-     // значения приходят проводами из обёртки и меняются асинхронно, ждать
-     // их на каждом витке не нужно.
+     // Половина — ВЛОЖЕННЫЙ DATAFLOW-регион, её входные скаляры формально тоже
+     // входы региона. Здесь нужен именно stable, а не INTERFACE: форма
+     // интерфейса задаётся только на границе ядра (там стоит ap_none register),
+     // у внутренней функции RTL-портов нет.
+     //
+     // Требование stable соблюдено буквально: UG1399 требует, чтобы читаемые
+     // ячейки не перезаписывались другим процессом или вызывающим контекстом во
+     // время исполнения региона. Это внешние входы, внутри дизайна их не пишет
+     // никто. Предупреждение HLS 200-991 ловит ЗАПИСЬ stable-скаляра — в наших
+     // логах его нет.
      #pragma HLS stable variable = enable
      #pragma HLS stable variable = listenPort
 
@@ -379,7 +393,8 @@ void dual_echo_half_b(int enable,
 #pragma HLS INLINE off
 #pragma HLS DATAFLOW disable_start_propagation
 
-     // См. пояснение в dual_echo_half_a и в dual_echo_core.
+     // См. пояснение в dual_echo_half_a: вложенный регион, поэтому stable, а
+     // не INTERFACE.
      #pragma HLS stable variable = enable
      #pragma HLS stable variable = listenPort
 
@@ -597,6 +612,22 @@ void hls_dual_echo_krnl(
 // самой HLS-функции.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma HLS INTERFACE ap_ctrl_none port = return
+
+// ВХОДНЫЕ СКАЛЯРЫ — ЯВНО ПРОВОДА.
+//
+// Без этих строк режим определялся неявным умолчанием. csynth подтверждал, что
+// умолчание верное ("Setting interface mode on port 'enable' to 'ap_none'"), и
+// битстрим на этом собрался. Но полагаться на умолчание в ядре, где неверная
+// форма скаляра уже стоила нескольких сессий на плате, — плохая идея: оно
+// молчаливое и может измениться с версией инструмента.
+//
+// Форма взята у iperf_krnl (iperf_client.cpp:572-582) — ядра, работающего на
+// этом железе. register даёт защёлку на входе порта: чистая граница для
+// таймингового анализа и никакого длинного комбинационного пути от регистра в
+// обёртке до логики стадии.
+#pragma HLS INTERFACE ap_none register port = enable
+#pragma HLS INTERFACE ap_none register port = listenPortA
+#pragma HLS INTERFACE ap_none register port = listenPortB
 
      dual_echo_core(s_axis_udp_rx_a, m_axis_udp_tx_a,
                     s_axis_udp_rx_meta_a, m_axis_udp_tx_meta_a,

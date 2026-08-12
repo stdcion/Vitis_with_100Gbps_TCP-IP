@@ -79,11 +79,12 @@ extern "C" void hls_echo_probe_dual_krnl(
     hls::stream<pkt16>&,  hls::stream<pkt512>&,
     hls::stream<pkt32>&,  hls::stream<pkt512>&, hls::stream<pkt64>&,
 
-    int, int, int, int, int,
+    int, int, int, int, int,                          // serverIp..triggerGo
     ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,
     ap_uint<32>&, ap_uint<32>&,                       // listenAttempts, portState
     ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,
-    int);
+    int,                                              // enable
+    ap_uint<32>);                                     // cycleCount (по значению)
 
 // ── потоки ───────────────────────────────────────────────────────────────────
 // half a (клиент, порт 0)
@@ -114,6 +115,19 @@ static ap_uint<32> r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes;
 static ap_uint<32> r_listenAttempts, r_portState;
 static ap_uint<32> r_tsRequest, r_tsEchoIn, r_tsEchoOut, r_tsReply, r_sampleReady;
 
+// Шкала времени, которую в железе держит HDL-обёртка (cycle_counter в
+// hls_echo_probe_dual_krnl_wrapper.sv). Здесь она моделируется одной
+// переменной и подаётся в ядро аргументом — ровно как проводом на плате.
+//
+// ЗАЧЕМ ЭТО ВАЖНО ДЛЯ ТЕСТА. Раньше счётчики жили внутри ядра, по одному на
+// половину, и csim принципиально не мог поймать их расхождение: один
+// call_kernel() исполняет обе стадии подряд, поэтому оба счётчика
+// инкрементировались строго по разу на tick() и были тождественно равны.
+// В RTL это независимые процессы, и совпадение держалось только на том, что
+// HLS дал обеим стадиям II=1. Теперь счётчик один и снаружи, так что тест и
+// железо считают время одинаково по построению.
+static ap_uint<32> g_cycleCount = 0;
+
 static void call_kernel()
 {
     hls_echo_probe_dual_krnl(
@@ -131,7 +145,7 @@ static void call_kernel()
         r_connAttempts, r_sent, r_recv, r_timeouts, r_echoes,
         r_listenAttempts, r_portState,
         r_tsRequest, r_tsEchoIn, r_tsEchoOut, r_tsReply, r_sampleReady,
-        k_enable);
+        k_enable, g_cycleCount);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +211,7 @@ static Msg  g_asmB;   int g_asmBBytes = 0; bool g_asmBactive = false;
 static void model_reset()
 {
     g_tick = 0;
+    g_cycleCount = 0;   // как ap_rst_n сбрасывает cycle_counter в обёртке
     s0_portOpen = s1_portOpen = false;
     s0_pendingStatus = s1_pendingStatus = -1;
     s0_deliverState = s1_deliverState = 0;
@@ -349,7 +364,12 @@ static void model_tick()
 
 static void tick(int n = 1)
 {
-    for (int i = 0; i < n; i++) { call_kernel(); model_tick(); }
+    // g_cycleCount инкрементируется ПОСЛЕ вызова ядра: в железе это регистр,
+    // и внутри такта ядро видит его значение до фронта. Ровно как cyc++ стоял
+    // в начале стадии и первое событие получало 1 — здесь первое событие
+    // получает то же значение, потому что счётчик стартует с 0 и растёт
+    // одинаково для обеих половин.
+    for (int i = 0; i < n; i++) { call_kernel(); model_tick(); g_cycleCount++; }
 }
 
 // ── проверки ─────────────────────────────────────────────────────────────────

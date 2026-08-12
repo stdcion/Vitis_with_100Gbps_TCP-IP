@@ -1,42 +1,47 @@
 # -----------------------------------------------------------------------------
-# package_hls_dual_echo_krnl.tcl — упаковать HDL-обёртку + HLS-ядро в один IP
+# package_hls_echo_probe_dual_krnl.tcl — упаковать HDL-обёртку + HLS-ядро в один IP
+#
+# Скопирован с package_hls_dual_echo_krnl.tcl — ядра, которое этим путём прошло
+# упаковку, BD и имплементацию (WNS=+0.0167, битстрим собран). Отличия только в
+# имени ядра; двусторонняя сверка портов перенесена как есть и здесь особенно
+# нужна: у probe-ядра 18 скаляров вместо 3.
 #
 # ЗАЧЕМ ЭТОТ ШАГ. Остальные HLS-ядра этого репозитория идут в BD напрямую:
 # export_hls_ip.tcl делает из .cpp готовый IP, и build_bd.tcl его находит.
-# Здесь так нельзя. hls_dual_echo_krnl объявлен ap_ctrl_none и не имеет
+# Здесь так нельзя. hls_echo_probe_dual_krnl объявлен ap_ctrl_none и не имеет
 # s_axilite (иначе HLS молча защёлкивает скаляры один раз после сброса — см.
-# шапку hls_dual_echo_krnl.cpp), поэтому регистры управления держит
+# шапку hls_echo_probe_dual_krnl.cpp), поэтому регистры управления держит
 # HDL-обёртка. В BD должен попасть IP, содержащий И то, И другое.
 #
 # Схема ровно как у iperf_krnl (package_iperf_krnl.tcl): создаём проект,
 # добавляем HDL, инстанцируем HLS-IP из ip_repo, упаковываем всё как RTL-ядро.
 #
 # ПОРЯДОК ЗАПУСКА (шаг 2.5, между HLS и BD):
-#     make -f Makefile.vivado user_ip   USER_KRNL=hls_dual_echo_krnl BOARD=u200
-#     vivado -mode batch -source kernel/user_krnl/hls_dual_echo_krnl/package_hls_dual_echo_krnl.tcl \
+#     make -f Makefile.vivado user_ip   USER_KRNL=hls_echo_probe_dual_krnl BOARD=u200
+#     vivado -mode batch -source kernel/user_krnl/hls_echo_probe_dual_krnl/package_hls_echo_probe_dual_krnl.tcl \
 #            -tclargs u200
-#     make -f Makefile.vivado bd        USER_KRNL=hls_dual_echo_krnl BOARD=u200
+#     make -f Makefile.vivado bd        USER_KRNL=hls_echo_probe_dual_krnl BOARD=u200
 #
-# ИМЯ IP. Упаковываем под именем hls_dual_echo_krnl, чтобы _find_ipdef в
+# ИМЯ IP. Упаковываем под именем hls_echo_probe_dual_krnl, чтобы _find_ipdef в
 # build_bd.tcl нашёл его первым же кандидатом (см. proc _find_ipdef —
 # он принимает имя ядра или родовое "user_krnl").
 #
 # ВАЖНО ПРО ДУБЛИКАТЫ. После этого шага в ip_repo_paths оказываются ДВА IP:
-# сырое HLS-ядро (hls_dual_echo_krnl из export_hls_ip.tcl) и эта обёртка. Если
+# сырое HLS-ядро (hls_echo_probe_dual_krnl из export_hls_ip.tcl) и эта обёртка. Если
 # назвать обёртку тем же именем, _find_ipdef честно упадёт с "разрешается
 # неоднозначно" — он для этого и написан. Поэтому HLS-ядро внутри
-# переименовано в hls_dual_echo_krnl_ip (create_ip -module_name), а наружу
-# выставлено имя hls_dual_echo_krnl только у обёртки.
+# переименовано в hls_echo_probe_dual_krnl_ip (create_ip -module_name), а наружу
+# выставлено имя hls_echo_probe_dual_krnl только у обёртки.
 # -----------------------------------------------------------------------------
 
 if {$::argc < 1} {
      puts "ОШИБКА: не задана плата."
-     puts "  vivado -mode batch -source package_hls_dual_echo_krnl.tcl -tclargs u200"
+     puts "  vivado -mode batch -source package_hls_echo_probe_dual_krnl.tcl -tclargs u200"
      exit 1
 }
 
 set BOARD [lindex $::argv 0]
-set KRNL  "hls_dual_echo_krnl"
+set KRNL  "hls_echo_probe_dual_krnl"
 
 set REPO_ROOT [file normalize [file dirname [info script]]/../../..]
 
@@ -85,7 +90,7 @@ add_files -norecurse [glob "$HDL_DIR/*.v" "$HDL_DIR/*.sv"]
 set_property ip_repo_paths [list $HLS_IP_DIR] [current_project]
 update_ip_catalog -rebuild
 
-# Инстанцируем HLS-ядро под именем hls_dual_echo_krnl_ip — так его называет
+# Инстанцируем HLS-ядро под именем hls_echo_probe_dual_krnl_ip — так его называет
 # wrapper, и так оно не конфликтует по имени с самой обёрткой.
 #
 # VLNV задан export_hls_ip.tcl: -vendor user -library kernel -version 1.0.
@@ -94,20 +99,20 @@ create_ip -name $KRNL -vendor user -library kernel -version 1.0 \
 
 # ОБЯЗАТЕЛЬНО: create_ip создаёт только .xci, а RTL модуля — нет. Без генерации
 # output products обёртка не эластируется:
-#     ERROR: [Synth 8-439] module 'hls_dual_echo_krnl_ip' not found
+#     ERROR: [Synth 8-439] module 'hls_echo_probe_dual_krnl_ip' not found
 # (перед этим Vivado предупреждает "IPs are missing output products").
 set ip_xci [get_files -all ${KRNL}_ip.xci]
 generate_target {synthesis instantiation_template} $ip_xci
 export_ip_user_files -of_objects $ip_xci -no_script -sync -force -quiet
 puts "output products для ${KRNL}_ip сгенерированы"
 
-set_property top hls_dual_echo_krnl_wrapper [current_fileset]
+set_property top hls_echo_probe_dual_krnl_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
 # Проверяем, что имена портов в обёртке совпадают с портами HLS-IP.
 #
 # ЗАЧЕМ НЕ synth_design. Сначала здесь стоял `synth_design -rtl`, и он давал
-# ЛОЖНЫЙ отказ: "module 'hls_dual_echo_krnl_ip' not found" даже после
+# ЛОЖНЫЙ отказ: "module 'hls_echo_probe_dual_krnl_ip' not found" даже после
 # generate_target. В режиме -rtl (elaborate-only) Vivado не разворачивает IP из
 # .xci, поэтому чёрный ящик остаётся ненайденным независимо от того, верна
 # обёртка или нет. Апстримный package_iperf_krnl.tcl синтез вообще не гоняет.
@@ -146,8 +151,8 @@ if {[llength $ip_ports] == 0} {
 } else {
      # Порты, которые обёртка подключает к инстансу HLS-ядра: строки вида
      #     .s_axis_udp_rx_a_tvalid ( ... ),
-     # внутри блока hls_dual_echo_krnl_ip ... );
-     set fh [open "$HDL_DIR/hls_dual_echo_krnl_wrapper.sv" r]
+     # внутри блока hls_echo_probe_dual_krnl_ip ... );
+     set fh [open "$HDL_DIR/hls_echo_probe_dual_krnl_wrapper.sv" r]
      set wrapper_src [read $fh]
      close $fh
 
@@ -155,7 +160,7 @@ if {[llength $ip_ports] == 0} {
      set wired {}
      set missing {}
      foreach line [split $wrapper_src "\n"] {
-          if {[regexp {hls_dual_echo_krnl_ip\s+\w+\s*\(} $line]} { set in_inst 1 ; continue }
+          if {[regexp {hls_echo_probe_dual_krnl_ip\s+\w+\s*\(} $line]} { set in_inst 1 ; continue }
           if {$in_inst && [regexp {^\s*\);} $line]}              { set in_inst 0 ; continue }
           if {!$in_inst} { continue }
           if {![regexp {^\s*\.(\w+)\s*\(} $line -> port]} { continue }
@@ -177,7 +182,7 @@ if {[llength $ip_ports] == 0} {
           foreach p [lrange $ip_ports 0 39] { puts "    $p" }
           puts ""
           error "имена портов в обёртке не совпадают с HLS-IP — правь\
-                 src/hdl/hls_dual_echo_krnl_wrapper.sv по списку выше"
+                 src/hdl/hls_echo_probe_dual_krnl_wrapper.sv по списку выше"
      }
 
      # ── направление 2: у IP есть порт, который обёртка не подключает ────────
@@ -225,7 +230,7 @@ if {[llength $ip_ports] == 0} {
           puts "  почему его можно не подключать."
           puts ""
           error "обёртка не подключает [llength $unconnected] портов HLS-IP —\
-                 правь src/hdl/hls_dual_echo_krnl_wrapper.sv или ALLOW_UNCONNECTED\
+                 правь src/hdl/hls_echo_probe_dual_krnl_wrapper.sv или ALLOW_UNCONNECTED\
                  в этом скрипте"
      }
 
@@ -245,7 +250,7 @@ ipx::edit_ip_in_project -upgrade true -name tmp_edit_project \
 #
 # Сначала здесь стояло просто $KRNL, и упаковка падала:
 #     ERROR: [IP_Flow 19-907] Component circularly references subcore
-#                             "user:kernel:hls_dual_echo_krnl:1.0"
+#                             "user:kernel:hls_echo_probe_dual_krnl:1.0"
 # HLS-IP внутри обёртки имеет ровно этот VLNV (его задал export_hls_ip.tcl:
 # -vendor user -library kernel), поэтому присвоить то же имя обёртке — значит
 # объявить, что она ссылается на саму себя. Переименования внутреннего МОДУЛЯ
@@ -259,7 +264,7 @@ set WRAP_NAME "${KRNL}_wrapper"
 
 set_property name        $WRAP_NAME [ipx::current_core]
 set_property display_name $WRAP_NAME [ipx::current_core]
-set_property description "dual-QSFP echo kernel (HLS core + HDL control wrapper)" \
+set_property description "dual-QSFP latency probe kernel (HLS core + HDL control wrapper)" \
      [ipx::current_core]
 set_property core_revision 1 [ipx::current_core]
 
@@ -312,9 +317,12 @@ puts ""
 puts "Дальше:"
 puts "  make -f Makefile.vivado bd USER_KRNL=$KRNL BOARD=$BOARD"
 puts ""
-puts "АДРЕСНАЯ КАРТА (уже сверена с DE_OFF_* в scripts/vivado/jtag_ctrl.tcl,"
-puts "источник истины — dual_echo_control_s_axi.v):"
-puts "  0x00 ap_ctrl      0x10 enable       0x18 listenPortA  0x20 listenPortB"
-puts "  0x30 listenAtt_a  0x34 portState_a  0x38 notify_a"
-puts "  0x40 listenAtt_b  0x44 portState_b  0x48 notify_b"
+puts "АДРЕСНАЯ КАРТА (источник истины — localparam в probe_control_s_axi.v;"
+puts "сверить с PROBE_OFF_* в scripts/vivado/jtag_ctrl.tcl):"
+puts "  параметры: 0x10 enable  0x18 serverIp  0x20 serverPort"
+puts "             0x28 listenPort  0x30 msgBytes  0x38 triggerGo"
+puts "  счётчики:  0x40 connAtt  0x44 sent  0x48 recv  0x4c timeout"
+puts "             0x50 echo  0x54 listenAtt  0x58 portState"
+puts "  таймстемпы:0x60 tsRequest  0x64 tsEchoIn  0x68 tsEchoOut  0x6c tsReply"
+puts "             0x70 sampleReady"
 puts "=========================================================="

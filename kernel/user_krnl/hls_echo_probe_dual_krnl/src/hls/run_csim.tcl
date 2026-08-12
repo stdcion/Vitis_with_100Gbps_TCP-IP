@@ -18,11 +18,20 @@
 # csim и csynth собирают ОДИН И ТОТ ЖЕ код — никаких -D, меняющих
 # поведение ядра, чтобы в железо шло ровно то, что протестировано.
 #
-# ПРО ПЕРИОД ТАКТА. 5.882 нс = 170 МГц — ровно та частота, на которой
-# идёт сборка (DEV_FREQ_MHZ в devices/u200/device.tcl). В отличие от
+# ПРО ПЕРИОД ТАКТА. 6.061 нс = 165 МГц — ровно та частота, на которой идёт
+# сборка (DEV_FREQ_MHZ в devices/u200/device.tcl.in). В отличие от
 # hls_pingpong_krnl, где стоит 4 нс «с запасом», здесь берём фактическую:
-# у dual-дизайна WNS всего +0.011 нс, и знать реальный запас важнее, чем
+# у dual-дизайна запас по WNS крошечный, и знать реальный запас важнее, чем
 # иметь абстрактную страховку.
+#
+# БЫЛО 5.882 (170 МГц) — устарело. Частоту снизили до 165 МГц 11.08.2026, когда
+# тайминг перестал закрываться, но здесь это не поправили, и csynth оценивал
+# запас по НЕВЕРНОМУ периоду — жёстче реального, то есть пугал зря. Если менять
+# частоту снова, править надо ЧЕТЫРЕ места:
+#     devices/u200/device.tcl.in   DEV_FREQ_MHZ   — источник истины для сборки
+#     scripts/vivado/jtag_ctrl.tcl EPD_CLK_NS     — перевод тактов в нс на хосте
+#     docs/latency_experiment_windows.md          — число в «Схеме эксперимента»
+#     этот файл                    create_clock   — оценка запаса в csynth
 
 set CFLAGS "-std=c++14 -I../../../../common/include"
 
@@ -34,7 +43,7 @@ add_files -tb tb/test_hls_echo_probe_dual_krnl.cpp -cflags $CFLAGS
 
 open_solution -reset "solution1" -flow_target vitis
 set_part {xcu200-fsgd2104-2-e}
-create_clock -period 5.882 -name default
+create_clock -period 6.061 -name default
 
 puts "=========== C SIMULATION ==========="
 csim_design
@@ -49,7 +58,9 @@ csynth_design
 # run_csim.tcl для hls_pingpong_krnl:
 #
 #   1) скалярные порты s_axilite несовместимы с cosim при ap_ctrl_none
-#      ([COSIM 212-345]); у нас таких портов десяток;
+#      ([COSIM 212-345]). У нас таких портов БОЛЬШЕ НЕТ — все 18 s_axilite
+#      убраны, регистры держит HDL-обёртка — так что эта причина снята.
+#      Остаётся вторая, и её достаточно;
 #   2) даже с обёрткой без скаляров cosim у hls_gateway_krnl ЗАВИС на
 #      212-й транзакции из 1501 — тестбенч вызывает top в цикле по
 #      такту, а cosim трактует каждый вызов как отдельную транзакцию со
@@ -70,22 +81,38 @@ if {$do_cosim} {
     puts "=========== CO-SIMULATION SKIPPED (-tclargs cosim to enable) ==========="
 }
 
-# Смещения регистров s_axi_control нужны для jtag_ctrl.tcl. HLS кладёт их
-# в заголовок драйвера — печатаем путь, чтобы не искать вручную.
-set hdr [glob -nocomplain epd_csim_proj/solution1/impl/ip/drivers/*/src/*_hw.h]
+# ЧТО ПРОВЕРИТЬ ПОСЛЕ ЭТОГО ПРОГОНА.
+#
+# Раньше здесь печатались смещения регистров из сгенерированного драйверного
+# заголовка *_hw.h. Этого файла БОЛЬШЕ НЕ БУДЕТ: s_axilite убраны, регистры
+# держит HDL-обёртка, а адресная карта задана руками в
+# src/hdl/probe_control_s_axi.v и уже сверена с EPD_OFF_* в jtag_ctrl.tcl.
+# Блок заменён на проверки, которые теперь действительно нужны.
 puts ""
-puts "=========== СМЕЩЕНИЯ РЕГИСТРОВ ==========="
-if {[llength $hdr] > 0} {
-    puts "Файл: [lindex $hdr 0]"
-    puts "Сверить с EPD_OFF_* в scripts/vivado/jtag_ctrl.tcl:"
-    set fh [open [lindex $hdr 0] r]
-    foreach line [split [read $fh] "\n"] {
-        if {[string match "*_ADDR_*" $line]} { puts "  $line" }
-    }
-    close $fh
-} else {
-    puts "Заголовок драйвера не найден — он появляется после export_design."
-    puts "Смещения можно взять из scripts/vivado/export_hls_ip.tcl."
-}
+puts "=========== ЧТО ПРОВЕРИТЬ В ВЫВОДЕ ВЫШЕ ==========="
+puts ""
+puts "1. ФОРМА СКАЛЯРОВ. Ждём у enable/serverIp/serverPort/listenPort/"
+puts "   msgBytes/triggerGo/cycleCount:"
+puts "       Setting interface mode on port '.../<имя>' to 'ap_none'"
+puts "   и у функции:"
+puts "       Setting interface mode on function '...' to 'ap_ctrl_none'"
+puts "   Любое упоминание s_axilite у скаляра = защёлка после сброса,"
+puts "   ядро не увидит записи по JTAG (UG1393, Free-Running Kernels)."
+puts ""
+puts "2. II СТАДИЙ. Ждём 'Final II = 1' у epd_client_traffic и"
+puts "   epd_server_echo. II=2 измерение больше НЕ ломает (шкала времени"
+puts "   одна, приходит проводом из обёртки), но пропускная способность"
+puts "   просядет — стоит знать."
+puts ""
+puts "3. sampleReady И ТЕНЕВОЙ РЕГИСТР. Единственное значение, которое"
+puts "   пишется в ДВУХ ветках epd_latch, поэтому проверять надо отдельно:"
+puts "       grep -n \"_preg\" epd_csim_proj/solution1/impl/ip/hdl/verilog/*epd_latch*.v"
+puts "   Ждём sampleReady_preg. Если его НЕТ — значение транзиентное, и"
+puts "   обёртке нужен латч, иначе epd_measure будет печатать"
+puts "   'sample failed' на исправном ядре."
+puts ""
+puts "4. ЗАПАС ПО ТАЙМИНГУ. Estimated Fmax против 165 МГц (6.061 нс)."
+puts "   Это лишь оценка HLS; настоящий WNS даёт только impl."
+puts ""
 
 exit

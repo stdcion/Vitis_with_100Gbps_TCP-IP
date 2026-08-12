@@ -362,37 +362,45 @@ proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
 #     epd_status                  ; # check that the connection opened
 #     epd_collect 20              ; # 20 samples with statistics
 #
-# OFFSETS are taken from the generated HLS driver header:
-#     .../hls_echo_probe_dual_krnl_ip_proj/sol1/impl/misc/drivers/
-#         hls_echo_probe_dual_krnl_v1_0/src/xhls_echo_probe_dual_krnl_hw.h
-# export_hls_ip.tcl prints them at the end of its run.
+# OFFSETS come from the HDL control wrapper, which is now the source of truth:
+#     kernel/user_krnl/hls_echo_probe_dual_krnl/src/hdl/probe_control_s_axi.v
+# The address map is spelled out in localparam there; these values are copied
+# from it line by line.
 #
-# IMPORTANT ABOUT THE STRIDE. Input parameters are 8 bytes apart, outputs are
-# 16: HLS inserts an ap_vld register after every output value. So the offsets
-# cannot be computed from the argument order, they must be taken from the
-# header. Re-check them after any change to the kernel signature.
+# THEY CHANGED ON 12.08.2026 -- DO NOT REUSE OLD ONES. The kernel used to carry
+# 18 x #pragma HLS INTERFACE s_axilite, which UG1393 forbids together with
+# ap_ctrl_none: HLS silently latched the input scalars once in state2, right
+# after reset, and writes over JTAG never reached the logic. For this kernel
+# that was fatal rather than merely inconvenient -- triggerGo is meant to change
+# on every sample, so the second measurement would never have started. The
+# registers therefore moved into HDL, exactly as was done for
+# hls_dual_echo_krnl.
 #
-# NOTE: listenAttempts/portState were added after echoCount, which pushed
-# every offset below them up by 0x20 (two 16-byte outputs). The values here
-# assume that layout -- verify against the header after the next export.
-set ::EPD_OFF_SERVER_IP     0x10
-set ::EPD_OFF_SERVER_PORT   0x18
-set ::EPD_OFF_LISTEN_PORT   0x20
-set ::EPD_OFF_MSG_BYTES     0x28
-set ::EPD_OFF_TRIGGER_GO    0x30
-set ::EPD_OFF_CONN_ATTEMPTS 0x38
-set ::EPD_OFF_SENT          0x48
-set ::EPD_OFF_RECV          0x58
-set ::EPD_OFF_TIMEOUTS      0x68
-set ::EPD_OFF_ECHOES        0x78
-set ::EPD_OFF_LISTEN_ATT    0x88
-set ::EPD_OFF_PORT_STATE    0x98
-set ::EPD_OFF_TS_REQUEST    0xa8
-set ::EPD_OFF_TS_ECHO_IN    0xb8
-set ::EPD_OFF_TS_ECHO_OUT   0xc8
-set ::EPD_OFF_TS_REPLY      0xd8
-set ::EPD_OFF_SAMPLE_READY  0xe8
-set ::EPD_OFF_ENABLE        0xf8
+# The old comment here explained that offsets could not be computed from the
+# argument order, because HLS inserts an ap_vld register after every output
+# (8-byte stride for inputs, 16 for outputs), and had to be read out of the
+# generated *_hw.h. That whole problem is gone: the map is written by hand in
+# the wrapper. Inputs keep the 8-byte stride so the layout stays familiar;
+# read-only values are packed 4 bytes apart, since they are plain wires from the
+# kernel with no ap_vld field.
+set ::EPD_OFF_ENABLE        0x10
+set ::EPD_OFF_SERVER_IP     0x18
+set ::EPD_OFF_SERVER_PORT   0x20
+set ::EPD_OFF_LISTEN_PORT   0x28
+set ::EPD_OFF_MSG_BYTES     0x30
+set ::EPD_OFF_TRIGGER_GO    0x38
+set ::EPD_OFF_CONN_ATTEMPTS 0x40
+set ::EPD_OFF_SENT          0x44
+set ::EPD_OFF_RECV          0x48
+set ::EPD_OFF_TIMEOUTS      0x4c
+set ::EPD_OFF_ECHOES        0x50
+set ::EPD_OFF_LISTEN_ATT    0x54
+set ::EPD_OFF_PORT_STATE    0x58
+set ::EPD_OFF_TS_REQUEST    0x60
+set ::EPD_OFF_TS_ECHO_IN    0x64
+set ::EPD_OFF_TS_ECHO_OUT   0x68
+set ::EPD_OFF_TS_REPLY      0x6c
+set ::EPD_OFF_SAMPLE_READY  0x70
 
 # ap_clk period, ns. Must match DEV_FREQ_MHZ in devices/<board>/device.tcl.in.
 # 165 MHz -> 6.061 ns. If the frequency changes, fix it here too, otherwise the
