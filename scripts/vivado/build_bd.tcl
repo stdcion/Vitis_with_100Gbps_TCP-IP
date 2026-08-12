@@ -315,7 +315,16 @@ for {set n 1} {$n <= $NUM_QSFP} {incr n} {
      }
 }
 set VLNV_NET  [_find_ipdef network_krnl]
-set VLNV_USER [_find_ipdef $USER_KRNL user_krnl]
+# Кандидаты по порядку:
+#   ${USER_KRNL}_wrapper — упакованная HDL-обёртка (шаг 2.5). ПЕРВЫМ, потому что
+#        когда обёртка есть, в BD должна идти именно она, а не сырое ядро.
+#        Имя с суффиксом, а не $USER_KRNL: у HLS-IP внутри обёртки тот же VLNV,
+#        и совпадение имён дало бы circular reference при упаковке
+#        (IP_Flow 19-907).
+#   $USER_KRNL           — сырое HLS-IP для ядер без обёртки (hls_echo_krnl).
+#   user_krnl            — родовое имя, под которым упакованы апстримные ядра
+#        (iperf_krnl, scatter_krnl) через package_*.tcl.
+set VLNV_USER [_find_ipdef ${USER_KRNL}_wrapper $USER_KRNL user_krnl]
 
 # Разные каналы обязаны прийти из разных пакетов — иначе два CMAC снова
 # нацелятся на один GT-квад. Проверяем явно: молчаливое совпадение здесь

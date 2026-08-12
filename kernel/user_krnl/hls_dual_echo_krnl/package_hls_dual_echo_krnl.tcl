@@ -169,8 +169,24 @@ ipx::unload_core $PACKAGE_DIR/component.xml
 ipx::edit_ip_in_project -upgrade true -name tmp_edit_project \
      -directory $PACKAGE_DIR $PACKAGE_DIR/component.xml
 
-set_property name        $KRNL [ipx::current_core]
-set_property display_name $KRNL [ipx::current_core]
+# ИМЯ ОБЁРТКИ ДОЛЖНО ОТЛИЧАТЬСЯ ОТ ИМЕНИ HLS-IP.
+#
+# Сначала здесь стояло просто $KRNL, и упаковка падала:
+#     ERROR: [IP_Flow 19-907] Component circularly references subcore
+#                             "user:kernel:hls_dual_echo_krnl:1.0"
+# HLS-IP внутри обёртки имеет ровно этот VLNV (его задал export_hls_ip.tcl:
+# -vendor user -library kernel), поэтому присвоить то же имя обёртке — значит
+# объявить, что она ссылается на саму себя. Переименования внутреннего МОДУЛЯ
+# (create_ip -module_name ..._ip) для этого недостаточно: конфликтует VLNV
+# ядра, а не имя инстанса.
+#
+# Суффикс _wrapper. build_bd.tcl найдёт его без правок: _find_ipdef принимает
+# список альтернатив и вызывается как [_find_ipdef $USER_KRNL user_krnl] —
+# добавляем сюда третьим кандидатом (см. правку в build_bd.tcl).
+set WRAP_NAME "${KRNL}_wrapper"
+
+set_property name        $WRAP_NAME [ipx::current_core]
+set_property display_name $WRAP_NAME [ipx::current_core]
 set_property description "dual-QSFP echo kernel (HLS core + HDL control wrapper)" \
      [ipx::current_core]
 set_property core_revision 1 [ipx::current_core]
@@ -219,6 +235,7 @@ close_project -delete
 puts ""
 puts "=========================================================="
 puts "IP обёртки готов: $PACKAGE_DIR"
+puts "  имя IP: $WRAP_NAME  (build_bd.tcl ищет его первым кандидатом)"
 puts ""
 puts "Дальше:"
 puts "  make -f Makefile.vivado bd USER_KRNL=$KRNL BOARD=$BOARD"
