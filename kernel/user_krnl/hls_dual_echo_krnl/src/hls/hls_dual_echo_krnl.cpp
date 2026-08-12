@@ -331,93 +331,59 @@ void dual_echo_rx_drain(hls::stream<pkt16>& s_axis_tcp_rx_meta,
  * получили бы одинаковые внутренние имена и синтез перепутал бы их
  * FIFO друг с другом).
  */
-void dual_echo_half_a(int enable,
-                      int listenPort,
-                      ap_uint<32>& listenAttempts,
-                      ap_uint<32>& portState,
-                      ap_uint<32>& notifyCount,
-                      hls::stream<pkt16>& m_axis_tcp_listen_port,
-                      hls::stream<pkt8>& s_axis_tcp_port_status,
-                      hls::stream<pkt128>& s_axis_tcp_notification,
-                      hls::stream<pkt32>& m_axis_tcp_read_pkg,
-                      hls::stream<pkt16>& s_axis_tcp_rx_meta,
-                      hls::stream<pkt512>& s_axis_tcp_rx_data)
-{
-#pragma HLS INLINE off
-#pragma HLS DATAFLOW disable_start_propagation
-
-     // Половина — ВЛОЖЕННЫЙ DATAFLOW-регион, её входные скаляры формально тоже
-     // входы региона. Здесь нужен именно stable, а не INTERFACE: форма
-     // интерфейса задаётся только на границе ядра (там стоит ap_none register),
-     // у внутренней функции RTL-портов нет.
-     //
-     // Требование stable соблюдено буквально: UG1399 требует, чтобы читаемые
-     // ячейки не перезаписывались другим процессом или вызывающим контекстом во
-     // время исполнения региона. Это внешние входы, внутри дизайна их не пишет
-     // никто. Предупреждение HLS 200-991 ловит ЗАПИСЬ stable-скаляра — в наших
-     // логах его нет.
-     #pragma HLS stable variable = enable
-     #pragma HLS stable variable = listenPort
-
-     static listenState st_a = {false, false, 0, 0};
-     #pragma HLS RESET variable=st_a
-
-     static hls::stream<ap_uint<16> > rxSessionFifo_a("rxSessionFifo_a");
-     #pragma HLS STREAM variable=rxSessionFifo_a depth=512
-     static hls::stream<ap_uint<16> > rxLengthFifo_a("rxLengthFifo_a");
-     #pragma HLS STREAM variable=rxLengthFifo_a depth=512
-
-     dual_echo_listen(enable, listenPort, st_a, listenAttempts, portState,
-                      m_axis_tcp_listen_port, s_axis_tcp_port_status);
-
-     dual_echo_rx_notify(notifyCount,
-                        s_axis_tcp_notification, m_axis_tcp_read_pkg,
-                        rxSessionFifo_a, rxLengthFifo_a);
-
-     dual_echo_rx_drain(s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
-                       rxSessionFifo_a, rxLengthFifo_a);
-}
-
-void dual_echo_half_b(int enable,
-                      int listenPort,
-                      ap_uint<32>& listenAttempts,
-                      ap_uint<32>& portState,
-                      ap_uint<32>& notifyCount,
-                      hls::stream<pkt16>& m_axis_tcp_listen_port,
-                      hls::stream<pkt8>& s_axis_tcp_port_status,
-                      hls::stream<pkt128>& s_axis_tcp_notification,
-                      hls::stream<pkt32>& m_axis_tcp_read_pkg,
-                      hls::stream<pkt16>& s_axis_tcp_rx_meta,
-                      hls::stream<pkt512>& s_axis_tcp_rx_data)
-{
-#pragma HLS INLINE off
-#pragma HLS DATAFLOW disable_start_propagation
-
-     // См. пояснение в dual_echo_half_a: вложенный регион, поэтому stable, а
-     // не INTERFACE.
-     #pragma HLS stable variable = enable
-     #pragma HLS stable variable = listenPort
-
-     // Свой объект состояния, отдельный от st_a — см. комментарий к
-     // listenState: именно это делает независимость половин свойством кода.
-     static listenState st_b = {false, false, 0, 0};
-     #pragma HLS RESET variable=st_b
-
-     static hls::stream<ap_uint<16> > rxSessionFifo_b("rxSessionFifo_b");
-     #pragma HLS STREAM variable=rxSessionFifo_b depth=512
-     static hls::stream<ap_uint<16> > rxLengthFifo_b("rxLengthFifo_b");
-     #pragma HLS STREAM variable=rxLengthFifo_b depth=512
-
-     dual_echo_listen(enable, listenPort, st_b, listenAttempts, portState,
-                      m_axis_tcp_listen_port, s_axis_tcp_port_status);
-
-     dual_echo_rx_notify(notifyCount,
-                        s_axis_tcp_notification, m_axis_tcp_read_pkg,
-                        rxSessionFifo_b, rxLengthFifo_b);
-
-     dual_echo_rx_drain(s_axis_tcp_rx_meta, s_axis_tcp_rx_data,
-                       rxSessionFifo_b, rxLengthFifo_b);
-}
+/*
+ * ПОЛОВИН КАК ФУНКЦИЙ БОЛЬШЕ НЕТ — И ЭТО ГЛАВНАЯ ПРАВКА ЭТОГО ЯДРА.
+ *
+ * Здесь были dual_echo_half_a и dual_echo_half_b: каждая со своим
+ * #pragma HLS DATAFLOW, внутри — вызовы listen/rx_notify/rx_drain. Итого ТРИ
+ * вложенных DATAFLOW-региона (core + две половины), и скаляр из AXI пересекал
+ * ДВЕ границы: снаружи в core, потом из core в половину.
+ *
+ * НА ВТОРОЙ ГРАНИЦЕ HLS ПРЕВРАЩАЕТ СКАЛЯР В FIFO-КАНАЛ. Проверено на
+ * сгенерированном RTL (dual_echo_core.v), одинаково и для enable, и для
+ * listenPort:
+ *
+ *     .enable(empty_178)                 <- половине a провод
+ *     .enable_dout(p_c_dout)             <- половине b канал
+ *     .enable_empty_n(p_c_empty_n)
+ *     .listenPort(empty_180)             <- то же самое с портом
+ *     .listenPort_dout(p_c1_dout)
+ *
+ * Причём писателем канала оказывалась САМА половина a. А она внутри
+ * dual_echo_listen делала `if (!enable) return;` — то есть выходила ДО записи в
+ * канал. Итог: enable=0 -> a не пишет -> b навсегда стоит на empty_n=0 -> b не
+ * отдаёт ap_ready -> регион встал -> a больше никогда не исполнится, чтобы
+ * увидеть, что enable уже стал единицей. ВЗАИМНАЯ БЛОКИРОВКА.
+ *
+ * Симптом на плате (стоил половины сессии): регистры живые, enable=1 читается
+ * обратно, listenPortA/B подтверждаются — а вся телеметрия нули НАВСЕГДА и
+ * listenAttempts не растёт. Выглядит в точности как старый баг с s_axilite,
+ * поэтому легко решить, что прошита не та версия. Это и есть те самые
+ * предупреждения HLS 200-656 "Deadlocks can occur", которые неделями
+ * принимались за шум.
+ *
+ * ПОЧЕМУ ПОМОГЛО ПЛОСКОЕ РАЗВЁРТЫВАНИЕ. hls_echo_probe_dual_krnl устроен с
+ * ОДНИМ уровнем DATAFLOW: четыре стадии лежат прямо в epd_core. Проверено на
+ * его RTL — там все скаляры доехали ПРОВОДАМИ, включая triggerGo, который
+ * меняется на каждом замере, и три копии enable:
+ *
+ *     .enableConn(enableConn)  .serverIp(serverIp)  .triggerGo(triggerGo)
+ *     grep "_c_dout|_c_empty_n|_c_write|_c_U" -> ПУСТО
+ *
+ * Поэтому здесь сделано так же: шесть стадий (по три на половину) вызываются
+ * прямо из dual_echo_core, промежуточного уровня нет. Скаляр пересекает ОДНУ
+ * границу и остаётся проводом.
+ *
+ * НЕЗАВИСИМОСТЬ ПОЛОВИН ОТ ЭТОГО НЕ ПОСТРАДАЛА. Она держится не на том, что
+ * половины были отдельными функциями, а на раздельном состоянии: st_a/st_b —
+ * разные объекты listenState, rxSessionFifo_a/_b и rxLengthFifo_a/_b — разные
+ * потоки. Это было сделано раньше (см. комментарий к listenState) именно чтобы
+ * независимость стала свойством кода, а не свойством инстанцирования.
+ *
+ * ПРАВИЛО НА БУДУЩЕЕ, в том числе для hls_ouch_krnl: держать DATAFLOW ПЛОСКИМ.
+ * Один регион, все стадии в нём. Вложенные регионы ломают передачу скаляров, и
+ * csynth об этом не сообщает — видно только в syn/verilog.
+ */
 
 void dual_echo_core(
      // половина a (-> network_krnl_1, QSFP0)
@@ -473,18 +439,62 @@ void dual_echo_core(
 
 #pragma HLS DATAFLOW disable_start_propagation
 
+     // stable на входных скалярах региона: снимает их синхронизацию со стартом
+     // региона, значения приходят проводами из обёртки и меняются асинхронно.
+     // Ровно так же помечены скаляры в epd_core у probe-ядра, где всё доезжает
+     // проводами. Это ЕДИНСТВЕННАЯ граница DATAFLOW в ядре — вложенных больше
+     // нет, см. комментарий выше.
+#pragma HLS stable variable = enableA
+#pragma HLS stable variable = enableB
+#pragma HLS stable variable = listenPortA
+#pragma HLS stable variable = listenPortB
 
-     dual_echo_half_a(enableA, listenPortA,
-                      listenAttempts_a, portState_a, notifyCount_a,
-                      m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a,
-                      s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
-                      s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a);
+     // ── состояние и внутренние потоки: раздельные на половину ──
+     //
+     // Именно это, а не разделение на функции, делает половины независимыми:
+     // два разных объекта listenState и две пары FIFO. Раньше они жили внутри
+     // функций-половин, теперь — здесь, в единственном DATAFLOW-регионе.
+     static listenState st_a = {false, false, 0, 0};
+     #pragma HLS RESET variable=st_a
+     static listenState st_b = {false, false, 0, 0};
+     #pragma HLS RESET variable=st_b
 
-     dual_echo_half_b(enableB, listenPortB,
-                      listenAttempts_b, portState_b, notifyCount_b,
-                      m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b,
-                      s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
-                      s_axis_tcp_rx_meta_b, s_axis_tcp_rx_data_b);
+     static hls::stream<ap_uint<16> > rxSessionFifo_a("rxSessionFifo_a");
+     #pragma HLS STREAM variable=rxSessionFifo_a depth=512
+     static hls::stream<ap_uint<16> > rxLengthFifo_a("rxLengthFifo_a");
+     #pragma HLS STREAM variable=rxLengthFifo_a depth=512
+     static hls::stream<ap_uint<16> > rxSessionFifo_b("rxSessionFifo_b");
+     #pragma HLS STREAM variable=rxSessionFifo_b depth=512
+     static hls::stream<ap_uint<16> > rxLengthFifo_b("rxLengthFifo_b");
+     #pragma HLS STREAM variable=rxLengthFifo_b depth=512
+
+     // ── шесть стадий ПЛОСКО, по три на половину ──
+     //
+     // Ни одного вложенного DATAFLOW: скаляры (enableA/B, listenPortA/B)
+     // пересекают одну границу региона и остаются проводами. См. большой
+     // комментарий выше о том, что было при вложенности.
+
+     // половина a -> network_krnl_1 (QSFP0)
+     dual_echo_listen(enableA, listenPortA, st_a, listenAttempts_a, portState_a,
+                      m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a);
+
+     dual_echo_rx_notify(notifyCount_a,
+                         s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
+                         rxSessionFifo_a, rxLengthFifo_a);
+
+     dual_echo_rx_drain(s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a,
+                        rxSessionFifo_a, rxLengthFifo_a);
+
+     // половина b -> network_krnl_2 (QSFP1)
+     dual_echo_listen(enableB, listenPortB, st_b, listenAttempts_b, portState_b,
+                      m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
+
+     dual_echo_rx_notify(notifyCount_b,
+                         s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
+                         rxSessionFifo_b, rxLengthFifo_b);
+
+     dual_echo_rx_drain(s_axis_tcp_rx_meta_b, s_axis_tcp_rx_data_b,
+                        rxSessionFifo_b, rxLengthFifo_b);
 
      // Заглушки на всё, что не используется — по одной на каждую
      // половину, неподключённый порт стека ломает сборку hw.
