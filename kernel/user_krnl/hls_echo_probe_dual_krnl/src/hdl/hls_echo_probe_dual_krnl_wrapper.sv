@@ -744,7 +744,18 @@ hls_echo_probe_dual_krnl_ip hls_echo_probe_dual_krnl_inst (
      .listenPort     ( listenPort_reg ),
      .msgBytes       ( msgBytes_reg   ),
      .triggerGo      ( triggerGo_reg  ),
-     .enable         ( enable_reg     ),
+     // ОДИН регистр enable (0x10) на ТРИ порта ядра. Снаружи по-прежнему один
+     // enable — адресная карта не менялась.
+     //
+     // Раздельные порты нужны потому, что при одном аргументе его читали три
+     // стадии, и HLS раздавал такой скаляр несимметрично: часть читателей
+     // получала провод, часть — FIFO-канал с блокировкой. Заблокированная
+     // стадия останавливала весь DATAFLOW-регион. Именно так сломался
+     // hls_dual_echo_krnl на плате: enable=1 читался обратно, а ядро не
+     // исполнялось вовсе.
+     .enableConn     ( enable_reg     ),
+     .enableTraffic  ( enable_reg     ),
+     .enableListen   ( enable_reg     ),
 
      // ── счётчики событий наружу ──
      //

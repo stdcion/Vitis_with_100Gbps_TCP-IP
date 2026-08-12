@@ -79,7 +79,7 @@ extern "C" void hls_dual_echo_krnl(
      int listenPortA, int listenPortB,
      ap_uint<32>& listenAttempts_a, ap_uint<32>& portState_a, ap_uint<32>& notifyCount_a,
      ap_uint<32>& listenAttempts_b, ap_uint<32>& portState_b, ap_uint<32>& notifyCount_b,
-     int enable);
+     int enableA, int enableB);   // одно значение, два порта — см. .cpp
 
 // Все порты стека в одном месте: тест дёргает только те, что нужны, но
 // передавать нужно все.
@@ -122,7 +122,7 @@ static void tick(stackPorts& p, telemetry& t, int portA, int portB, int enable)
           portA, portB,
           t.att_a, t.state_a, t.notify_a,
           t.att_b, t.state_b, t.notify_b,
-          enable);
+          enable, enable);   // обёртка подаёт один регистр на оба порта
 }
 
 static void portStatus(hls::stream<pkt8>& s, bool success)

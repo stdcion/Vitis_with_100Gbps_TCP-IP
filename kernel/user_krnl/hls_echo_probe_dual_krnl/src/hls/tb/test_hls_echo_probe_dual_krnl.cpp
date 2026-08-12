@@ -83,7 +83,7 @@ extern "C" void hls_echo_probe_dual_krnl(
     ap_uint<32>&, ap_uint<32>&, ap_uint<32>&, ap_uint<32>&,  // connAtt,sent,recv,timeout
     ap_uint<32>&, ap_uint<32>&,                       // echoRxCount, echoCount
     ap_uint<32>&, ap_uint<32>&,                       // listenAttempts, portState
-    int);                                             // enable
+    int, int, int);        // enableConn/Traffic/Listen — одно значение
 
 // ── потоки ───────────────────────────────────────────────────────────────────
 // half a (клиент, порт 0)
@@ -155,7 +155,7 @@ static void call_kernel()
         r_connAttempts, r_sent, r_recv, r_timeouts,
         r_echoRx, r_echoes,
         r_listenAttempts, r_portState,
-        k_enable);
+        k_enable, k_enable, k_enable);   // обёртка подаёт один регистр на все три
 }
 
 // Логика HDL-обёртки: захват таймстемпов по изменению счётчиков + sampleReady.

@@ -561,7 +561,18 @@ hls_dual_echo_krnl_ip hls_dual_echo_krnl_inst (
      // ── скаляры: провода, а не регистры ──────────────────────────────────
      .listenPortA      ( listenPortA_reg  ),
      .listenPortB      ( listenPortB_reg  ),
-     .enable           ( enable_reg       ),
+
+     // ОДИН регистр enable (0x10) на ДВА порта ядра. Снаружи это по-прежнему
+     // один enable — адресная карта не менялась.
+     //
+     // Раздельные порты нужны потому, что при одном аргументе его читали обе
+     // половины, и HLS раздал их несимметрично: половине a провод, половине b
+     // FIFO-канал p_c_U с блокировкой по empty_n. Половина b вставала на пустом
+     // канале, а через ap_ready/ap_continue DATAFLOW-региона вставала и a.
+     // На плате это выглядело так: регистры живые, enable=1 читается обратно,
+     // а listenAttempts=0 и вся телеметрия нули навсегда.
+     .enableA          ( enable_reg       ),
+     .enableB          ( enable_reg       ),
 
      .listenAttempts_a ( listenAttempts_a ),
      .portState_a      ( portState_a      ),

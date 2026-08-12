@@ -103,8 +103,8 @@ set ::USR_OFF_ENABLE        0x40
 #     4294967295 rather than -1. That matters because axi_read32 feeds
 #     counters and timestamps straight into integer comparisons.
 #
-# Tcl 8.5+ computes in 64 bits, so a 48-bit MAC passes through intact and the
-# >> 32 shift stays correct.
+# Tcl 8.5+ computes in 64 bits, so a 48-bit MAC should pass through intact.
+# "Should" -- see _hex2words below for why we no longer rely on it for MACs.
 proc _hex2int {s} {
      set s [string trim $s]
      regsub -nocase {^0x} $s "" s
@@ -112,6 +112,48 @@ proc _hex2int {s} {
           error "expected a hex number without prefix, got: '$s'"
      }
      return [expr {"0x$s" + 0}]
+}
+
+# Split a hex string into low and high 32-bit words WITHOUT any arithmetic
+# wider than 32 bits: the string is cut in two and each half parsed on its own.
+#
+# WHY THIS EXISTS. On the board a MAC of 000a35029de5 came back as
+# 000035029de5 -- the 0x0a byte, which lives in the high word, was gone. Both
+# the "writing" line and the "read back" line showed the truncated value, and
+# network_configure still printed "write confirmed", because it compared the
+# already-damaged value against itself. The stack's RTL is fine
+# (network_control_s_axi.sv:435 writes int_mac_addr[63:32] from 0x1c), and the
+# same parse on a desktop Tcl 8.6 yields the correct hi=0000000a -- so this is
+# a property of the Tcl build inside that Vivado, not of the design.
+#
+# Rather than diagnose which Tcl does what, avoid the question: 48-bit values
+# are never held in one integer. Correct on every Tcl, including the one that
+# handles them properly.
+#
+# Returns a two-element list {lo hi}. For inputs of 8 hex digits or fewer the
+# high word is 0, so this is safe for IPs too.
+proc _hex2words {s} {
+     set s [string trim $s]
+     regsub -nocase {^0x} $s "" s
+     if {![regexp {^[0-9a-fA-F]+$} $s]} {
+          error "expected a hex number without prefix, got: '$s'"
+     }
+     set len [string length $s]
+     if {$len > 16} {
+          error "hex value too wide for 64 bits: '$s'"
+     }
+     if {$len <= 8} {
+          return [list [expr {"0x$s" + 0}] 0]
+     }
+     set lo_str [string range $s end-7 end]
+     set hi_str [string range $s 0 end-8]
+     return [list [expr {"0x$lo_str" + 0}] [expr {"0x$hi_str" + 0}]]
+}
+
+# Format a {lo hi} pair back into a 12-digit hex string for printing, again
+# without wide arithmetic. Used so the log shows what was really written.
+proc _words2hex12 {lo hi} {
+     return [format "%04x%08x" $hi $lo]
 }
 
 # --- low level access ----------------------------------------------------------
@@ -168,15 +210,22 @@ proc network_configure {ip_str mac_str {arp 1} {n 1}} {
      set base [ouch_base_network $n]
 
      set ip  [_hex2int $ip_str]
-     set mac [_hex2int $mac_str]
 
-     puts "network_krnl: ip=0x[format %08x $ip] mac=0x[format %012x $mac]"
+     # MAC is handled as two 32-bit words end to end -- never as one 48-bit
+     # integer. See _hex2words: on the board the high byte of the MAC was
+     # silently lost, and because the comparison below used the same damaged
+     # value on both sides, it still reported "write confirmed".
+     lassign [_hex2words $mac_str] mac_lo mac_hi
+
+     puts "network_krnl: ip=0x[format %08x $ip] mac=0x[_words2hex12 $mac_lo $mac_hi]"
 
      axi_write32 [expr {$base + $::NET_OFF_IP_ADDR}] $ip
 
-     # mac_addr is a 64-bit argument, s_axilite exposes it as two words.
-     axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR}]       [expr {$mac & 0xffffffff}]
-     axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]   [expr {($mac >> 32) & 0xffffffff}]
+     # mac_addr is a 64-bit argument, s_axilite exposes it as two words:
+     # 0x18 = mac_addr[31:0], 0x1c = mac_addr[63:32]
+     # (network_control_s_axi.sv:126-127).
+     axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR}]       $mac_lo
+     axi_write32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]   $mac_hi
 
      axi_write32 [expr {$base + $::NET_OFF_ARP}] $arp
 
@@ -187,13 +236,24 @@ proc network_configure {ip_str mac_str {arp 1} {n 1}} {
      set rd_ip  [axi_read32 [expr {$base + $::NET_OFF_IP_ADDR}]]
      set rd_lo  [axi_read32 [expr {$base + $::NET_OFF_MAC_ADDR}]]
      set rd_hi  [axi_read32 [expr {$base + $::NET_OFF_MAC_ADDR + 4}]]
-     set rd_mac [expr {($rd_hi << 32) | $rd_lo}]
 
-     puts "  read back:  ip=0x[format %08x $rd_ip] mac=0x[format %012x $rd_mac]"
+     puts "  read back:  ip=0x[format %08x $rd_ip] mac=0x[_words2hex12 $rd_lo $rd_hi]"
 
-     if {$rd_ip != $ip || $rd_mac != $mac} {
-          puts "  *** WRITE NOT CONFIRMED -- check ouch_base_network $n and that"
-          puts "      the device is programmed with this bitstream"
+     # Compare WORD BY WORD. The old code folded both halves into one integer
+     # first, so a mangled high word compared equal to itself and the check
+     # passed while the MAC was wrong.
+     if {$rd_ip != $ip} {
+          puts "  *** IP WRITE NOT CONFIRMED (wrote [format %08x $ip],"
+          puts "      read [format %08x $rd_ip]) -- check ouch_base_network $n"
+          puts "      and that the device is programmed with this bitstream"
+          return 0
+     }
+     if {$rd_lo != $mac_lo || $rd_hi != $mac_hi} {
+          puts "  *** MAC WRITE NOT CONFIRMED"
+          puts "      lo: wrote [format %08x $mac_lo] read [format %08x $rd_lo]"
+          puts "      hi: wrote [format %08x $mac_hi] read [format %08x $rd_hi]"
+          puts "      The high word lives at offset 0x1c; if only it differs,"
+          puts "      the 48-bit value was damaged before it reached AXI."
           return 0
      }
      puts "  write confirmed"

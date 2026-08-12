@@ -454,8 +454,11 @@ void dual_echo_core(
      hls::stream<pkt32>& m_axis_tcp_tx_meta_b,
      hls::stream<pkt512>& m_axis_tcp_tx_data_b,
      hls::stream<pkt64>& s_axis_tcp_tx_status_b,
-     // управление и телеметрия (s_axi_control)
-     int enable,
+     // управление и телеметрия. enableA/enableB — одно значение из обёртки,
+     // раздельные аргументы, чтобы у каждого был ОДИН читатель (см. шапку
+     // топ-функции: один общий enable HLS раздавал половинам несимметрично).
+     int enableA,
+     int enableB,
      int listenPortA,
      int listenPortB,
      ap_uint<32>& listenAttempts_a,
@@ -471,13 +474,13 @@ void dual_echo_core(
 #pragma HLS DATAFLOW disable_start_propagation
 
 
-     dual_echo_half_a(enable, listenPortA,
+     dual_echo_half_a(enableA, listenPortA,
                       listenAttempts_a, portState_a, notifyCount_a,
                       m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a,
                       s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
                       s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a);
 
-     dual_echo_half_b(enable, listenPortB,
+     dual_echo_half_b(enableB, listenPortB,
                       listenAttempts_b, portState_b, notifyCount_b,
                       m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b,
                       s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
@@ -559,8 +562,32 @@ void hls_dual_echo_krnl(
                ap_uint<32>& portState_b,
                ap_uint<32>& notifyCount_b,
 
-               // enable — разрешение начать работу (провод из обёртки).
-               int enable)
+               // ── enable: ДВА аргумента на одно значение ──
+               //
+               // Обёртка подаёт на оба один и тот же регистр (0x10), так что
+               // снаружи это по-прежнему ОДИН enable — адресная карта и
+               // jtag_ctrl.tcl не меняются.
+               //
+               // ЗАЧЕМ РАЗДЕЛЕНО. Пока это был один аргумент, его читали ОБЕ
+               // половины, и HLS раздал его НЕСИММЕТРИЧНО (проверено в
+               // сгенерированном RTL, dual_echo_core.v):
+               //
+               //     .enable(empty_176)              <- половине a провод
+               //     .enable_dout(p_c_dout)          <- половине b FIFO p_c_U
+               //     .enable_empty_n(p_c_empty_n)
+               //     .enable_read(...)
+               //
+               // Половина b блокировалась на пустом канале, а через
+               // ap_ready/ap_continue DATAFLOW-региона вставала и половина a.
+               // Симптом на плате: регистры живые, enable=1 читается, а
+               // listenAttempts=0 и вся телеметрия нули НАВСЕГДА. Ядро не
+               // исполнялось ни в одной половине.
+               //
+               // Теперь у каждого аргумента ОДИН читатель — размножать нечего,
+               // и независимость стала свойством кода, а не расписания HLS.
+               // Тот же дефект был у probe-ядра со скаляром cycleCount.
+               int enableA,
+               int enableB)
 {
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
 #pragma HLS INTERFACE axis port = m_axis_udp_tx_a
@@ -625,7 +652,8 @@ void hls_dual_echo_krnl(
 // этом железе. register даёт защёлку на входе порта: чистая граница для
 // таймингового анализа и никакого длинного комбинационного пути от регистра в
 // обёртке до логики стадии.
-#pragma HLS INTERFACE ap_none register port = enable
+#pragma HLS INTERFACE ap_none register port = enableA
+#pragma HLS INTERFACE ap_none register port = enableB
 #pragma HLS INTERFACE ap_none register port = listenPortA
 #pragma HLS INTERFACE ap_none register port = listenPortB
 
@@ -649,7 +677,7 @@ void hls_dual_echo_krnl(
                     m_axis_tcp_tx_meta_b, m_axis_tcp_tx_data_b,
                     s_axis_tcp_tx_status_b,
 
-                    enable, listenPortA, listenPortB,
+                    enableA, enableB, listenPortA, listenPortB,
                     listenAttempts_a, portState_a, notifyCount_a,
                     listenAttempts_b, portState_b, notifyCount_b);
 }

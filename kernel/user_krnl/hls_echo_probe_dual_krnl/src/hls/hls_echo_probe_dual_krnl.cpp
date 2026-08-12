@@ -829,7 +829,10 @@ void epd_core(
      hls::stream<pkt512>& m_axis_tcp_tx_data_b,
      hls::stream<pkt64>& s_axis_tcp_tx_status_b,
      // параметры
-     int enable, int serverIp, int serverPort, int listenPort,
+     // enableConn/Traffic/Listen — одно значение из обёртки, раздельные
+     // аргументы, чтобы у каждого был ОДИН читатель (см. шапку топ-функции).
+     int enableConn, int enableTraffic, int enableListen,
+     int serverIp, int serverPort, int listenPort,
      int msgBytes, int triggerGo,
      // счётчики событий. Время по их ap_vld штампует HDL-обёртка — таймстемпов
      // и sampleReady здесь больше нет, см. пояснение выше (было epd_latch).
@@ -863,7 +866,9 @@ void epd_core(
      // читается и сравнивается с прошлым значением. Скаляр, меняющийся КАЖДЫЙ
      // такт, здесь больше не передаётся — попытка так сделать (cycleCount)
      // кончилась несимметричным размножением через FIFO, см. пояснение выше.
-#pragma HLS stable variable = enable
+#pragma HLS stable variable = enableConn
+#pragma HLS stable variable = enableTraffic
+#pragma HLS stable variable = enableListen
 #pragma HLS stable variable = serverIp
 #pragma HLS stable variable = serverPort
 #pragma HLS stable variable = listenPort
@@ -882,11 +887,11 @@ void epd_core(
      // ap_vld счётчиков событий.
 
      // --- клиент (порт 0) ---
-     epd_client_connect(enable, serverIp, serverPort, connAttempts,
+     epd_client_connect(enableConn, serverIp, serverPort, connAttempts,
                         sessionFifo,
                         m_axis_tcp_open_connection_a, s_axis_tcp_open_status_a);
 
-     epd_client_traffic(enable, msgBytes, triggerGo,
+     epd_client_traffic(enableTraffic, msgBytes, triggerGo,
                         sessionFifo,
                         sentCount, recvCount, timeoutCount,
                         m_axis_tcp_tx_meta_a, m_axis_tcp_tx_data_a,
@@ -895,7 +900,7 @@ void epd_core(
                         s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a);
 
      // --- сервер-эхо (порт 1) ---
-     epd_server_listen(enable, listenPort, listenAttempts, portState,
+     epd_server_listen(enableListen, listenPort, listenAttempts, portState,
                        m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
      epd_server_echo(echoRxCount, echoCount,
@@ -1017,7 +1022,32 @@ void hls_echo_probe_dual_krnl(
                // enable молча ломал jtag_ctrl.tcl. Теперь адресная карта
                // задана руками в probe_control_s_axi.v, и порядок аргументов
                // на смещения не влияет вообще.
-               int enable
+               // ── enable: ТРИ аргумента на одно значение ──
+               //
+               // Обёртка подаёт на все три один и тот же регистр (0x10), так что
+               // снаружи это по-прежнему ОДИН enable: адресная карта и
+               // jtag_ctrl.tcl не меняются.
+               //
+               // ЗАЧЕМ РАЗДЕЛЕНО. Пока это был один аргумент, его читали ТРИ
+               // стадии (epd_client_connect, epd_client_traffic,
+               // epd_server_listen), и HLS раздавал такой скаляр
+               // НЕСИММЕТРИЧНО: часть читателей получала провод, часть —
+               // FIFO-канал с блокировкой по empty_n. Стадия на канале
+               // вставала, а через ap_ready/ap_continue DATAFLOW-региона
+               // вставал весь регион.
+               //
+               // Это НЕ теория: ровно так сломался hls_dual_echo_krnl на плате
+               // (dual_echo_core.v: половине a достался .enable(empty_176),
+               // половине b — .enable_dout/.enable_empty_n/.enable_read через
+               // FIFO p_c_U). Симптом: регистры живые, enable=1 читается
+               // обратно, а вся телеметрия нули навсегда и ядро не исполняется.
+               // csynth при этом был чистый — видно только в syn/verilog.
+               //
+               // Теперь у каждого аргумента ОДИН читатель. Тот же приём, что с
+               // cycleCount: не давать HLS решать, как размножить скаляр.
+               int enableConn,
+               int enableTraffic,
+               int enableListen
                       ) {
 
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
@@ -1137,7 +1167,9 @@ void hls_echo_probe_dual_krnl(
 // register: значение защёлкивается на входе порта, что даёт чистую границу для
 // таймингового анализа и снимает длинный комбинационный путь от регистра в
 // обёртке до логики стадии.
-#pragma HLS INTERFACE ap_none register port = enable
+#pragma HLS INTERFACE ap_none register port = enableConn
+#pragma HLS INTERFACE ap_none register port = enableTraffic
+#pragma HLS INTERFACE ap_none register port = enableListen
 #pragma HLS INTERFACE ap_none register port = serverIp
 #pragma HLS INTERFACE ap_none register port = serverPort
 #pragma HLS INTERFACE ap_none register port = listenPort
@@ -1165,7 +1197,8 @@ void hls_echo_probe_dual_krnl(
               m_axis_tcp_tx_meta_b, m_axis_tcp_tx_data_b,
               s_axis_tcp_tx_status_b,
 
-              enable, serverIp, serverPort, listenPort,
+              enableConn, enableTraffic, enableListen,
+              serverIp, serverPort, listenPort,
               msgBytes, triggerGo,
 
               connAttempts, sentCount, recvCount, timeoutCount,
