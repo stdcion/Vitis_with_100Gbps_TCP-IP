@@ -337,35 +337,44 @@ module tb_probe_ctrl;
           // А ТЕПЕРЬ САМА ГОНКА.
           //
           // Условие сброса (triggerGo_reg != trigger_r) истинно РОВНО ОДИН
-          // такт -- тот, что следует за изменением triggerGo_reg, потому что
-          // trigger_r догоняет его на следующем фронте. Надо поднять
-          // recvCount_ap_vld именно на этом такте.
+          // такт: triggerGo_reg меняется по w_hs, а trigger_r догоняет его на
+          // следующем фронте. Надо поднять recvCount_ap_vld именно на нём.
           //
-          // БЕЗ fork/wait НАМЕРЕННО. Вариант с fork и wait(triggerGo_reg==N)
-          // разваливается, если регистр успеет измениться до того, как wait
-          // взведётся: тестбенч повиснет до глобального таймаута, и это будет
-          // выглядеть как непонятный отказ, а не как найденный дефект. Здесь
-          // порядок задан явно: сначала запись, потом поиск того самого такта.
-          axi_write(A_TRIGGER, 32'd101);
-
-          // Ищем такт, на котором условие сброса истинно, и в нём даём vld.
-          // Ограничиваем поиск, чтобы при неверном допущении тестбенч
-          // ОТКАЗАЛ, а не повис.
+          // ПОЧЕМУ НЕЛЬЗЯ «СНАЧАЛА ЗАПИСЬ, ПОТОМ ПОИСК». Первая версия делала
+          // axi_write, а потом искала такт с расхождением -- и не находила
+          // никогда (прогон 13.08: «the racing cycle was actually hit» = FAIL).
+          // Причина: axi_write возвращает управление только после bvalid, то
+          // есть на 1-2 такта ПОЗЖЕ w_hs, а окно к тому моменту уже закрыто.
+          // Ловить надо ВО ВРЕМЯ транзакции, а не после неё.
+          //
+          // Поэтому здесь отдельный процесс следит за triggerGo_reg параллельно
+          // записи и стреляет стробом в тот же такт, когда значение изменилось.
+          // guard ограничивает ожидание: при неверном допущении тестбенч
+          // ОТКАЗЫВАЕТ, а не висит до глобального таймаута.
           begin : race
-               integer guard;
-               reg     hit;
-               hit = 1'b0;
-               for (guard = 0; guard < 20 && !hit; guard = guard + 1) begin
-                    if (dut.triggerGo_reg !== dut.trigger_r) begin
-                         // ЭТОТ такт -- условие сброса истинно прямо сейчас.
-                         force dut.recvCount_ap_vld = 1'b1;
-                         @(negedge clk);
-                         release dut.recvCount_ap_vld;
-                         hit = 1'b1;
-                    end else begin
-                         @(negedge clk);
+               integer      guard;
+               reg          hit;
+               reg [31:0]   prev;
+               hit  = 1'b0;
+               prev = dut.triggerGo_reg;
+
+               fork
+                    axi_write(A_TRIGGER, 32'd101);
+                    begin
+                         for (guard = 0; guard < 40 && !hit; guard = guard + 1) begin
+                              @(posedge clk);
+                              // Смотрим СРАЗУ после фронта: triggerGo_reg уже
+                              // обновился, а trigger_r ещё держит старое --
+                              // это и есть тот единственный такт.
+                              if (dut.triggerGo_reg !== prev) begin
+                                   force dut.recvCount_ap_vld = 1'b1;
+                                   @(posedge clk);
+                                   release dut.recvCount_ap_vld;
+                                   hit = 1'b1;
+                              end
+                         end
                     end
-               end
+               join
                `chk("the racing cycle was actually hit", hit === 1'b1);
           end
 
