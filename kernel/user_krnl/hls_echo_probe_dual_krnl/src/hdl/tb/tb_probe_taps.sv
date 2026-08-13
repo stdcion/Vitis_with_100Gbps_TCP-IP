@@ -234,7 +234,10 @@ module tb_probe_taps;
      always #5 clk = ~clk;
 
      integer errors = 0;
-     task check(input [255:0] name, input cond);
+     // name -- string, а НЕ [255:0]: вектор вмещает 32 байта, и сообщения
+     // на кириллице (2 байта на символ в UTF-8) обрезались посередине.
+     // Прогон 13.08 печатал «ok   М (tag=6  SYN» вместо полной строки.
+     task check(input string name, input cond);
           begin
                if (cond) $display("  ok   %0s", name);
                else begin $display("  FAIL %0s", name); errors = errors + 1; end

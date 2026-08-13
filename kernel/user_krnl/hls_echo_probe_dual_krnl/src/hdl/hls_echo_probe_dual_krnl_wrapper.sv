@@ -396,6 +396,47 @@ end
 
 assign ap_idle = ap_idle_r;
 
+// ── регистры <-> провода ─────────────────────────────────────────────────────
+//
+// ОБЪЯВЛЕНИЯ СТОЯТ ЗДЕСЬ, ДО ПЕРВОГО ИСПОЛЬЗОВАНИЯ, И ЭТО НЕ ВКУСОВЩИНА.
+// Раньше этот блок лежал ниже, рядом с инстансом probe_control_s_axi, а
+// защёлка таймстемпов и фильтры выше уже читали sentCount_ap_vld и
+// minWords_reg. Vivado Synthesis это принимает (Verilog-2001 разрешает
+// использовать wire уровня модуля до объявления, и probe с таким кодом прошёл
+// имплементацию), но xvlog в режиме SystemVerilog -- нет:
+//
+//     ERROR: [VRFC 10-3380] identifier 'sentCount_ap_vld' is used before its
+//                           declaration
+//
+// То есть код собирался, но не симулировался, а расхождение между
+// инструментами -- плохая опора. Держим объявления выше всех читателей.
+wire [31:0] enable_reg;
+wire [31:0] serverIp_reg;
+wire [31:0] serverPort_reg;
+wire [31:0] listenPort_reg;
+wire [31:0] msgBytes_reg;
+wire [31:0] triggerGo_reg;
+// Порог фильтра кадров на axis_net_*. В HLS-ядро НЕ идёт: врезки живут целиком
+// в обёртке. Хост пишет его вместе с msgBytes, поэтому свип по размерам не
+// требует пересборки, а порог всегда соответствует тому, что отправляется.
+wire [31:0] minWords_reg;
+
+// Счётчики событий из ядра. ap_vld — строб «изменилось в этом такте», по нему
+// защёлкиваются таймстемпы ниже. Сами значения читаются хостом как телеметрия;
+// держать их между обновлениями — забота HLS (теневой регистр *_preg).
+wire [31:0] connAttempts;
+wire [31:0] sentCount;
+wire        sentCount_ap_vld;
+wire [31:0] recvCount;
+wire        recvCount_ap_vld;
+wire [31:0] timeoutCount;
+wire [31:0] echoRxCount;
+wire        echoRxCount_ap_vld;
+wire [31:0] echoCount;
+wire        echoCount_ap_vld;
+wire [31:0] listenAttempts;
+wire [31:0] portState;
+
 // ── ЕДИНАЯ ШКАЛА ВРЕМЕНИ ДЛЯ ОБЕИХ ПОЛОВИН ───────────────────────────────────
 //
 // Все четыре таймстемпа замера обязаны быть в ОДНОЙ шкале, иначе NET_FWD и
@@ -667,34 +708,6 @@ always @(posedge ap_clk) begin
                sample_ready_r <= 1'b0;      // новый замер начат
      end
 end
-
-// ── регистры <-> провода ─────────────────────────────────────────────────────
-wire [31:0] enable_reg;
-wire [31:0] serverIp_reg;
-wire [31:0] serverPort_reg;
-wire [31:0] listenPort_reg;
-wire [31:0] msgBytes_reg;
-wire [31:0] triggerGo_reg;
-// Порог фильтра кадров на axis_net_*. В HLS-ядро НЕ идёт: врезки живут целиком
-// в обёртке. Хост пишет его вместе с msgBytes, поэтому свип по размерам не
-// требует пересборки, а порог всегда соответствует тому, что отправляется.
-wire [31:0] minWords_reg;
-
-// Счётчики событий из ядра. ap_vld — строб «изменилось в этом такте», по нему
-// защёлкиваются таймстемпы выше. Сами значения читаются хостом как телеметрия;
-// держать их между обновлениями — забота HLS (теневой регистр *_preg).
-wire [31:0] connAttempts;
-wire [31:0] sentCount;
-wire        sentCount_ap_vld;
-wire [31:0] recvCount;
-wire        recvCount_ap_vld;
-wire [31:0] timeoutCount;
-wire [31:0] echoRxCount;
-wire        echoRxCount_ap_vld;
-wire [31:0] echoCount;
-wire        echoCount_ap_vld;
-wire [31:0] listenAttempts;
-wire [31:0] portState;
 
 probe_control_s_axi #(
      .C_S_AXI_ADDR_WIDTH ( C_S_AXI_CONTROL_ADDR_WIDTH ),
