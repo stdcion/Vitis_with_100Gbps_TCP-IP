@@ -359,7 +359,8 @@ csynth — потому что молчит. Только `syn/verilog`.
 
 | Файл | Что |
 |---|---|
-| [latency_experiment_windows.md](latency_experiment_windows.md) | **инструкция оператору**: пошагово, что вводить и что должно печататься |
+| [probe_runbook.md](probe_runbook.md) | **НАЧАТЬ ОТСЮДА, если задача «провести эксперимент»**: сборка → прошивка → замер → свип, одним списком, с развилками |
+| [latency_experiment_windows.md](latency_experiment_windows.md) | подробная инструкция оператору: что печатает каждая команда и разбор отказов |
 | [latency_experiment_context.md](latency_experiment_context.md) | зачем эксперимент, схема стенда, точки измерения |
 | [latency_net_probe_design.md](latency_net_probe_design.md) | врезки на `axis_net_*` (4 больших `T`): **реализовано 13.08, не собрано**; в шапке — три расхождения с первоначальным проектом |
 | [building.md](building.md) | сборка по шагам, «сборка начисто» |
