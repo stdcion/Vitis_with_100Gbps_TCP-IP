@@ -227,16 +227,50 @@ epd_measure
 puts "  -- epd_collect на таком битстриме:"
 epd_collect 3
 
-puts "\n=== 10. epd_net_status: три состояния ==="
-proc chk_net {label ca cb da db mw} {
+puts "\n=== 10. epd_net_status: четыре состояния ==="
+#
+# Четвёртое состояние -- «замеров ещё не было» -- добавлено 13.08 после того,
+# как прогон на модели исправной платы показал ЛОЖНУЮ ТРЕВОГУ: сразу после
+# epd_enable счётчики выглядят как passed=0, dropped>0 (ARP и SYN уже прошли,
+# нашего кадра ещё не было), и старая версия объявляла «minWords завышен».
+# Инструкция велит звать epd_net_status ДО первого epd_measure, то есть
+# ложная тревога срабатывала бы у каждого оператора на первом же прогоне.
+# Отличает эти два случая счётчик sent.
+proc chk_net {label ca cb da db mw {sent 5}} {
      set ::HW(0x88) $ca ; set ::HW(0x8c) $cb
      set ::HW(0x90) $da ; set ::HW(0x94) $db ; set ::HW(0x74) $mw
+     set ::HW(0x44) $sent
      puts "  -- $label"
-     epd_net_status
+     return [epd_net_status]
 }
 chk_net "норма" 20 20 35 35 2
 chk_net "фильтр режет всё (minWords завышен)" 0 0 60 60 25
 chk_net "врезка мертва" 0 0 0 0 2
+chk_net "замеров ещё не было (НЕ отказ)" 0 0 4 4 2 0
+
+# Проверяем не только печать, но и то, ЧТО именно советует скрипт: при sent=0
+# он не должен предлагать понижать minWords.
+proc _net_advice {ca cb da db mw sent} {
+     set ::HW(0x88) $ca ; set ::HW(0x8c) $cb
+     set ::HW(0x90) $da ; set ::HW(0x94) $db
+     set ::HW(0x74) $mw ; set ::HW(0x44) $sent
+     set out ""
+     # перехватываем вывод, подменив puts на время вызова
+     rename ::puts ::_real_puts
+     proc ::puts {args} { append ::_cap [lindex $args end] "\n" }
+     set ::_cap ""
+     catch {epd_net_status}
+     rename ::puts {} ; rename ::_real_puts ::puts
+     return $::_cap
+}
+set a1 [_net_advice 0 0 4 4 2 0]
+ok "при sent=0 НЕ советует понижать minWords" \
+     [expr {![string match "*is too high*" $a1]}]
+ok "при sent=0 говорит, что это норма" [string match "*normal*" $a1]
+set a2 [_net_advice 0 0 60 60 25 10]
+ok "при sent>0 и passed=0 советует minWords" [string match "*is too high*" $a2]
+set a3 [_net_advice 0 0 0 0 2 10]
+ok "при нулях всюду говорит про мёртвую врезку" [string match "*NO traffic*" $a3]
 
 puts "\n=== 11. чистые функции jtag_ctrl.tcl ==="
 #

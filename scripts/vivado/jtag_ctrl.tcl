@@ -704,7 +704,11 @@ proc epd_net_status {{n 1}} {
      set db [axi_read32 [expr {$base + $::EPD_OFF_NF_DROP_B}]]
      set mw [axi_read32 [expr {$base + $::EPD_OFF_MIN_WORDS}]]
 
-     puts "epd\[$n\]: net taps: minWords=$mw"
+     # Сколько пакетов ядро вообще отправило. Без этого числа passed=0 не
+     # истолковать: см. ниже.
+     set snt [axi_read32 [expr {$base + $::EPD_OFF_SENT}]]
+
+     puts "epd\[$n\]: net taps: minWords=$mw (sent=$snt)"
      puts "epd\[$n\]:   channel A (QSFP0): passed=$ca dropped=$da"
      puts "epd\[$n\]:   channel B (QSFP1): passed=$cb dropped=$db"
 
@@ -713,6 +717,19 @@ proc epd_net_status {{n 1}} {
                puts "  -> channel $ch tap sees NO traffic at all. Either this"
                puts "     bitstream has no taps, or config_sp did not route"
                puts "     axis_net_* through the wrapper on this channel."
+          } elseif {$cnt == 0 && $snt == 0} {
+               # НОРМА, а не отказ. Это состояние сразу после epd_enable:
+               # ARP и SYN/SYN-ACK уже прошли по проводу (односоловные кадры,
+               # фильтр их и должен отсеивать), а НАШЕГО кадра ещё не было --
+               # ни одного замера не запускали.
+               #
+               # Раньше эта ветка попадала под "drops every frame" и советовала
+               # понизить minWords. Ложная тревога срабатывала у каждого, кто
+               # следует инструкции: она велит звать epd_net_status ДО первого
+               # epd_measure, то есть ровно здесь.
+               puts "  -> channel $ch: no measurement has run yet (sent=0), so"
+               puts "     only ARP/SYN went through -- they are supposed to be"
+               puts "     dropped. This is normal. Re-check after epd_measure."
           } elseif {$cnt == 0} {
                puts "  -> channel $ch drops every frame, ours included:"
                puts "     minWords=$mw is too high. Re-run epd_configure."
