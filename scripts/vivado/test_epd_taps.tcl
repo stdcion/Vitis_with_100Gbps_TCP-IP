@@ -238,5 +238,141 @@ chk_net "норма" 20 20 35 35 2
 chk_net "фильтр режет всё (minWords завышен)" 0 0 60 60 25
 chk_net "врезка мертва" 0 0 0 0 2
 
+puts "\n=== 11. чистые функции jtag_ctrl.tcl ==="
+#
+# ЗАЧЕМ ОТДЕЛЬНО. Всё выше проверяет epd_*, но в файле есть функции, от которых
+# зависит bringup ЛЮБОГО ядра, а не только probe: разбор адресов и MAC. Их
+# заглушка выше подменяет (_hex2int), поэтому берём НАСТОЯЩИЕ определения из
+# исходника и проверяем их отдельно.
+#
+# Главная из них -- _hex2words. На плате MAC 000a35029de5 записался как
+# 000035029de5: старший байт пропал, а `write confirmed` всё равно напечаталось,
+# потому что сравнение шло с уже испорченным значением. Это худший вид дефекта:
+# инструмент говорит «всё хорошо», а стек не отвечает.
+proc _load_procs {names} {
+     set fh [open $::REPO/scripts/vivado/jtag_ctrl.tcl r]
+     set src [read $fh]
+     close $fh
+     foreach p $names {
+          set i [string first "\nproc $p " $src]
+          if {$i < 0} { puts "  FAIL не найдена процедура $p" ; incr ::fails ; continue }
+          set rest [string range $src $i end]
+          set j [string first "\n\}\n" $rest]
+          uplevel #0 [string range $rest 0 [expr {$j + 2}]]
+     }
+}
+_load_procs {_hex2words _words2hex12 _de_dotted}
+
+# 48-битный MAC: старший байт обязан уцелеть
+lassign [_hex2words 000a35029de5] lo hi
+ok "MAC 000a35029de5: младшее слово" [expr {$lo == 0x35029de5}]
+ok "MAC 000a35029de5: СТАРШИЙ БАЙТ НА МЕСТЕ (0x000a)" [expr {$hi == 0x000a}]
+ok "MAC round-trip" [expr {[_words2hex12 $lo $hi] eq "000a35029de5"}]
+lassign [_hex2words 020000000001] lo hi
+ok "локально администрируемый MAC 020000000001" [expr {$hi == 0x0200 && $lo == 1}]
+lassign [_hex2words ffffffffffff] lo hi
+ok "broadcast ffffffffffff" [expr {$lo == 0xffffffff && $hi == 0xffff}]
+ok "слишком длинное значение отвергается" [expr {[catch {_hex2words 00112233445566778899}] == 1}]
+ok "не-hex отвергается" [expr {[catch {_hex2words "zz"}] == 1}]
+# IP: 8 знаков и меньше -> старшее слово ноль
+lassign [_hex2words 0a01d499] lo hi
+ok "IP 0a01d499 (hi=0)" [expr {$lo == 0x0a01d499 && $hi == 0}]
+ok "_de_dotted 0a01d499 -> 10.1.212.153" [expr {[_de_dotted 0a01d499] eq "10.1.212.153"}]
+ok "_de_dotted c0a80a0a -> 192.168.10.10" [expr {[_de_dotted c0a80a0a] eq "192.168.10.10"}]
+
+puts "\n=== 12. адресные карты: tcl против HDL ==="
+#
+# Смещения в этом скрипте -- копия localparam из соответствующих *_control_s_axi.
+# Если они разойдутся, на плате это выглядит как «ядро не отвечает», и искать
+# будут в прошивке. Сверяем ПРОГРАММНО и для ВСЕХ трёх карт, а не только probe.
+proc _hdl_addrs {path} {
+     set fh [open $path r] ; set s [read $fh] ; close $fh
+     set out [dict create]
+     foreach {full name val} [regexp -all -inline {(ADDR_\w+)\s*=\s*\d*'h([0-9a-fA-F]+)} $s] {
+          dict set out $name [expr {"0x$val" + 0}]
+     }
+     return $out
+}
+set NET [_hdl_addrs $::REPO/kernel/network_krnl/src/hdl/network_control_s_axi.sv]
+set DE  [_hdl_addrs $::REPO/kernel/user_krnl/hls_dual_echo_krnl/src/hdl/dual_echo_control_s_axi.v]
+set EPD [_hdl_addrs $::REPO/kernel/user_krnl/hls_echo_probe_dual_krnl/src/hdl/probe_control_s_axi.v]
+
+# {переменная-в-tcl  имя-в-hdl  какая-карта}
+set MAP {
+     NET_OFF_AP_CTRL      ADDR_AP_CTRL            NET
+     NET_OFF_IP_ADDR      ADDR_IP_ADDR_DATA_0     NET
+     NET_OFF_MAC_ADDR     ADDR_MAC_ADDR_DATA_0    NET
+     NET_OFF_ARP          ADDR_ARP_DATA_0         NET
+     NET_OFF_AXI00_PTR    ADDR_AXI00_PTR0_DATA_0  NET
+     NET_OFF_AXI01_PTR    ADDR_AXI01_PTR0_DATA_0  NET
+     DE_OFF_AP_CTRL       ADDR_AP_CTRL            DE
+     DE_OFF_ENABLE        ADDR_ENABLE_DATA_0      DE
+     DE_OFF_LISTEN_PORT_A ADDR_PORT_A_DATA_0      DE
+     DE_OFF_LISTEN_PORT_B ADDR_PORT_B_DATA_0      DE
+     DE_OFF_LISTEN_ATT_A  ADDR_ATT_A_DATA_0       DE
+     DE_OFF_PORT_STATE_A  ADDR_STATE_A_DATA_0     DE
+     DE_OFF_NOTIFY_A      ADDR_NOTIFY_A_DATA_0    DE
+     DE_OFF_LISTEN_ATT_B  ADDR_ATT_B_DATA_0       DE
+     DE_OFF_PORT_STATE_B  ADDR_STATE_B_DATA_0     DE
+     DE_OFF_NOTIFY_B      ADDR_NOTIFY_B_DATA_0    DE
+     EPD_OFF_ENABLE       ADDR_ENABLE_DATA_0      EPD
+     EPD_OFF_SERVER_IP    ADDR_SERVERIP_DATA_0    EPD
+     EPD_OFF_SERVER_PORT  ADDR_SRVPORT_DATA_0     EPD
+     EPD_OFF_LISTEN_PORT  ADDR_LSNPORT_DATA_0     EPD
+     EPD_OFF_MSG_BYTES    ADDR_MSGBYTES_DATA_0    EPD
+     EPD_OFF_TRIGGER_GO   ADDR_TRIGGER_DATA_0     EPD
+     EPD_OFF_CONN_ATTEMPTS ADDR_CONNATT_DATA_0    EPD
+     EPD_OFF_SENT         ADDR_SENT_DATA_0        EPD
+     EPD_OFF_RECV         ADDR_RECV_DATA_0        EPD
+     EPD_OFF_TIMEOUTS     ADDR_TIMEOUT_DATA_0     EPD
+     EPD_OFF_ECHOES       ADDR_ECHO_DATA_0        EPD
+     EPD_OFF_LISTEN_ATT   ADDR_LSNATT_DATA_0      EPD
+     EPD_OFF_PORT_STATE   ADDR_PORTSTATE_DATA_0   EPD
+     EPD_OFF_ECHO_RX      ADDR_ECHORX_DATA_0      EPD
+     EPD_OFF_TS_REQUEST   ADDR_TSREQ_DATA_0       EPD
+     EPD_OFF_TS_ECHO_IN   ADDR_TSECHOIN_DATA_0    EPD
+     EPD_OFF_TS_ECHO_OUT  ADDR_TSECHOOUT_DATA_0   EPD
+     EPD_OFF_TS_REPLY     ADDR_TSREPLY_DATA_0     EPD
+     EPD_OFF_SAMPLE_READY ADDR_SMPREADY_DATA_0    EPD
+     EPD_OFF_MIN_WORDS    ADDR_MINWORDS_DATA_0    EPD
+     EPD_OFF_TS_NET_TX_A  ADDR_TSNETTXA_DATA_0    EPD
+     EPD_OFF_TS_NET_RX_B  ADDR_TSNETRXB_DATA_0    EPD
+     EPD_OFF_TS_NET_TX_B  ADDR_TSNETTXB_DATA_0    EPD
+     EPD_OFF_TS_NET_RX_A  ADDR_TSNETRXA_DATA_0    EPD
+     EPD_OFF_NF_COUNT_A   ADDR_NFCNTA_DATA_0      EPD
+     EPD_OFF_NF_COUNT_B   ADDR_NFCNTB_DATA_0      EPD
+     EPD_OFF_NF_DROP_A    ADDR_NFDRPA_DATA_0      EPD
+     EPD_OFF_NF_DROP_B    ADDR_NFDRPB_DATA_0      EPD
+}
+# Смещения NET_OFF_*/DE_OFF_* лежат вне загруженного выше epd-блока -- берём их
+# из исходника тем же способом, что и epd-часть.
+set fh [open $::REPO/scripts/vivado/jtag_ctrl.tcl r]
+foreach line [split [read $fh] "\n"] {
+     if {[regexp {^set ::(\w+_OFF_\w+)\s+(0x[0-9a-fA-F]+)} $line -> nm vl]} {
+          set ::$nm [expr {$vl + 0}]
+     }
+}
+close $fh
+
+set map_bad 0
+set map_n 0
+foreach {tclname hdlname which} $MAP {
+     incr map_n
+     if {![info exists ::$tclname]} {
+          puts "  FAIL нет переменной ::$tclname" ; incr fails ; incr map_bad ; continue
+     }
+     set want [set ::$tclname]
+     set d [set ::$which]
+     if {![dict exists $d $hdlname]} {
+          puts "  FAIL нет $hdlname в HDL-карте $which" ; incr fails ; incr map_bad ; continue
+     }
+     set got [dict get $d $hdlname]
+     if {$want != $got} {
+          puts [format "  FAIL %s=0x%02x, а %s=0x%02x" $tclname $want $hdlname $got]
+          incr fails ; incr map_bad
+     }
+}
+ok "сверено $map_n смещений в трёх картах (net, dual_echo, probe)" [expr {$map_bad == 0}]
+
 puts ""
 if {$fails == 0} { puts "ВСЁ ЗЕЛЁНОЕ" } else { puts "ОТКАЗОВ: $fails" ; exit 1 }

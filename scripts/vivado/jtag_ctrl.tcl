@@ -412,14 +412,21 @@ proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
 #
 # The kernel contains a client (port 0) and an echo server (port 1). A packet
 # is sent on a trigger, travels around the loop through the cable and comes
-# back; the kernel latches four raw timestamps and the host computes the
-# intervals.
+# back. EIGHT raw timestamps are latched and the host computes the intervals:
+# four small t on the kernel ports, and four big T from the axis_net_* taps that
+# split "the network" into stack and wire. All eight come from ONE cycle counter
+# in the wrapper, which is why the differences are meaningful.
+#
+# A bitstream built before the taps answers 0 on the four T registers; the host
+# detects that and prints four intervals instead of seven rather than computing
+# nonsense from zeros.
 #
 # Usage:
 #     echo_bringup_dual 0a01d498 000a35029de5 0a01d499 000a35029de6
 #     epd_configure 0a01d499 7001 64
 #     epd_enable 1
 #     epd_status                  ; # check that the connection opened
+#     epd_net_status              ; # are the taps alive? (before measuring)
 #     epd_collect 20              ; # 20 samples with statistics
 #
 # OFFSETS come from the HDL control wrapper, which is now the source of truth:
@@ -604,6 +611,12 @@ proc epd_status {{n 1}} {
           puts "     Check addressing (same /24, different last octets) and vio_dump."
      } elseif {$snt > 0 && $erx == 0} {
           puts "  -> the request never reached port 1: link, cable or CMAC placement"
+          # The taps split this further than the kernel counters can: if the tap
+          # on channel A counted the frame, it did leave the FPGA and the fault
+          # is in the cable or the far CMAC; if it did not, the request never got
+          # past the local stack. Worth one extra command before reaching for
+          # vio_dump.
+          puts "     epd_net_status tells \"left the FPGA\" from \"never got out\""
      } elseif {$erx > 0 && $ech == 0} {
           puts "  -> the echo RECEIVED the request but never sent a reply."
           puts "     That is inside the kernel, not the network: the echo is stuck"
@@ -623,7 +636,7 @@ proc _epd_state {v} {
      }
 }
 
-# One sample: pull the trigger, wait for sampleReady, read the four values.
+# One sample: pull the trigger, wait for sampleReady, read the eight values.
 #
 # There is no read race by construction: until the trigger is pulled again no
 # new packet is sent and the registers do not change.
