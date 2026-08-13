@@ -28,7 +28,14 @@
 # csim). Врезки от ядра не зависят: axis_net_* в него не заходят, поэтому в
 # tb_probe_taps.sv стоит заглушка вместо ядра.
 #
-# КОД ВОЗВРАТА: 0 если все тестбенчи напечатали «ВСЁ ЗЕЛЁНОЕ», иначе 1 --
+# ПОЧЕМУ СООБЩЕНИЯ ТЕСТБЕНЧЕЙ НА ЛАТИНИЦЕ. $display в xsim 2024.1 портит
+# многобайтовые символы: строка «строба НЕТ -- отсечён МАРКЕРОМ» печаталась как
+# «Т --». Ни [255:0], ни string, ни макрос вместо задачи это не лечат -- дело в
+# самом выводе. Чисто ASCII-строки печатаются верно всегда, поэтому сообщения
+# англоязычные. КОММЕНТАРИИ в тестбенчах остаются русскими: их читают в файле,
+# а не через симулятор.
+#
+# КОД ВОЗВРАТА: 0 если все тестбенчи напечатали «ALL GREEN», иначе 1 --
 # чтобы можно было ставить в цепочку.
 
 set -u
@@ -78,7 +85,7 @@ run_one () {
      # отбрасывая шапку самого xsim.
      sed -n '/^=== /,$p' "$tb.sim.log"
 
-     if grep -q "ВСЁ ЗЕЛЁНОЕ" "$tb.sim.log"; then
+     if grep -q "ALL GREEN" "$tb.sim.log"; then
           :
      else
           echo "*** $tb НЕ ПРОШЁЛ. Полный лог: $WORK/$tb.sim.log"
@@ -97,6 +104,17 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "taps" ]; then
      run_one tb_probe_taps \
           "$HDL_DIR/net_frame_filter.v $HDL_DIR/probe_control_s_axi.v \
            $HDL_DIR/hls_echo_probe_dual_krnl_wrapper.sv $TB_DIR/tb_probe_taps.sv"
+fi
+
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "ctrl" ]; then
+     # tb_probe_ctrl использует ТУ ЖЕ заглушку ядра, что объявлена в
+     # tb_probe_taps.sv, поэтому оба файла компилируются вместе. Дублировать
+     # заглушку (182 порта) во втором файле значило бы завести второе место,
+     # которое надо править при каждом изменении обёртки.
+     run_one tb_probe_ctrl \
+          "$HDL_DIR/net_frame_filter.v $HDL_DIR/probe_control_s_axi.v \
+           $HDL_DIR/hls_echo_probe_dual_krnl_wrapper.sv \
+           $TB_DIR/tb_probe_taps.sv $TB_DIR/tb_probe_ctrl.sv"
 fi
 
 echo ""

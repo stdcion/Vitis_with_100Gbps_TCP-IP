@@ -149,116 +149,116 @@ module tb_net_frame_filter;
           rst_n = 1'b1;
           repeat (2) @(negedge clk);
 
-          `check("после сброса счётчики нулевые", (count_ours == 0) && (count_drop == 0));
+          `check("counters are zero after reset", (count_ours == 0) && (count_drop == 0));
 
           // ── 1. норма: minWords=2 ────────────────────────────────────────
-          $display("\n[1] наш кадр среди служебных, minWords=2");
+          $display("\n[1] our frame among service frames, minWords=2");
           min_words = 32'd2;
           s0 = strobes;
           send_frame(1, 1, 1'b0);   // ARP     -- 1 слово
           send_frame(2, 2, 1'b1);   // НАШ     -- 2 слова + маркер
           send_frame(3, 1, 1'b0);   // ACK     -- 1 слово
           repeat (2) @(negedge clk);
-          `check("ровно один строб", (strobes - s0) == 1);
-          `check("строб на НАШЕМ кадре (tag=2)", last_strobe_tag == 2);
+          `check("exactly one strobe", (strobes - s0) == 1);
+          `check("strobe on OUR frame (tag=2)", last_strobe_tag == 2);
           `check("count_ours=1", count_ours == 1);
           `check("count_drop=2", count_drop == 2);
 
           // ── 2. SYN с опциями: длину проходит, маркер нет ─────────────────
-          $display("\n[2] TCP SYN с опциями (2 слова, без маркера)");
+          $display("\n[2] TCP SYN with options (2 words, no marker)");
           s0 = strobes; d0 = count_drop;
           send_frame(4, 2, 1'b0);
           repeat (2) @(negedge clk);
-          `check("строба НЕТ -- отсечён МАРКЕРОМ", (strobes - s0) == 0);
-          `check("посчитан как отброшенный", count_drop == d0 + 1);
+          `check("NO strobe -- rejected by the MARKER", (strobes - s0) == 0);
+          `check("counted as dropped", count_drop == d0 + 1);
 
           // ── 3. SYN прямо перед нашим кадром ──────────────────────────────
-          $display("\n[3] SYN, сразу за ним наш кадр");
+          $display("\n[3] SYN, immediately followed by our frame");
           s0 = strobes;
           send_frame(5, 2, 1'b0);
           send_frame(6, 2, 1'b1);
           repeat (2) @(negedge clk);
-          `check("ровно один строб", (strobes - s0) == 1);
-          `check("строб на НАШЕМ (tag=6), не на SYN", last_strobe_tag == 6);
+          `check("exactly one strobe", (strobes - s0) == 1);
+          `check("strobe on OURS (tag=6), not on the SYN", last_strobe_tag == 6);
 
           // ── 4. ЛОВУШКА: односоловный кадр сразу ПОСЛЕ нашего ────────────
           //
           // marker_seen ещё держит наш маркер. При minWords=1 длина не
           // спасает, и без ветки single_word чужой ACK дал бы ложный строб.
-          $display("\n[4] ЛОВУШКА: односоловный ACK после нашего, minWords=1");
+          $display("\n[4] TRAP: single-word ACK right after ours, minWords=1");
           min_words = 32'd1;
           s0 = strobes;
           send_frame(7, 2, 1'b1);   // наш
           send_frame(8, 1, 1'b0);   // ACK, БЕЗ маркера
           repeat (2) @(negedge clk);
-          `check("ровно один строб", (strobes - s0) == 1);
-          `check("строб на НАШЕМ (tag=7), ACK не просочился", last_strobe_tag == 7);
+          `check("exactly one strobe", (strobes - s0) == 1);
+          `check("strobe on OURS (tag=7), the ACK did not slip through", last_strobe_tag == 7);
 
           // ── 5. то же при minWords=0 ──────────────────────────────────────
-          $display("\n[5] то же при minWords=0 (длина выключена совсем)");
+          $display("\n[5] same at minWords=0 (length check disabled entirely)");
           min_words = 32'd0;
           s0 = strobes;
           send_frame(9, 2, 1'b1);
           send_frame(10, 1, 1'b0);
           send_frame(11, 1, 1'b0);
           repeat (2) @(negedge clk);
-          `check("ровно один строб", (strobes - s0) == 1);
-          `check("строб на НАШЕМ (tag=9)", last_strobe_tag == 9);
+          `check("exactly one strobe", (strobes - s0) == 1);
+          `check("strobe on OURS (tag=9)", last_strobe_tag == 9);
 
           // ── 6. свип по размерам ──────────────────────────────────────────
-          $display("\n[6] свип: minWords по формуле, наш кадр всегда ловится");
+          $display("\n[6] sweep: minWords by formula, our frame always caught");
           // msgBytes 32,64->2  128->3  256->5  512->9  1024->17  1500->25
           min_words = 32'd2;  s0 = strobes; send_frame(20, 2,  1'b1);
-          repeat (2) @(negedge clk); `check("msg<=64  (2 слова)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg<=64  (2 words)",  (strobes-s0)==1);
           min_words = 32'd3;  s0 = strobes; send_frame(21, 3,  1'b1);
-          repeat (2) @(negedge clk); `check("msg=128  (3 слова)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=128  (3 words)",  (strobes-s0)==1);
           min_words = 32'd5;  s0 = strobes; send_frame(22, 5,  1'b1);
-          repeat (2) @(negedge clk); `check("msg=256  (5 слов)",   (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=256  (5 words)",   (strobes-s0)==1);
           min_words = 32'd9;  s0 = strobes; send_frame(23, 9,  1'b1);
-          repeat (2) @(negedge clk); `check("msg=512  (9 слов)",   (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=512  (9 words)",   (strobes-s0)==1);
           min_words = 32'd17; s0 = strobes; send_frame(24, 17, 1'b1);
-          repeat (2) @(negedge clk); `check("msg=1024 (17 слов)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=1024 (17 words)",  (strobes-s0)==1);
           min_words = 32'd25; s0 = strobes; send_frame(25, 25, 1'b1);
-          repeat (2) @(negedge clk); `check("msg=1500 (25 слов)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=1500 (25 words)",  (strobes-s0)==1);
 
           // ── 7. порог завышен: режет ВСЁ, включая наш кадр ────────────────
-          $display("\n[7] minWords завышен -- фильтр режет всё");
+          $display("\n[7] minWords too high -- filter rejects everything");
           min_words = 32'd25;
           s0 = strobes; d0 = count_drop;
           send_frame(30, 2, 1'b1);   // наш, но всего 2 слова
           repeat (2) @(negedge clk);
-          `check("строба нет", (strobes - s0) == 0);
-          `check("ушёл в drop (это и видно как passed=0 при растущем dropped)", count_drop == d0 + 1);
+          `check("no strobe", (strobes - s0) == 0);
+          `check("went to drop (this is what passed=0 with rising dropped looks like)", count_drop == d0 + 1);
 
           // ── 8. backpressure и паузы ──────────────────────────────────────
           //
           // ГЛАВНОЕ, ЧЕГО НЕ ВИДИТ ПИТОНОВСКАЯ МОДЕЛЬ: там beat подаётся
           // вызовом функции, а здесь tready реально снимается. Если бы в .v
           // tready забыли в условии beat, счёт слов уехал бы именно тут.
-          $display("\n[8] паузы и backpressure не ломают счёт слов");
+          $display("\n[8] stalls and backpressure do not break the word count");
           min_words = 32'd3;
           s0 = strobes;
           send_frame_stalled(40, 3, 1'b1);
           repeat (2) @(negedge clk);
-          `check("наш 3-словный кадр опознан несмотря на паузы", (strobes - s0) == 1);
-          `check("строб на нём (tag=40)", last_strobe_tag == 40);
+          `check("our 3-word frame recognised despite the stalls", (strobes - s0) == 1);
+          `check("strobe on it (tag=40)", last_strobe_tag == 40);
 
           // ── 9. сброс обнуляет счётчики ───────────────────────────────────
-          $display("\n[9] сброс обнуляет счётчики");
+          $display("\n[9] reset clears the counters");
           @(negedge clk); rst_n = 1'b0;
           repeat (3) @(negedge clk); rst_n = 1'b1;
           @(negedge clk);
-          `check("count_ours=0 после сброса", count_ours == 0);
-          `check("count_drop=0 после сброса", count_drop == 0);
+          `check("count_ours=0 after reset", count_ours == 0);
+          `check("count_drop=0 after reset", count_drop == 0);
           // и логика жива после сброса
           min_words = 32'd2; s0 = strobes;
           send_frame(50, 2, 1'b1);
           repeat (2) @(negedge clk);
-          `check("после сброса фильтр работает", (strobes - s0) == 1);
+          `check("filter works after reset", (strobes - s0) == 1);
 
           $display("");
-          if (errors == 0) $display("=== tb_net_frame_filter: ВСЁ ЗЕЛЁНОЕ ===");
-          else             $display("=== tb_net_frame_filter: ОТКАЗОВ %0d ===", errors);
+          if (errors == 0) $display("=== tb_net_frame_filter: ALL GREEN ===");
+          else             $display("=== tb_net_frame_filter: FAILURES %0d ===", errors);
           $finish;
      end
 
@@ -266,7 +266,7 @@ module tb_net_frame_filter;
      // не будет крутиться вечно на сборочной машине.
      initial begin
           #500000;
-          $display("*** TIMEOUT: тестбенч не завершился");
+          $display("*** TIMEOUT: testbench did not finish");
           $finish;
      end
 

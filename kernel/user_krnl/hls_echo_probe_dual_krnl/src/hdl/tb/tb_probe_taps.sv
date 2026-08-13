@@ -471,26 +471,26 @@ module tb_probe_taps;
           repeat (4) @(negedge clk);
 
           // ── 1. minWords: сброс в 2, RW ───────────────────────────────────
-          $display("\n[1] регистр minWords");
+          $display("\n[1] minWords register");
           axi_read(A_MINWORDS, v);
-          `check("сброс в 2 (не 0 -- иначе фильтр пропускал бы ARP/ACK)", v == 32'd2);
+          `check("reset value 2 (not 0 -- at 0 the filter would pass ARP/ACK)", v == 32'd2);
           axi_write(A_MINWORDS, 32'd5);
           axi_read(A_MINWORDS, v);
-          `check("записывается и читается", v == 32'd5);
+          `check("written and read back", v == 32'd5);
           axi_write(A_MINWORDS, 32'd2);
 
           // ── 2. таймстемпы нулевые до трафика ─────────────────────────────
-          $display("\n[2] до трафика таймстемпы нулевые");
+          $display("\n[2] timestamps are zero before any traffic");
           axi_read(A_TS_TX_A, t1p); axi_read(A_TS_RX_B, t2p);
           axi_read(A_TS_TX_B, t1);  axi_read(A_TS_RX_A, t2);
-          `check("все четыре = 0", (t1p==0)&&(t2p==0)&&(t1==0)&&(t2==0));
+          `check("all four are 0", (t1p==0)&&(t2p==0)&&(t1==0)&&(t2==0));
 
           // ── 3. ГЛАВНОЕ: каждый T приходит от СВОЕЙ врезки ────────────────
           //
           // Кадры разной длины в разные врезки, с паузами. Если каналы
           // перепутаны местами, порядок таймстемпов не совпадёт.
           // Круг: T1'(tx_a) -> T2'(rx_b) -> T1(tx_b) -> T2(rx_a).
-          $display("\n[3] соответствие врезка -> регистр (круг T1'->T2'->T1->T2)");
+          $display("\n[3] tap -> register mapping (loop T1'->T2'->T1->T2)");
           send(0, 2, 1'b1); repeat (10) @(negedge clk);   // T1'
           send(1, 3, 1'b1); repeat (10) @(negedge clk);   // T2'
           send(2, 4, 1'b1); repeat (10) @(negedge clk);   // T1
@@ -499,32 +499,32 @@ module tb_probe_taps;
           axi_read(A_TS_TX_A, t1p); axi_read(A_TS_RX_B, t2p);
           axi_read(A_TS_TX_B, t1);  axi_read(A_TS_RX_A, t2);
           $display("     T1'=%0d T2'=%0d T1=%0d T2=%0d", t1p, t2p, t1, t2);
-          `check("все четыре ненулевые", (t1p!=0)&&(t2p!=0)&&(t1!=0)&&(t2!=0));
-          `check("T1' < T2' (запрос ушёл раньше, чем пришёл)", t1p < t2p);
-          `check("T2' < T1  (пришёл раньше, чем ответ ушёл)",  t2p < t1);
-          `check("T1  < T2  (ответ ушёл раньше, чем вернулся)", t1  < t2);
-          `check("все четыре РАЗНЫЕ (иначе один регистр на всех)", (t1p!=t2p)&&(t2p!=t1)&&(t1!=t2)&&(t1p!=t2));
+          `check("all four are non-zero", (t1p!=0)&&(t2p!=0)&&(t1!=0)&&(t2!=0));
+          `check("T1' < T2' (request left before it arrived)", t1p < t2p);
+          `check("T2' < T1  (arrived before the reply left)",  t2p < t1);
+          `check("T1  < T2  (reply left before it came back)", t1  < t2);
+          `check("all four DIFFER (otherwise one register serves all)", (t1p!=t2p)&&(t2p!=t1)&&(t1!=t2)&&(t1p!=t2));
 
           // ── 4. счётчики кадров по каналам ────────────────────────────────
-          $display("\n[4] счётчики кадров: канал A = tx_a+rx_a, B = tx_b+rx_b");
+          $display("\n[4] frame counters: channel A = tx_a+rx_a, B = tx_b+rx_b");
           axi_read(A_NF_CNT_A, ca); axi_read(A_NF_CNT_B, cb);
           $display("     countA=%0d countB=%0d", ca, cb);
-          `check("A = 2 (по одному кадру на tx_a и rx_a)", ca == 32'd2);
-          `check("B = 2 (по одному кадру на tx_b и rx_b)", cb == 32'd2);
+          `check("A = 2 (one frame each on tx_a and rx_a)", ca == 32'd2);
+          `check("B = 2 (one frame each on tx_b and rx_b)", cb == 32'd2);
 
           // ── 5. чужой кадр: drop растёт, таймстемп НЕ меняется ────────────
-          $display("\n[5] чужой кадр (без маркера) не сдвигает таймстемп");
+          $display("\n[5] a foreign frame (no marker) does not move the timestamp");
           axi_read(A_TS_TX_A, t1p);
           axi_read(A_NF_DRP_A, da);
           send(0, 2, 1'b0);              // SYN-подобный: 2 слова, маркера нет
           repeat (10) @(negedge clk);
           axi_read(A_TS_TX_A, v);
-          `check("таймстемп T1' не изменился", v == t1p);
+          `check("timestamp T1' did not change", v == t1p);
           axi_read(A_NF_DRP_A, db);
-          `check("dropA вырос", db == da + 1);
+          `check("dropA increased", db == da + 1);
 
           // ── 6. односоловный кадр после нашего (ловушка single_word) ──────
-          $display("\n[6] ловушка: односоловный кадр после нашего, minWords=1");
+          $display("\n[6] trap: single-word frame right after ours, minWords=1");
           axi_write(A_MINWORDS, 32'd1);
           send(2, 2, 1'b1);              // наш в tx_b
           repeat (6) @(negedge clk);
@@ -532,34 +532,34 @@ module tb_probe_taps;
           send(2, 1, 1'b0);              // односоловный чужой туда же
           repeat (6) @(negedge clk);
           axi_read(A_TS_TX_B, v);
-          `check("таймстемп T1 не сдвинулся чужим односоловным", v == t1);
+          `check("timestamp T1 not moved by a foreign single-word frame", v == t1);
           axi_write(A_MINWORDS, 32'd2);
 
           // ── 7. прозрачность за весь прогон ───────────────────────────────
-          $display("\n[7] прозрачность врезок (проверялась каждый такт)");
-          `check("passthrough ни разу не исказил шину", pass_err == 0);
+          $display("\n[7] tap transparency (checked every cycle)");
+          `check("passthrough never distorted the bus", pass_err == 0);
 
           // ── 8. backpressure проходит насквозь ────────────────────────────
-          $display("\n[8] tready от приёмника доходит до источника");
+          $display("\n[8] tready from the sink reaches the source");
           @(negedge clk); sink_tx_a_tr = 1'b0;
           @(negedge clk);
-          `check("tready=0 виден на входе врезки", i_tx_a_tr == 1'b0);
+          `check("tready=0 visible at the tap input", i_tx_a_tr == 1'b0);
           @(negedge clk); sink_tx_a_tr = 1'b1;
           @(negedge clk);
-          `check("tready=1 виден на входе врезки", i_tx_a_tr == 1'b1);
+          `check("tready=1 visible at the tap input", i_tx_a_tr == 1'b1);
 
           $display("");
           if (errors == 0 && pass_err == 0)
-               $display("=== tb_probe_taps: ВСЁ ЗЕЛЁНОЕ ===");
+               $display("=== tb_probe_taps: ALL GREEN ===");
           else
-               $display("=== tb_probe_taps: ОТКАЗОВ %0d (прозрачность: %0d) ===",
+               $display("=== tb_probe_taps: FAILURES %0d (transparency: %0d) ===",
                         errors, pass_err);
           $finish;
      end
 
      initial begin
           #2000000;
-          $display("*** TIMEOUT: тестбенч не завершился");
+          $display("*** TIMEOUT: testbench did not finish");
           $finish;
      end
 
