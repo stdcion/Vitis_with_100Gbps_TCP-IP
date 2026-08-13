@@ -17,8 +17,19 @@ sc=hls_echo_probe_dual_krnl_1.m_axis_tcp_read_pkg_a:network_krnl_1.s_axis_tcp_re
 sc=hls_echo_probe_dual_krnl_1.m_axis_tcp_tx_meta_a:network_krnl_1.s_axis_tcp_tx_meta
 sc=hls_echo_probe_dual_krnl_1.m_axis_tcp_tx_data_a:network_krnl_1.s_axis_tcp_tx_data
 
-sc=cmac_krnl_1.axis_net_rx:network_krnl_1.axis_net_rx
-sc=network_krnl_1.axis_net_tx:cmac_krnl_1.axis_net_tx
+# axis_net_* канала A идёт ЧЕРЕЗ ОБЁРТКУ user-ядра, а не напрямую в CMAC.
+# Обёртка пробрасывает шину проводами (passthrough без регистра, ноль
+# добавленных тактов) и ставит на ней большие T -- см. net_frame_filter.v и
+# docs/latency_net_probe_design.md. HLS-ядро об этих портах не знает.
+#
+# ПОРЯДОК ВАЖЕН: перепутанные каналы дадут собираемый BD с числами, похожими на
+# «асимметрию тракта», -- то есть обманут. Мнемоника: у ядра s_axis_* всегда
+# ВХОД (кто-то отдаёт нам), m_axis_* всегда ВЫХОД (мы отдаём дальше), суффикс
+# _a/_b -- номер канала, tx/rx -- направление относительно сети.
+sc=network_krnl_1.axis_net_tx:hls_echo_probe_dual_krnl_1.s_axis_net_tx_a
+sc=hls_echo_probe_dual_krnl_1.m_axis_net_tx_a:cmac_krnl_1.axis_net_tx
+sc=cmac_krnl_1.axis_net_rx:hls_echo_probe_dual_krnl_1.s_axis_net_rx_a
+sc=hls_echo_probe_dual_krnl_1.m_axis_net_rx_a:network_krnl_1.axis_net_rx
 
 sc=network_krnl_2.m_axis_udp_rx:hls_echo_probe_dual_krnl_1.s_axis_udp_rx_b
 sc=network_krnl_2.m_axis_udp_rx_meta:hls_echo_probe_dual_krnl_1.s_axis_udp_rx_meta_b
@@ -38,5 +49,8 @@ sc=hls_echo_probe_dual_krnl_1.m_axis_tcp_read_pkg_b:network_krnl_2.s_axis_tcp_re
 sc=hls_echo_probe_dual_krnl_1.m_axis_tcp_tx_meta_b:network_krnl_2.s_axis_tcp_tx_meta
 sc=hls_echo_probe_dual_krnl_1.m_axis_tcp_tx_data_b:network_krnl_2.s_axis_tcp_tx_data
 
-sc=cmac_krnl_2.axis_net_rx:network_krnl_2.axis_net_rx
-sc=network_krnl_2.axis_net_tx:cmac_krnl_2.axis_net_tx
+# axis_net_* канала B -- то же самое, что для канала A выше.
+sc=network_krnl_2.axis_net_tx:hls_echo_probe_dual_krnl_1.s_axis_net_tx_b
+sc=hls_echo_probe_dual_krnl_1.m_axis_net_tx_b:cmac_krnl_2.axis_net_tx
+sc=cmac_krnl_2.axis_net_rx:hls_echo_probe_dual_krnl_1.s_axis_net_rx_b
+sc=hls_echo_probe_dual_krnl_1.m_axis_net_rx_b:network_krnl_2.axis_net_rx

@@ -303,6 +303,35 @@ foreach bif [ipx::get_bus_interfaces -of_objects [ipx::current_core]] {
 set_property value [join $busifs ":"] $assoc
 puts "ASSOCIATED_BUSIF: [join $busifs :]"
 
+# ── восемь интерфейсов врезки обязаны быть распознаны ────────────────────────
+#
+# axis_net_* -- единственные AXI-Stream порты обёртки, которые НЕ идут в
+# HLS-ядро (сквозной проход мимо него, см. шапку обёртки). Значит двусторонняя
+# сверка портов выше их не касается вовсе: она смотрит только на инстанс
+# HLS-ядра. Если Vivado не выведет из имён шинный интерфейс, порты останутся
+# отдельными сигналами, connect_bd_intf_net в build_bd.tcl не найдёт пин, и BD
+# упадёт -- но упадёт далеко отсюда и с невнятным сообщением про несуществующий
+# интерфейс.
+#
+# Проверяем здесь, где понятно, что случилось. Ждём ровно 8: s/m x tx/rx x a/b.
+set net_bifs {}
+foreach nm $busifs {
+     if {[string match "*axis_net_*" $nm]} { lappend net_bifs $nm }
+}
+if {[llength $net_bifs] != 8} {
+     puts ""
+     puts "  Найдено интерфейсов axis_net_*: [llength $net_bifs], ждали 8"
+     foreach nm [lsort $net_bifs] { puts "    $nm" }
+     puts ""
+     puts "  Vivado выводит шинный интерфейс из имён портов:"
+     puts "  <имя>_tvalid/_tready/_tdata/_tkeep/_tlast. Если суффиксы не те или"
+     puts "  какой-то из пяти отсутствует, интерфейс не соберётся, а порты"
+     puts "  останутся россыпью сигналов."
+     error "не все врезки axis_net_* распознаны как AXI-Stream — правь имена\
+            портов в src/hdl/hls_echo_probe_dual_krnl_wrapper.sv"
+}
+puts "врезки axis_net_*: все 8 интерфейсов распознаны"
+
 ipx::update_checksums [ipx::current_core]
 ipx::check_integrity [ipx::current_core]
 ipx::save_core [ipx::current_core]
@@ -325,4 +354,7 @@ puts "  счётчики:  0x40 connAtt  0x44 sent  0x48 recv  0x4c timeout"
 puts "             0x50 echo  0x54 listenAtt  0x58 portState"
 puts "  таймстемпы:0x60 tsRequest  0x64 tsEchoIn  0x68 tsEchoOut  0x6c tsReply"
 puts "             0x70 sampleReady"
+puts "  врезки:    0x74 minWords(RW)  0x78 tsNetTxA  0x7c tsNetRxB"
+puts "             0x80 tsNetTxB  0x84 tsNetRxA"
+puts "             0x88 nfCountA  0x8c nfCountB  0x90 nfDropA  0x94 nfDropB"
 puts "=========================================================="

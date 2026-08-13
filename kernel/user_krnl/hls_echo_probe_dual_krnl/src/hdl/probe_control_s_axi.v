@@ -63,10 +63,47 @@
 //   0x68  tsEchoOut      RO  t1
 //   0x6c  tsReply        RO  t2
 //   0x70  sampleReady    RO  1 = четвёрка выше готова и не запрашивалась
+//   -- врезки на axis_net_*: большие T (см. latency_net_probe_design.md) --
+//   0x74  minWords       RW  порог фильтра кадров, слов на шине 512 бит
+//   0x78  tsNetTxA       RO  T1' -- запрос ушёл в провод (порт 0)
+//   0x7c  tsNetRxB       RO  T2' -- запрос пришёл из провода (порт 1)
+//   0x80  tsNetTxB       RO  T1  -- ответ ушёл в провод (порт 1)
+//   0x84  tsNetRxA       RO  T2  -- ответ пришёл из провода (порт 0)
+//   0x88  netFrameCountA RO  кадров прошло фильтр, канал A (tx0+rx0)
+//   0x8c  netFrameCountB RO  то же, канал B
+//   0x90  netFrameDropA  RO  кадров отсеяно (ARP/ACK/ICMP), канал A
+//   0x94  netFrameDropB  RO  то же, канал B
 //
 // Шаг 8 байт у RW-регистров сохранён нарочно -- он совпадает с раскладкой,
 // которую даёт HLS для входных скаляров. RO-регистры идут подряд по 4 байта:
 // ap_vld-полей у них нет, потому что это просто провода из ядра.
+//
+// ПОЧЕМУ minWords НА 0x74, А НЕ В РЯДУ RW. Проект врезок
+// (latency_net_probe_design.md) предлагал положить его на 0x40 -- следующее
+// место в ряду RW с шагом 8 -- и сдвинуть весь RO-блок на 0x44. Это сдвинуло бы
+// восемь уже работающих смещений в трёх файлах (здесь, в jtag_ctrl.tcl и в
+// шапке package_*.tcl) ради косметики раскладки. Расхождение смещений между
+// этими файлами -- ровно тот класс ошибки, который на плате выглядит как
+// «ядро не отвечает», поэтому ничего из работающего не двигаем: minWords
+// встаёт в начало НОВОГО блока, а ряд RW остаётся как был.
+//
+// ЗАЧЕМ ЭТИ ЧЕТЫРЕ ТОЧКИ. Четыре маленьких t дают NET_FWD = t2'-t1' одним
+// числом, в котором слиты стек TX, CMAC, кабель, CMAC и стек RX. Большие T
+// разбивают его на три части:
+//
+//     t1' ─ стек 0 TX ─ T1' ─ CMAC+кабель+CMAC ─ T2' ─ стек 1 RX ─ t2'
+//
+// EXT_* (между двумя T) -- то, что нельзя улучшить кодом. Всё остальное можно,
+// и для бюджета гейтвея нужно именно это разделение.
+//
+// СМЕЩЕНИЕ МЕЖДУ t И T. У точек t строб -- это ap_vld зарегистрированного
+// выхода HLS-ядра, у точек T -- прямое tvalid&tready&tlast с шины. Пути разные,
+// и t может отставать от T на такт. Влияет ТОЛЬКО на смешанные интервалы
+// (STACK_*, где вычитается T-t); однородные не затронуты -- EXT_* считаются из
+// двух T, а RTT и ECHO из двух t. Величину не угадывать, а измерить: она равна
+// расхождению STACK_0_TX+EXT_A+STACK_1_RX против NET_FWD, известного независимо.
+// Поправка одна и та же для всех четырёх STACK_*, поэтому в железе её нет --
+// она появится константой в jtag_ctrl.tcl после первого замера.
 //
 // ОТКУДА БЕРУТСЯ ТАЙМСТЕМПЫ. НЕ из ядра -- их ставит обёртка
 // (hls_echo_probe_dual_krnl_wrapper.sv) по ap_vld счётчиков событий, потому что
@@ -128,6 +165,12 @@ module probe_control_s_axi
     output wire [31:0]                   listenPort,
     output wire [31:0]                   msgBytes,
     output wire [31:0]                   triggerGo,
+    // порог фильтра кадров -> в ЧЕТЫРЕ инстанса net_frame_filter в обёртке.
+    // Это HDL, а не HLS: один wire на четыре потребителя -- обычное дело, и
+    // проблема несимметричного размножения скаляра (из-за которой в ядре
+    // пришлось делать enableConn/enableTraffic/enableListen) здесь не
+    // существует в принципе.
+    output wire [31:0]                   minWords,
 
     // телеметрия <- из ядра проводами
     input  wire [31:0]                   connAttempts,
@@ -142,7 +185,17 @@ module probe_control_s_axi
     input  wire [31:0]                   tsEchoIn,
     input  wire [31:0]                   tsEchoOut,
     input  wire [31:0]                   tsReply,
-    input  wire [31:0]                   sampleReady
+    input  wire [31:0]                   sampleReady,
+
+    // врезки на axis_net_*: таймстемпы и счётчики кадров <- из обёртки
+    input  wire [31:0]                   tsNetTxA,
+    input  wire [31:0]                   tsNetRxB,
+    input  wire [31:0]                   tsNetTxB,
+    input  wire [31:0]                   tsNetRxA,
+    input  wire [31:0]                   netFrameCountA,
+    input  wire [31:0]                   netFrameCountB,
+    input  wire [31:0]                   netFrameDropA,
+    input  wire [31:0]                   netFrameDropB
 );
 
 //------------------------Address Info-------------------
@@ -176,6 +229,15 @@ localparam
     ADDR_TSECHOOUT_DATA_0 = 12'h068,
     ADDR_TSREPLY_DATA_0   = 12'h06c,
     ADDR_SMPREADY_DATA_0  = 12'h070,
+    ADDR_MINWORDS_DATA_0  = 12'h074,
+    ADDR_TSNETTXA_DATA_0  = 12'h078,
+    ADDR_TSNETRXB_DATA_0  = 12'h07c,
+    ADDR_TSNETTXB_DATA_0  = 12'h080,
+    ADDR_TSNETRXA_DATA_0  = 12'h084,
+    ADDR_NFCNTA_DATA_0    = 12'h088,
+    ADDR_NFCNTB_DATA_0    = 12'h08c,
+    ADDR_NFDRPA_DATA_0    = 12'h090,
+    ADDR_NFDRPB_DATA_0    = 12'h094,
     WRIDLE                = 2'd0,
     WRDATA                = 2'd1,
     WRRESP                = 2'd2,
@@ -212,6 +274,12 @@ localparam
     reg  [31:0]                   int_listenPort = 32'b0;
     reg  [31:0]                   int_msgBytes = 32'b0;
     reg  [31:0]                   int_triggerGo = 32'b0;
+    // Порог фильтра. Значение по сбросу 2 -- то, что нужно для msgBytes 32..64,
+    // с которых начинается свип. Ноль был бы хуже осмысленного умолчания:
+    // при min_words=0 фильтр пропускает ВСЁ, включая ARP и чистые ACK, и
+    // забытая запись minWords выглядела бы как «врезка ловит не тот кадр» --
+    // то есть как правдоподобные, но неверные числа вместо явного отказа.
+    reg  [31:0]                   int_minWords = 32'd2;
 
 //------------------------AXI write fsm------------------
 assign AWREADY = (wstate == WRIDLE);
@@ -383,6 +451,33 @@ always @(posedge ACLK) begin
                 ADDR_SMPREADY_DATA_0: begin
                     rdata <= sampleReady;
                 end
+                ADDR_MINWORDS_DATA_0: begin
+                    rdata <= int_minWords;
+                end
+                ADDR_TSNETTXA_DATA_0: begin
+                    rdata <= tsNetTxA;
+                end
+                ADDR_TSNETRXB_DATA_0: begin
+                    rdata <= tsNetRxB;
+                end
+                ADDR_TSNETTXB_DATA_0: begin
+                    rdata <= tsNetTxB;
+                end
+                ADDR_TSNETRXA_DATA_0: begin
+                    rdata <= tsNetRxA;
+                end
+                ADDR_NFCNTA_DATA_0: begin
+                    rdata <= netFrameCountA;
+                end
+                ADDR_NFCNTB_DATA_0: begin
+                    rdata <= netFrameCountB;
+                end
+                ADDR_NFDRPA_DATA_0: begin
+                    rdata <= netFrameDropA;
+                end
+                ADDR_NFDRPB_DATA_0: begin
+                    rdata <= netFrameDropB;
+                end
                 default: begin
                     rdata <= 32'b0;
                 end
@@ -400,6 +495,7 @@ assign serverPort = int_serverPort;
 assign listenPort = int_listenPort;
 assign msgBytes   = int_msgBytes;
 assign triggerGo  = int_triggerGo;
+assign minWords   = int_minWords;
 
 // int_ap_start
 always @(posedge ACLK) begin
@@ -555,6 +651,26 @@ always @(posedge ACLK) begin
     else if (ACLK_EN) begin
         if (w_hs && waddr == ADDR_TRIGGER_DATA_0)
             int_triggerGo <= (WDATA[31:0] & wmask) | (int_triggerGo & ~wmask);
+    end
+end
+
+// int_minWords
+//
+// Порог фильтра кадров на axis_net_*: сколько 512-битных слов должно быть в
+// кадре, чтобы считать его нашим. Хост пишет его вместе с msgBytes,
+// epd_configure считает сам: ceil((14+20+20+msgBytes)/64).
+//
+// Сброс НЕ в ноль, а в 2 -- то же значение, что инициализатор объявления. При
+// нуле фильтр пропускает всё подряд (frame_words >= 0 всегда истинно), то есть
+// таймстемпы штампуются по ARP и чистым ACK, а измерение молча даёт
+// правдоподобные, но неверные числа. Двойка соответствует msgBytes 32..64 --
+// тому, с чего начинается свип.
+always @(posedge ACLK) begin
+    if (ARESET)
+        int_minWords <= 32'd2;
+    else if (ACLK_EN) begin
+        if (w_hs && waddr == ADDR_MINWORDS_DATA_0)
+            int_minWords <= (WDATA[31:0] & wmask) | (int_minWords & ~wmask);
     end
 end
 

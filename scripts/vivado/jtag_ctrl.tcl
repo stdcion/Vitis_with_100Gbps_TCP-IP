@@ -463,6 +463,26 @@ set ::EPD_OFF_TS_ECHO_OUT   0x68
 set ::EPD_OFF_TS_REPLY      0x6c
 set ::EPD_OFF_SAMPLE_READY  0x70
 
+# axis_net_* probe taps: the four big T points. These split NET_FWD (one number
+# containing stack TX + CMAC + cable + CMAC + stack RX) into three parts:
+#
+#     t1' ─ stack 0 TX ─ T1' ─ CMAC+cable+CMAC ─ T2' ─ stack 1 RX ─ t2'
+#
+# EXT_* (between two T points) is what code cannot improve -- CMAC is a black
+# box, ~150-200 ns per datasheet, the cable ~5 ns/m. Everything else can be.
+#
+# minWords is RW: the frame filter threshold in 512-bit words. epd_configure
+# computes it from msgBytes, there is no need to set it by hand.
+set ::EPD_OFF_MIN_WORDS     0x74
+set ::EPD_OFF_TS_NET_TX_A   0x78
+set ::EPD_OFF_TS_NET_RX_B   0x7c
+set ::EPD_OFF_TS_NET_TX_B   0x80
+set ::EPD_OFF_TS_NET_RX_A   0x84
+set ::EPD_OFF_NF_COUNT_A    0x88
+set ::EPD_OFF_NF_COUNT_B    0x8c
+set ::EPD_OFF_NF_DROP_A     0x90
+set ::EPD_OFF_NF_DROP_B     0x94
+
 # ap_clk period, ns. Must match DEV_FREQ_MHZ in devices/<board>/device.tcl.in.
 # 165 MHz -> 6.061 ns. If the frequency changes, fix it here too, otherwise the
 # conversion to nanoseconds lies -- silently, which is the worst kind.
@@ -481,13 +501,44 @@ set ::EPD_TRIG 0
 proc epd_configure {serverIp serverPort msgBytes {n 1}} {
      set base [ouch_base_user $n]
 
+     # Two independent reasons the axis_net_* taps need msgBytes >= 32, both
+     # covered by the same number:
+     #
+     #   * below 11 bytes our frame becomes single-word (54+msgBytes <= 64) and
+     #     is indistinguishable BY LENGTH from a bare ACK;
+     #   * below 10 bytes there is nowhere to put the filter marker, which the
+     #     kernel writes into payload[4..9].
+     #
+     # Neither would fail loudly: the taps would time-stamp the wrong frame and
+     # return plausible numbers, which is worse than an error. The sweep starts
+     # at 64 bytes anyway, so refusing here costs nothing.
+     if {$msgBytes < 32} {
+          puts "epd\[$n\]: *** msgBytes=$msgBytes is below 32 -- REFUSED."
+          puts "      The axis_net_* filter needs both a frame longer than one"
+          puts "      512-bit word (to tell it from a bare ACK) and room for the"
+          puts "      marker in payload\[4..9\]. Below 32 bytes the four T"
+          puts "      timestamps would silently latch on the wrong frame."
+          puts "      Use 32 or more."
+          return 0
+     }
+
+     # Filter threshold, in 512-bit words: ceil(frame_bytes / 64), where the
+     # frame is 14 (Ethernet) + 20 (IP) + 20 (TCP) + msgBytes. Written together
+     # with msgBytes so a size sweep never leaves the threshold stale -- a
+     # threshold too high means the filter drops OUR frame too, and then the
+     # timestamps simply stop updating.
+     set frameBytes [expr {14 + 20 + 20 + $msgBytes}]
+     set minWords   [expr {($frameBytes + 63) / 64}]
+
      puts "epd\[$n\]: server=0x$serverIp:$serverPort msg=$msgBytes bytes"
+     puts "epd\[$n\]: frame=$frameBytes bytes -> minWords=$minWords"
 
      set sip [_hex2int $serverIp]
      axi_write32 [expr {$base + $::EPD_OFF_SERVER_IP}]   $sip
      axi_write32 [expr {$base + $::EPD_OFF_SERVER_PORT}] $serverPort
      axi_write32 [expr {$base + $::EPD_OFF_LISTEN_PORT}] $serverPort
      axi_write32 [expr {$base + $::EPD_OFF_MSG_BYTES}]   $msgBytes
+     axi_write32 [expr {$base + $::EPD_OFF_MIN_WORDS}]   $minWords
 
      # Verify by reading back: without this, "the kernel does not respond" is
      # indistinguishable from "the parameters were never written".
@@ -495,6 +546,19 @@ proc epd_configure {serverIp serverPort msgBytes {n 1}} {
      if {$rd != $msgBytes} {
           puts "  *** WRITE NOT CONFIRMED (msgBytes=$rd, expected $msgBytes)"
           puts "      check ouch_base_user $n and that this bitstream is loaded"
+          return 0
+     }
+     # minWords is checked separately, and on purpose: it lives in a register
+     # block added later than the rest, so a bitstream built before the taps
+     # existed answers 0 here while msgBytes above reads back correctly. That
+     # combination means "old bitstream", not "bad write", and saying so beats
+     # letting the T timestamps stay at zero with no explanation.
+     set rdw [axi_read32 [expr {$base + $::EPD_OFF_MIN_WORDS}]]
+     if {$rdw != $minWords} {
+          puts "  *** minWords NOT CONFIRMED (read $rdw, expected $minWords)"
+          puts "      msgBytes wrote fine, so the base address is right. Most"
+          puts "      likely this bitstream predates the axis_net_* taps: the"
+          puts "      four t points still work, the four T points will read 0."
           return 0
      }
      puts "  write confirmed"
@@ -564,7 +628,18 @@ proc _epd_state {v} {
 # There is no read race by construction: until the trigger is pulled again no
 # new packet is sent and the registers do not change.
 #
-# Returns {t1p t2p t1 t2}, or an empty list on timeout.
+# Returns {t1p t2p t1 t2 T1p T2p T1 T2}, or an empty list on timeout.
+#
+# The four T values come from the axis_net_* taps and are latched by the SAME
+# cycle_counter as the four t values -- that is the whole reason the taps live
+# in the wrapper rather than in a separate sniffer kernel. Reading them costs
+# four more JTAG transactions per sample, so a sample now costs ten rather than
+# six; epd_calibrate's estimate scales accordingly.
+#
+# No read race, same as before: until the trigger is pulled again no new packet
+# is sent, so none of the eight registers move while they are being read. The
+# T points are covered by the same argument -- they belong to the same packet
+# because there is only ever one packet in flight.
 proc epd_sample {{n 1} {timeout_ms 500}} {
      set base [ouch_base_user $n]
 
@@ -586,7 +661,51 @@ proc epd_sample {{n 1} {timeout_ms 500}} {
      set t1  [axi_read32 [expr {$base + $::EPD_OFF_TS_ECHO_OUT}]]
      set t2  [axi_read32 [expr {$base + $::EPD_OFF_TS_REPLY}]]
 
-     return [list $t1p $t2p $t1 $t2]
+     set T1p [axi_read32 [expr {$base + $::EPD_OFF_TS_NET_TX_A}]]
+     set T2p [axi_read32 [expr {$base + $::EPD_OFF_TS_NET_RX_B}]]
+     set T1  [axi_read32 [expr {$base + $::EPD_OFF_TS_NET_TX_B}]]
+     set T2  [axi_read32 [expr {$base + $::EPD_OFF_TS_NET_RX_A}]]
+
+     return [list $t1p $t2p $t1 $t2 $T1p $T2p $T1 $T2]
+}
+
+# Frame-filter counters from the four axis_net_* taps.
+#
+# NOT a measurement -- a liveness check, and the pair matters more than either
+# number alone:
+#
+#   * count grows, drop grows      -- normal: our frames pass, ARP/ACK dropped
+#   * count = 0, drop grows        -- the filter rejects EVERYTHING, our frame
+#                                     included. minWords too high for msgBytes.
+#   * count = 0, drop = 0          -- the tap is dead: wired to the wrong pins,
+#                                     or this bitstream predates the taps.
+#
+# Without this pair, "the T timestamps did not update" is indistinguishable
+# from "the filter is too strict" -- the same reasoning that put listenAttempts
+# and portState into the kernel.
+proc epd_net_status {{n 1}} {
+     set base [ouch_base_user $n]
+     set ca [axi_read32 [expr {$base + $::EPD_OFF_NF_COUNT_A}]]
+     set cb [axi_read32 [expr {$base + $::EPD_OFF_NF_COUNT_B}]]
+     set da [axi_read32 [expr {$base + $::EPD_OFF_NF_DROP_A}]]
+     set db [axi_read32 [expr {$base + $::EPD_OFF_NF_DROP_B}]]
+     set mw [axi_read32 [expr {$base + $::EPD_OFF_MIN_WORDS}]]
+
+     puts "epd\[$n\]: net taps: minWords=$mw"
+     puts "epd\[$n\]:   channel A (QSFP0): passed=$ca dropped=$da"
+     puts "epd\[$n\]:   channel B (QSFP1): passed=$cb dropped=$db"
+
+     foreach {ch cnt drp} [list A $ca $da B $cb $db] {
+          if {$cnt == 0 && $drp == 0} {
+               puts "  -> channel $ch tap sees NO traffic at all. Either this"
+               puts "     bitstream has no taps, or config_sp did not route"
+               puts "     axis_net_* through the wrapper on this channel."
+          } elseif {$cnt == 0} {
+               puts "  -> channel $ch drops every frame, ours included:"
+               puts "     minWords=$mw is too high. Re-run epd_configure."
+          }
+     }
+     return [list $ca $cb $da $db $mw]
 }
 
 # Subtraction modulo 2^32 -- the same as in hardware. Needed because the
@@ -594,22 +713,79 @@ proc epd_sample {{n 1} {timeout_ms 500}} {
 # across the wrap must stay correct.
 proc _epd_sub32 {a b} { return [expr {($a - $b) & 0xFFFFFFFF}] }
 
-# Computes the four intervals from the raw timestamps.
-# Returns {rtt fwd echo rev} in clock cycles.
+# Computes the intervals from the raw timestamps.
 #
-# NOTE ON THE BALANCE CHECK. fwd+echo+rev == rtt is an ALGEBRAIC IDENTITY for
-# any four numbers: (t2'-t1') + (t1-t2') + (t2-t1) collapses to (t2-t1'), and
-# it holds under modulo-2^32 arithmetic too. So the check can only fail if a
-# register was read torn -- it does NOT validate that the four values belong
-# to the same packet. Trust it as a transport check, not as a data check; use
-# the raw columns from epd_raw and an eyeball on the spread for the latter.
+# Returns {rtt fwd echo rev  s0tx extA s1rx s1tx extB s0rx} in clock cycles.
+# The first four are unchanged and stay first on purpose: callers that only
+# want them keep working with lassign as they did.
+#
+# THE FULL DECOMPOSITION OF THE LOOP, seven terms instead of three:
+#
+#     RTT = STACK_0_TX + EXT_A + STACK_1_RX + ECHO
+#                      + STACK_1_TX + EXT_B + STACK_0_RX
+#
+#   STACK_0_TX = T1' - t1'   stack of port 0: TOE + IP + merge, request to wire
+#   EXT_A      = T2' - T1'   CMAC0 + SerDes + cable + SerDes + CMAC1
+#   STACK_1_RX = t2' - T2'   stack of port 1: ip_handler + TOE RX + delivery
+#   ECHO       = t1  - t2'   the echo inside the kernel (a few cycles)
+#   STACK_1_TX = T1  - t1    stack of port 1 sending the reply
+#   EXT_B      = T2  - T1    the wire back
+#   STACK_0_RX = t2  - T2    stack of port 0 receiving the reply
+#
+# The stacks decompose into FOUR values, not two: network_krnl_1 and
+# network_krnl_2 are physically separate instances, each with its own TX and RX
+# path. Folding them into one "stack time" would lose exactly the asymmetry we
+# are looking for.
+#
+# NO "-1" CORRECTION IS APPLIED, and that is deliberate. All eight points are
+# stamped by ONE cycle_counter in the wrapper, so any latency shared between
+# event and latch cancels in the difference. The schematic in the artefact
+# writes these formulas as "T1' - t1' - 1"; that 1 belongs to the REGISTERED
+# tap variant (skid buffer, +1 cycle in the path). Ours is a plain passthrough
+# with no register, so subtracting one would introduce a one-cycle (6 ns) error
+# where none exists.
+#
+# There IS a shift that does not cancel: the t points are stamped off the ap_vld
+# of a registered HLS output, the T points off tvalid&tready&tlast straight from
+# the bus. Different paths, so t may lag T by a cycle. It affects only the MIXED
+# intervals (the four STACK_*, where T-t is subtracted); the homogeneous ones
+# are untouched -- EXT_* comes from two T values, RTT and ECHO from two t.
+# Do not guess its size: it equals the discrepancy of STACK_0_TX+EXT_A+STACK_1_RX
+# against NET_FWD, which is known independently from the four t points. That is
+# what epd_measure prints as "residual". Once measured on live hardware, it
+# becomes a constant here -- with a number taken from the measurement, not from
+# a guess.
+#
+# NOTE ON THE OLD BALANCE CHECK. fwd+echo+rev == rtt is an ALGEBRAIC IDENTITY
+# for any four numbers: (t2'-t1') + (t1-t2') + (t2-t1) collapses to (t2-t1'),
+# and it holds under modulo-2^32 arithmetic too. So it can only fail if a
+# register was read torn -- it does NOT validate that the values belong to the
+# same packet. The same is true of the seven-term sum. What is NOT an identity
+# is the residual above: it mixes two independent stamping paths, so it carries
+# real information.
 proc epd_intervals {sample} {
-     lassign $sample t1p t2p t1 t2
+     lassign $sample t1p t2p t1 t2 T1p T2p T1 T2
      set rtt [_epd_sub32 $t2  $t1p]
      set fwd [_epd_sub32 $t2p $t1p]
      set ech [_epd_sub32 $t1  $t2p]
      set rev [_epd_sub32 $t2  $t1]
-     return [list $rtt $fwd $ech $rev]
+
+     # A bitstream without the taps answers 0 on all four T registers. Return
+     # the four classic intervals and empty slots rather than nonsense: a
+     # modulo subtraction of zero would produce huge plausible-looking numbers
+     # (0 - t1' wraps to ~2^32), and those are worse than a visible gap.
+     if {$T1p == 0 && $T2p == 0 && $T1 == 0 && $T2 == 0} {
+          return [list $rtt $fwd $ech $rev {} {} {} {} {} {}]
+     }
+
+     set s0tx [_epd_sub32 $T1p $t1p]
+     set extA [_epd_sub32 $T2p $T1p]
+     set s1rx [_epd_sub32 $t2p $T2p]
+     set s1tx [_epd_sub32 $T1  $t1]
+     set extB [_epd_sub32 $T2  $T1]
+     set s0rx [_epd_sub32 $t2  $T2]
+
+     return [list $rtt $fwd $ech $rev $s0tx $extA $s1rx $s1tx $extB $s0rx]
 }
 
 # One sample with printout. Also checks the balance: the parts must add up to
@@ -621,16 +797,18 @@ proc epd_measure {{n 1}} {
           epd_status $n
           return {}
      }
-     lassign $s t1p t2p t1 t2
-     lassign [epd_intervals $s] rtt fwd ech rev
+     lassign $s t1p t2p t1 t2 T1p T2p T1 T2
+     set iv [epd_intervals $s]
+     lassign $iv rtt fwd ech rev s0tx extA s1rx s1tx extB s0rx
      set ns $::EPD_CLK_NS
 
-     # Raw counter values first. They are what the kernel actually latched;
+     # Raw counter values first. They are what the hardware actually latched;
      # everything below is arithmetic the host does on them. Printing both
      # means a suspicious interval can be re-derived by hand instead of
      # being taken on trust -- and the wrap case (t2 < t1') stays visible
      # rather than hidden behind a modulo subtraction.
-     puts "  raw: t1'=$t1p t2'=$t2p t1=$t1 t2=$t2"
+     puts "  raw t: t1'=$t1p t2'=$t2p t1=$t1 t2=$t2"
+     puts "  raw T: T1'=$T1p T2'=$T2p T1=$T1 T2=$T2"
      if {$t2 < $t1p} {
           puts "       (counter wrapped between t1' and t2 -- normal, the"
           puts "        subtraction below is modulo 2^32)"
@@ -641,7 +819,7 @@ proc epd_measure {{n 1}} {
      puts [format "  ECHO    %6d          %9.1f" $ech [expr {$ech*$ns}]]
      puts [format "  NET_REV %6d          %9.1f" $rev [expr {$rev*$ns}]]
 
-     # No "balance" line here on purpose: fwd+echo+rev == rtt is an identity
+     # No "balance" line for fwd+echo+rev == rtt on purpose: it is an identity
      # (see epd_intervals), so printing it every time advertised a check that
      # cannot fail on real data. It is still worth guarding, because a torn
      # JTAG read WOULD break it -- but that is a transport fault, so say so.
@@ -649,10 +827,55 @@ proc epd_measure {{n 1}} {
           puts "  *** TORN READ: fwd+echo+rev != rtt, which is arithmetically"
           puts "      impossible -- a register was read mid-update. Discard."
      }
-     # Raw quadruple first, then the intervals: callers that only want the
+
+     if {$s0tx eq ""} {
+          puts "  (no axis_net_* taps in this bitstream -- four t points only."
+          puts "   The seven-term decomposition needs the T points; rebuild with"
+          puts "   the taps to get it.)"
+     } else {
+          puts ""
+          puts "  --- decomposition, seven terms ---"
+          puts [format "  STACK_0_TX %6d cycles %9.1f ns   request into the wire (port 0)" \
+                    $s0tx [expr {$s0tx*$ns}]]
+          puts [format "  EXT_A      %6d        %9.1f      CMAC+cable+CMAC, forward" \
+                    $extA [expr {$extA*$ns}]]
+          puts [format "  STACK_1_RX %6d        %9.1f      wire to application (port 1)" \
+                    $s1rx [expr {$s1rx*$ns}]]
+          puts [format "  ECHO       %6d        %9.1f      inside the kernel" \
+                    $ech [expr {$ech*$ns}]]
+          puts [format "  STACK_1_TX %6d        %9.1f      reply into the wire (port 1)" \
+                    $s1tx [expr {$s1tx*$ns}]]
+          puts [format "  EXT_B      %6d        %9.1f      CMAC+cable+CMAC, reverse" \
+                    $extB [expr {$extB*$ns}]]
+          puts [format "  STACK_0_RX %6d        %9.1f      wire to measurer (port 0)" \
+                    $s0rx [expr {$s0rx*$ns}]]
+
+          # THE RESIDUAL. This is the one check here that is not an identity,
+          # and the number the whole tap exercise hinges on.
+          #
+          # STACK_0_TX + EXT_A + STACK_1_RX must equal NET_FWD, which is known
+          # independently from the four t points alone. The t and T points are
+          # stamped off DIFFERENT paths (ap_vld of a registered HLS output vs
+          # tvalid&tready&tlast straight off the bus), so a small constant
+          # residual -- a cycle or so -- is expected and is exactly the
+          # correction to fold into the four STACK_* values later.
+          #
+          # A LARGE residual means something else: the filter latched the wrong
+          # frame. Then check epd_net_status, and read the "foreign traffic"
+          # section of docs/latency_net_probe_design.md.
+          set res_f [expr {($s0tx + $extA + $s1rx) - $fwd}]
+          set res_r [expr {($s1tx + $extB + $s0rx) - $rev}]
+          puts ""
+          puts [format "  residual fwd %+d cycles, rev %+d  (t-vs-T stamping shift;" \
+                    $res_f $res_r]
+          puts "                 a cycle or two is expected, tens mean the filter"
+          puts "                 caught the wrong frame -- run epd_net_status)"
+     }
+
+     # Raw values first, then the intervals: callers that only want the
      # intervals can still lrange them out, and nothing silently discards
      # the raw data.
-     return [list $t1p $t2p $t1 $t2 $rtt $fwd $ech $rev]
+     return [concat [list $t1p $t2p $t1 $t2 $T1p $T2p $T1 $T2] $iv]
 }
 
 # Raw samples as CSV, for analysis outside Vivado.
@@ -671,22 +894,42 @@ proc epd_measure {{n 1}} {
 # Redirect it to a file the usual Tcl way if you want one:
 #     set fh [open C:/epd_raw.csv w]; puts $fh [epd_raw 50]; close $fh
 proc epd_raw {count {n 1}} {
-     set out "sample,t1p,t2p,t1,t2,rtt,net_fwd,echo,net_rev,ns_rtt,status"
+     # Eight raw stamps, then the four classic intervals, then the six from the
+     # taps. Empty tap columns mean a bitstream without them -- see
+     # epd_intervals, which refuses to fabricate numbers from zeros.
+     set hdr "sample,t1p,t2p,t1,t2,T1p,T2p,T1,T2"
+     append hdr ",rtt,net_fwd,echo,net_rev"
+     append hdr ",stack0_tx,ext_a,stack1_rx,stack1_tx,ext_b,stack0_rx"
+     append hdr ",ns_rtt,status"
+     set out $hdr
      puts $out
+
+     # Column count, so a TIMEOUT row lines up with the header instead of being
+     # counted by hand. 21 fields = 1 + 8 + 4 + 6 + 2.
+     #
+     # The sample index and the status both carry a value, so between them go
+     # ncol-2 EMPTY fields, which needs ncol-1 commas -- one to close the index
+     # and one to open the status. Off by one here is not cosmetic: a short row
+     # shifts every column after it, so a spreadsheet reads net_rev as echo and
+     # the numbers stay plausible.
+     set ncol [llength [split $hdr ","]]
+     set empty [string repeat "," [expr {$ncol - 1}]]
 
      for {set i 0} {$i < $count} {incr i} {
           set s [epd_sample $n]
           if {[llength $s] == 0} {
-               set line "$i,,,,,,,,,,TIMEOUT"
+               set line "$i${empty}TIMEOUT"
                puts $line
                append out "\n$line"
                continue
           }
-          lassign $s t1p t2p t1 t2
-          lassign [epd_intervals $s] rtt fwd ech rev
+          lassign $s t1p t2p t1 t2 T1p T2p T1 T2
+          lassign [epd_intervals $s] rtt fwd ech rev s0tx extA s1rx s1tx extB s0rx
           set ok [expr {($fwd + $ech + $rev) == $rtt ? "ok" : "TORN"}]
-          set line [format "%d,%u,%u,%u,%u,%d,%d,%d,%d,%.1f,%s" \
-                        $i $t1p $t2p $t1 $t2 $rtt $fwd $ech $rev \
+          set line [format "%d,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%.1f,%s" \
+                        $i $t1p $t2p $t1 $t2 $T1p $T2p $T1 $T2 \
+                        $rtt $fwd $ech $rev \
+                        $s0tx $extA $s1rx $s1tx $extB $s0rx \
                         [expr {$rtt * $::EPD_CLK_NS}] $ok]
           puts $line
           append out "\n$line"
@@ -705,7 +948,11 @@ proc epd_calibrate {{n 1} {iters 100}} {
      set dt [expr {[clock milliseconds] - $t0}]
      set per [expr {double($dt)/$iters}]
      puts [format "JTAG: %d reads in %d ms = %.2f ms per transaction" $iters $dt $per]
-     puts [format "      one sample (~6 transactions) is about %.0f ms" [expr {$per*6}]]
+     # Ten transactions per sample since the axis_net_* taps were added: one
+     # trigger write, one sampleReady poll, four t reads, four T reads. It was
+     # six before the taps -- if an old estimate is being compared against,
+     # that is the difference.
+     puts [format "      one sample (~10 transactions) is about %.0f ms" [expr {$per*10}]]
      return $per
 }
 
@@ -731,9 +978,16 @@ proc epd_calibrate {{n 1} {iters 100}} {
 set ::EPD_WARMUP 3
 
 proc epd_collect {count {n 1}} {
-     set names {RTT NET_FWD ECHO NET_REV}
-     set data  {{} {} {} {}}
+     # Order matches epd_intervals: the four classic intervals first, then the
+     # six from the axis_net_* taps. A blank name is a group separator in the
+     # printout, not a series.
+     set names {RTT NET_FWD ECHO NET_REV
+                STACK_0_TX EXT_A STACK_1_RX STACK_1_TX EXT_B STACK_0_RX}
+     set nser  [llength $names]
+     set data  {}
+     for {set k 0} {$k < $nser} {incr k} { lappend data {} }
      set bad 0
+     set no_taps 0
      set raw_t1p {}
      set raw_t2  {}
 
@@ -750,7 +1004,16 @@ proc epd_collect {count {n 1}} {
           # Drop torn reads (see epd_intervals: the sum is an identity, so
           # this only trips on a register read caught mid-update).
           if {[expr {$fwd + $ech + $rev}] != $rtt} { incr bad; continue }
-          for {set k 0} {$k < 4} {incr k} {
+
+          # A bitstream without the taps returns empty tap slots. Accumulate
+          # the four classic series anyway -- they are just as valid as before
+          # the taps existed -- and count the samples so the printout can say
+          # WHY the six tap rows are missing instead of showing empty stats.
+          set have_taps [expr {[lindex $iv 4] ne ""}]
+          if {!$have_taps} { incr no_taps }
+
+          set lim [expr {$have_taps ? $nser : 4}]
+          for {set k 0} {$k < $lim} {incr k} {
                lset data $k [concat [lindex $data $k] [lindex $iv $k]]
           }
           lappend raw_t1p [lindex $s 0]
@@ -761,20 +1024,93 @@ proc epd_collect {count {n 1}} {
      puts ""
      puts "=== $got samples out of $count (discarded: $bad, warm-up: $::EPD_WARMUP) ==="
      if {$got == 0} { epd_status $n; return }
+     if {$no_taps > 0} {
+          puts "    $no_taps of them without axis_net_* taps (T points read 0):"
+          puts "    the four rows below are valid, the seven-term decomposition"
+          puts "    is not available. Rebuild with the taps to get it."
+     }
 
-     puts [format "%-9s %8s %8s %8s %9s   %s" \
+     puts [format "%-11s %8s %8s %8s %9s   %s" \
                "" "min" "med" "max" "mean" "ns (mean)"]
-     for {set k 0} {$k < 4} {incr k} {
+     for {set k 0} {$k < $nser} {incr k} {
           set v [lsort -integer [lindex $data $k]]
+          set cnt [llength $v]
+          # Skip a series with no data: that is the tap rows on a bitstream
+          # without them. Printing zeros would read as "measured 0 cycles".
+          if {$cnt == 0} { continue }
+          # Blank line between the classic four and the decomposition, so the
+          # two groups are not misread as one flat list of comparable numbers.
+          if {$k == 4} {
+               puts "            --- decomposition (needs the axis_net_* taps) ---"
+          }
           set mn [lindex $v 0]
           set mx [lindex $v end]
-          set md [lindex $v [expr {$got / 2}]]
+          set md [lindex $v [expr {$cnt / 2}]]
           set sum 0
           foreach x $v { incr sum $x }
-          set avg [expr {double($sum)/$got}]
-          puts [format "%-9s %8d %8d %8d %9.1f   %9.1f" \
+          set avg [expr {double($sum)/$cnt}]
+          puts [format "%-11s %8d %8d %8d %9.1f   %9.1f" \
                     [lindex $names $k] $mn $md $mx $avg \
                     [expr {$avg*$::EPD_CLK_NS}]]
+     }
+
+     # Free checks the decomposition makes possible. Both are about symmetry,
+     # and both are informative rather than pass/fail -- see
+     # docs/latency_net_probe_design.md.
+     if {[llength [lindex $data 4]] > 0} {
+          set n_ok [llength [lindex $data 4]]
+          set med {}
+          for {set k 4} {$k < $nser} {incr k} {
+               set v [lsort -integer [lindex $data $k]]
+               lappend med [lindex $v [expr {[llength $v] / 2}]]
+          }
+          lassign $med m_s0tx m_extA m_s1rx m_s1tx m_extB m_s0rx
+
+          puts ""
+          # CMAC_ONE = (EXT_A + EXT_B - 2*CABLE) / 4. CABLE is ~5 ns/m, i.e.
+          # under one cycle, so it is a second-order correction and is dropped
+          # here. No separate calibration build is needed: the external deltas
+          # give CMAC from this very measurement.
+          set cmac_one [expr {($m_extA + $m_extB) / 4.0}]
+          puts [format "CMAC_ONE   ~%.1f cycles (%.1f ns) -- one side of one CMAC," \
+                    $cmac_one [expr {$cmac_one*$::EPD_CLK_NS}]]
+          puts "                    from (EXT_A+EXT_B)/4, cable ignored (<1 cycle)"
+
+          # E2E: the gateway budget for one pass, cable to cable -- receive on
+          # one port, process, transmit on the other. This is the number the
+          # whole exercise is for. ECHO stands in for the gateway logic, which
+          # is not written yet, so this is the FLOOR, not a prediction.
+          set e2e [expr {$m_s1rx + $m_s1tx + 2*$cmac_one}]
+          puts [format "E2E floor  ~%.1f cycles (%.1f ns) -- one gateway pass," \
+                    $e2e [expr {$e2e*$::EPD_CLK_NS}]]
+          puts "                    STACK_1_RX + STACK_1_TX + 2*CMAC_ONE, logic = 0"
+
+          # EXT_A vs EXT_B: the two CMAC sides. They are NOT obliged to match
+          # here -- port 0 sits on QPLL0, port 1 on QPLL1, different GT quads.
+          if {$m_extA > 0 && $m_extB > 0} {
+               set r [expr {double($m_extA)/$m_extB}]
+               if {$r > 1.5 || $r < 0.667} {
+                    puts [format "  note: EXT_A (%d) and EXT_B (%d) differ by more than 1.5x." \
+                              $m_extA $m_extB]
+                    puts "        Not necessarily wrong -- different GT quads and QPLLs --"
+                    puts "        but check epd_net_status that both taps see traffic."
+               }
+          }
+
+          # STACK_0_RX vs STACK_1_RX: the SAME network_krnl in two instances.
+          # A real divergence here means external influence -- DDR4 contention,
+          # SLR placement -- not stack asymmetry.
+          if {$m_s0rx > 0 && $m_s1rx > 0} {
+               set r [expr {double($m_s0rx)/$m_s1rx}]
+               if {$r > 1.5 || $r < 0.667} {
+                    puts [format "  note: STACK_0_RX (%d) vs STACK_1_RX (%d) differ by >1.5x," \
+                              $m_s0rx $m_s1rx]
+                    puts "        yet these are the same network_krnl in two instances."
+                    puts "        Suspect external influence: DDR4 contention, SLR placement."
+                    puts "        Check make -f Makefile.vivado report."
+               }
+          }
+          puts "($n_ok samples with taps)"
      }
 
      # THIS is the check that catches a bad sample -- not the sum, which is an

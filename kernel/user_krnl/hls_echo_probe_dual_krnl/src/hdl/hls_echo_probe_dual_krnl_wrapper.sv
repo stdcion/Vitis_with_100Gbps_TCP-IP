@@ -274,7 +274,95 @@ module hls_echo_probe_dual_krnl_wrapper #(
      output wire        s_axis_tcp_tx_status_b_tready,
      input  wire [63:0] s_axis_tcp_tx_status_b_tdata,
      input  wire [7:0]  s_axis_tcp_tx_status_b_tkeep,
-     input  wire        s_axis_tcp_tx_status_b_tlast
+     input  wire        s_axis_tcp_tx_status_b_tlast,
+
+     // ── ВРЕЗКИ НА axis_net_*: СКВОЗНОЙ ПРОХОД МИМО HLS-ЯДРА ───────────────
+     //
+     // Эти восемь интерфейсов в HLS-ядро НЕ ИДУТ ВООБЩЕ. Обёртка пробрасывает
+     // их проводами и подглядывает за tvalid&tready&tlast, чтобы поставить
+     // четыре больших T на той же шкале, что и маленькие t.
+     //
+     // ПОЧЕМУ ЗДЕСЬ, А НЕ ОТДЕЛЬНЫМ ЯДРОМ-СНИФФЕРОМ. Требование -- читать по
+     // JTAG и на ТОЙ ЖЕ шкале времени, что четыре существующие точки. Счётчик
+     // cycle_counter уже живёт здесь, регистры тоже. Отдельное ядро потребовало
+     // бы либо тянуть счётчик наружу проводом BD, либо завести второй -- а
+     // второй счётчик это ровно та ошибка, которую уже исправляли: расхождение
+     // шкал завышает один интервал настолько, насколько занижает другой, и ни
+     // одна проверка на хосте этого не видит.
+     //
+     // ПОЧЕМУ ЭТО БЕЗОПАСНО ПО КЛОКУ. axis_net_* на границе cmac_krnl уже в
+     // домене ap_clk: внутри CMAC стоит network_clk_cross (cmac_krnl.sv:116),
+     // переводящий 322 МГц GT в aclk, плюс axis_register_slice_512. А
+     // network_krnl держит весь стек на том же клоке -- network_top.sv:238:
+     // .net_clk(aclk). Проверено по коду, не предположение. Значит врезка не
+     // добавляет CDC и живёт на той же шкале, что cycle_counter.
+     //
+     // РЕГИСТРА В ТРАКТЕ НЕТ, И ЭТО НАМЕРЕННО. Он добавил бы такт в измеряемый
+     // путь, то есть исказил бы то, что мерим; а граница для тайминга там уже
+     // есть -- axis_register_slice_512 внутри CMAC.
+     //
+     // В САМ ТРАКТ ЛОГИКА НЕ ДОБАВЛЕНА ВООБЩЕ: tdata/tvalid/tready/tkeep/tlast
+     // идут насквозь чистыми assign. Фильтр висит на шине ОТВЕТВЛЕНИЕМ -- он
+     // читает три бита управления и сравнивает 48 бит tdata[511:464] с
+     // константой, а результат кладёт в свой регистр, не возвращая ничего в
+     // тракт. То есть длина комбинационного пути между network_krnl и
+     // cmac_krnl не изменилась; добавилась только нагрузка на эти провода
+     // (fanout) и отдельный путь до триггера фильтра. При запасе WNS +0.0858 нс
+     // это всё равно надо проверить на impl, а не считать доказанным.
+     //
+     // Ширина 512 бит -- C_AXIS_NET_{RX,TX}_TDATA_WIDTH (cmac_krnl.sv:10-11).
+     //
+     // Канал A (QSFP0): network_krnl_1.axis_net_tx -> сюда -> cmac_krnl_1
+     input  wire         s_axis_net_tx_a_tvalid,
+     output wire         s_axis_net_tx_a_tready,
+     input  wire [511:0] s_axis_net_tx_a_tdata,
+     input  wire [63:0]  s_axis_net_tx_a_tkeep,
+     input  wire         s_axis_net_tx_a_tlast,
+
+     output wire         m_axis_net_tx_a_tvalid,
+     input  wire         m_axis_net_tx_a_tready,
+     output wire [511:0] m_axis_net_tx_a_tdata,
+     output wire [63:0]  m_axis_net_tx_a_tkeep,
+     output wire         m_axis_net_tx_a_tlast,
+
+     // Канал A: cmac_krnl_1.axis_net_rx -> сюда -> network_krnl_1
+     input  wire         s_axis_net_rx_a_tvalid,
+     output wire         s_axis_net_rx_a_tready,
+     input  wire [511:0] s_axis_net_rx_a_tdata,
+     input  wire [63:0]  s_axis_net_rx_a_tkeep,
+     input  wire         s_axis_net_rx_a_tlast,
+
+     output wire         m_axis_net_rx_a_tvalid,
+     input  wire         m_axis_net_rx_a_tready,
+     output wire [511:0] m_axis_net_rx_a_tdata,
+     output wire [63:0]  m_axis_net_rx_a_tkeep,
+     output wire         m_axis_net_rx_a_tlast,
+
+     // Канал B (QSFP1): network_krnl_2.axis_net_tx -> сюда -> cmac_krnl_2
+     input  wire         s_axis_net_tx_b_tvalid,
+     output wire         s_axis_net_tx_b_tready,
+     input  wire [511:0] s_axis_net_tx_b_tdata,
+     input  wire [63:0]  s_axis_net_tx_b_tkeep,
+     input  wire         s_axis_net_tx_b_tlast,
+
+     output wire         m_axis_net_tx_b_tvalid,
+     input  wire         m_axis_net_tx_b_tready,
+     output wire [511:0] m_axis_net_tx_b_tdata,
+     output wire [63:0]  m_axis_net_tx_b_tkeep,
+     output wire         m_axis_net_tx_b_tlast,
+
+     // Канал B: cmac_krnl_2.axis_net_rx -> сюда -> network_krnl_2
+     input  wire         s_axis_net_rx_b_tvalid,
+     output wire         s_axis_net_rx_b_tready,
+     input  wire [511:0] s_axis_net_rx_b_tdata,
+     input  wire [63:0]  s_axis_net_rx_b_tkeep,
+     input  wire         s_axis_net_rx_b_tlast,
+
+     output wire         m_axis_net_rx_b_tvalid,
+     input  wire         m_axis_net_rx_b_tready,
+     output wire [511:0] m_axis_net_rx_b_tdata,
+     output wire [63:0]  m_axis_net_rx_b_tkeep,
+     output wire         m_axis_net_rx_b_tlast
 );
 
 // ── блочный протокол ─────────────────────────────────────────────────────────
@@ -412,6 +500,129 @@ always @(posedge ap_clk) begin
      end
 end
 
+// ── ВРЕЗКИ НА axis_net_*: ЧЕТЫРЕ БОЛЬШИХ T ───────────────────────────────────
+//
+// Сквозной проход. Никакой логики в тракте: комбинационное соединение, ноль
+// добавленных тактов. Именно поэтому измеряемый путь остаётся тем же, каким
+// был бы без врезки, -- а мы им же и меряем.
+assign m_axis_net_tx_a_tvalid = s_axis_net_tx_a_tvalid;
+assign m_axis_net_tx_a_tdata  = s_axis_net_tx_a_tdata;
+assign m_axis_net_tx_a_tkeep  = s_axis_net_tx_a_tkeep;
+assign m_axis_net_tx_a_tlast  = s_axis_net_tx_a_tlast;
+assign s_axis_net_tx_a_tready = m_axis_net_tx_a_tready;
+
+assign m_axis_net_rx_a_tvalid = s_axis_net_rx_a_tvalid;
+assign m_axis_net_rx_a_tdata  = s_axis_net_rx_a_tdata;
+assign m_axis_net_rx_a_tkeep  = s_axis_net_rx_a_tkeep;
+assign m_axis_net_rx_a_tlast  = s_axis_net_rx_a_tlast;
+assign s_axis_net_rx_a_tready = m_axis_net_rx_a_tready;
+
+assign m_axis_net_tx_b_tvalid = s_axis_net_tx_b_tvalid;
+assign m_axis_net_tx_b_tdata  = s_axis_net_tx_b_tdata;
+assign m_axis_net_tx_b_tkeep  = s_axis_net_tx_b_tkeep;
+assign m_axis_net_tx_b_tlast  = s_axis_net_tx_b_tlast;
+assign s_axis_net_tx_b_tready = m_axis_net_tx_b_tready;
+
+assign m_axis_net_rx_b_tvalid = s_axis_net_rx_b_tvalid;
+assign m_axis_net_rx_b_tdata  = s_axis_net_rx_b_tdata;
+assign m_axis_net_rx_b_tkeep  = s_axis_net_rx_b_tkeep;
+assign m_axis_net_rx_b_tlast  = s_axis_net_rx_b_tlast;
+assign s_axis_net_rx_b_tready = m_axis_net_rx_b_tready;
+
+// Фильтр кадров по числу слов. Четыре инстанса, по одному на измеряемую точку.
+// Обоснование фильтра целиком -- в шапке net_frame_filter.v; коротко: на
+// axis_net_* идёт весь трафик стека, наш кадр там ничем не выделен, а служебные
+// (ARP, чистый ACK, ICMP) укладываются в одно 512-битное слово.
+//
+// min_words читают все четыре инстанса с одного провода minWords_reg. В HLS
+// такое размножение скаляра было бы дефектом (часть читателей получила бы
+// FIFO-канал с блокировкой -- см. enableConn/enableTraffic/enableListen выше),
+// но это HDL: один wire на четыре потребителя -- обычное дело.
+//
+// ВНИМАНИЕ НА tready. Смотрим сигналы со стороны, куда данные УХОДЯТ:
+// s_axis_*_tvalid/tlast и m_axis_*_tready. Через passthrough это одни и те же
+// провода, но брать tready именно от мастера правильнее по смыслу -- считается
+// передача, а не предъявление, и при backpressure таймстемп не уедет.
+wire        net_tx_a_ours, net_rx_a_ours, net_tx_b_ours, net_rx_b_ours;
+wire [31:0] nf_cnt_tx_a, nf_cnt_rx_a, nf_cnt_tx_b, nf_cnt_rx_b;
+wire [31:0] nf_drp_tx_a, nf_drp_rx_a, nf_drp_tx_b, nf_drp_rx_b;
+
+net_frame_filter flt_tx_a (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .tvalid(s_axis_net_tx_a_tvalid), .tready(m_axis_net_tx_a_tready),
+     .tlast(s_axis_net_tx_a_tlast), .tdata(s_axis_net_tx_a_tdata),
+     .min_words(minWords_reg),
+     .frame_ours(net_tx_a_ours),
+     .count_ours(nf_cnt_tx_a), .count_drop(nf_drp_tx_a)
+);
+
+net_frame_filter flt_rx_a (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .tvalid(s_axis_net_rx_a_tvalid), .tready(m_axis_net_rx_a_tready),
+     .tlast(s_axis_net_rx_a_tlast), .tdata(s_axis_net_rx_a_tdata),
+     .min_words(minWords_reg),
+     .frame_ours(net_rx_a_ours),
+     .count_ours(nf_cnt_rx_a), .count_drop(nf_drp_rx_a)
+);
+
+net_frame_filter flt_tx_b (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .tvalid(s_axis_net_tx_b_tvalid), .tready(m_axis_net_tx_b_tready),
+     .tlast(s_axis_net_tx_b_tlast), .tdata(s_axis_net_tx_b_tdata),
+     .min_words(minWords_reg),
+     .frame_ours(net_tx_b_ours),
+     .count_ours(nf_cnt_tx_b), .count_drop(nf_drp_tx_b)
+);
+
+net_frame_filter flt_rx_b (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .tvalid(s_axis_net_rx_b_tvalid), .tready(m_axis_net_rx_b_tready),
+     .tlast(s_axis_net_rx_b_tlast), .tdata(s_axis_net_rx_b_tdata),
+     .min_words(minWords_reg),
+     .frame_ours(net_rx_b_ours),
+     .count_ours(nf_cnt_rx_b), .count_drop(nf_drp_rx_b)
+);
+
+// Таймстемпы больших T -- ТОТ ЖЕ cycle_counter, что и у маленьких t. В этом
+// весь смысл размещения врезки здесь: разности T-t осмысленны только на одной
+// шкале.
+//
+//     T1' <- tx на канале A   запрос ушёл в провод (порт 0)
+//     T2' <- rx на канале B   запрос пришёл из провода (порт 1)
+//     T1  <- tx на канале B   ответ ушёл в провод (порт 1)
+//     T2  <- rx на канале A   ответ пришёл из провода (порт 0)
+//
+// Круг: t1' -> T1' -> T2' -> t2' -> [эхо] -> t1 -> T1 -> T2 -> t2.
+logic [31:0] ts_net_tx_a_r = 32'b0;   // T1'
+logic [31:0] ts_net_rx_b_r = 32'b0;   // T2'
+logic [31:0] ts_net_tx_b_r = 32'b0;   // T1
+logic [31:0] ts_net_rx_a_r = 32'b0;   // T2
+
+always @(posedge ap_clk) begin
+     if (~ap_rst_n) begin
+          ts_net_tx_a_r <= 32'b0;
+          ts_net_rx_b_r <= 32'b0;
+          ts_net_tx_b_r <= 32'b0;
+          ts_net_rx_a_r <= 32'b0;
+     end else begin
+          if (net_tx_a_ours) ts_net_tx_a_r <= cycle_counter;
+          if (net_rx_b_ours) ts_net_rx_b_r <= cycle_counter;
+          if (net_tx_b_ours) ts_net_tx_b_r <= cycle_counter;
+          if (net_rx_a_ours) ts_net_rx_a_r <= cycle_counter;
+     end
+end
+
+// Счётчики кадров наружу: на канал приходится ДВА фильтра (tx и rx), а регистра
+// в карте по одному на канал. Складываем -- отладочному счётчику этого хватает:
+// вопрос, на который он отвечает, звучит «врезка на этом канале вообще живая?»,
+// а не «сколько именно кадров на каждом направлении». Раздельные счётчики
+// стоили бы ещё четырёх адресов ради различия, которое видно и так: если сумма
+// растёт, а один из таймстемпов канала стоит -- мёртвое как раз то направление.
+wire [31:0] netFrameCountA = nf_cnt_tx_a + nf_cnt_rx_a;
+wire [31:0] netFrameCountB = nf_cnt_tx_b + nf_cnt_rx_b;
+wire [31:0] netFrameDropA  = nf_drp_tx_a + nf_drp_rx_a;
+wire [31:0] netFrameDropB  = nf_drp_tx_b + nf_drp_rx_b;
+
 // ── sampleReady ──────────────────────────────────────────────────────────────
 //
 // Тоже переехал из ядра. Здесь он проще, чем был в epd_latch: там надо было
@@ -464,6 +675,10 @@ wire [31:0] serverPort_reg;
 wire [31:0] listenPort_reg;
 wire [31:0] msgBytes_reg;
 wire [31:0] triggerGo_reg;
+// Порог фильтра кадров на axis_net_*. В HLS-ядро НЕ идёт: врезки живут целиком
+// в обёртке. Хост пишет его вместе с msgBytes, поэтому свип по размерам не
+// требует пересборки, а порог всегда соответствует тому, что отправляется.
+wire [31:0] minWords_reg;
 
 // Счётчики событий из ядра. ap_vld — строб «изменилось в этом такте», по нему
 // защёлкиваются таймстемпы выше. Сами значения читаются хостом как телеметрия;
@@ -529,7 +744,17 @@ probe_control_s_axi #(
      .tsEchoIn       ( ts_echo_in_r           ),
      .tsEchoOut      ( ts_echo_out_r          ),
      .tsReply        ( ts_reply_r             ),
-     .sampleReady    ( {31'b0, sample_ready_r} )
+     .sampleReady    ( {31'b0, sample_ready_r} ),
+     // врезки на axis_net_*: порог фильтра наружу, таймстемпы и счётчики внутрь
+     .minWords       ( minWords_reg           ),
+     .tsNetTxA       ( ts_net_tx_a_r          ),
+     .tsNetRxB       ( ts_net_rx_b_r          ),
+     .tsNetTxB       ( ts_net_tx_b_r          ),
+     .tsNetRxA       ( ts_net_rx_a_r          ),
+     .netFrameCountA ( netFrameCountA         ),
+     .netFrameCountB ( netFrameCountB         ),
+     .netFrameDropA  ( netFrameDropA          ),
+     .netFrameDropB  ( netFrameDropB          )
 );
 
 // ── HLS-ядро ─────────────────────────────────────────────────────────────────
