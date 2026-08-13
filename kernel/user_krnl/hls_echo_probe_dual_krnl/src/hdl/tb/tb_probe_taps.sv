@@ -34,6 +34,27 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
+// ПОЧЕМУ МАКРОС, А НЕ task check(input string name, ...).
+//
+// Сначала было `input [255:0] name` -- вектор на 32 байта, и сообщения на
+// кириллице (2 байта на символ в UTF-8) обрезались посередине: прогон 13.08
+// печатал «ok   М (tag=6  SYN» вместо полной строки. Замена на `input string`
+// НЕ ПОМОГЛА -- xvlog 2024.1 всё равно приводит аргумент задачи к вектору.
+//
+// Макрос решает это тем, что строка НИКУДА НЕ ПЕРЕДАЁТСЯ: литерал
+// подставляется прямо в $display на месте вызова, где длина ничем не
+// ограничена.
+//
+// Тело обёрнуто в begin/end намеренно: голый if/else в макросе присоединил бы
+// чужой else, если вызов окажется внутри незаскобленного if. Здесь таких мест
+// нет, но макрос переживёт правку тестбенча.
+`define check(NAME, COND) \
+     begin \
+          if (COND) $display("  ok   %0s", NAME); \
+          else begin $display("  FAIL %0s", NAME); errors = errors + 1; end \
+     end
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Заглушка HLS-ядра.
 //
@@ -234,15 +255,6 @@ module tb_probe_taps;
      always #5 clk = ~clk;
 
      integer errors = 0;
-     // name -- string, а НЕ [255:0]: вектор вмещает 32 байта, и сообщения
-     // на кириллице (2 байта на символ в UTF-8) обрезались посередине.
-     // Прогон 13.08 печатал «ok   М (tag=6  SYN» вместо полной строки.
-     task check(input string name, input cond);
-          begin
-               if (cond) $display("  ok   %0s", name);
-               else begin $display("  FAIL %0s", name); errors = errors + 1; end
-          end
-     endtask
 
      // ── AXI-Lite ─────────────────────────────────────────────────────────
      reg         awvalid = 1'b0, wvalid = 1'b0, arvalid = 1'b0;
@@ -461,17 +473,17 @@ module tb_probe_taps;
           // ── 1. minWords: сброс в 2, RW ───────────────────────────────────
           $display("\n[1] регистр minWords");
           axi_read(A_MINWORDS, v);
-          check("сброс в 2 (не 0 -- иначе фильтр пропускал бы ARP/ACK)", v == 32'd2);
+          `check("сброс в 2 (не 0 -- иначе фильтр пропускал бы ARP/ACK)", v == 32'd2);
           axi_write(A_MINWORDS, 32'd5);
           axi_read(A_MINWORDS, v);
-          check("записывается и читается", v == 32'd5);
+          `check("записывается и читается", v == 32'd5);
           axi_write(A_MINWORDS, 32'd2);
 
           // ── 2. таймстемпы нулевые до трафика ─────────────────────────────
           $display("\n[2] до трафика таймстемпы нулевые");
           axi_read(A_TS_TX_A, t1p); axi_read(A_TS_RX_B, t2p);
           axi_read(A_TS_TX_B, t1);  axi_read(A_TS_RX_A, t2);
-          check("все четыре = 0", (t1p==0)&&(t2p==0)&&(t1==0)&&(t2==0));
+          `check("все четыре = 0", (t1p==0)&&(t2p==0)&&(t1==0)&&(t2==0));
 
           // ── 3. ГЛАВНОЕ: каждый T приходит от СВОЕЙ врезки ────────────────
           //
@@ -487,19 +499,18 @@ module tb_probe_taps;
           axi_read(A_TS_TX_A, t1p); axi_read(A_TS_RX_B, t2p);
           axi_read(A_TS_TX_B, t1);  axi_read(A_TS_RX_A, t2);
           $display("     T1'=%0d T2'=%0d T1=%0d T2=%0d", t1p, t2p, t1, t2);
-          check("все четыре ненулевые", (t1p!=0)&&(t2p!=0)&&(t1!=0)&&(t2!=0));
-          check("T1' < T2' (запрос ушёл раньше, чем пришёл)", t1p < t2p);
-          check("T2' < T1  (пришёл раньше, чем ответ ушёл)",  t2p < t1);
-          check("T1  < T2  (ответ ушёл раньше, чем вернулся)", t1  < t2);
-          check("все четыре РАЗНЫЕ (иначе один регистр на всех)",
-                (t1p!=t2p)&&(t2p!=t1)&&(t1!=t2)&&(t1p!=t2));
+          `check("все четыре ненулевые", (t1p!=0)&&(t2p!=0)&&(t1!=0)&&(t2!=0));
+          `check("T1' < T2' (запрос ушёл раньше, чем пришёл)", t1p < t2p);
+          `check("T2' < T1  (пришёл раньше, чем ответ ушёл)",  t2p < t1);
+          `check("T1  < T2  (ответ ушёл раньше, чем вернулся)", t1  < t2);
+          `check("все четыре РАЗНЫЕ (иначе один регистр на всех)", (t1p!=t2p)&&(t2p!=t1)&&(t1!=t2)&&(t1p!=t2));
 
           // ── 4. счётчики кадров по каналам ────────────────────────────────
           $display("\n[4] счётчики кадров: канал A = tx_a+rx_a, B = tx_b+rx_b");
           axi_read(A_NF_CNT_A, ca); axi_read(A_NF_CNT_B, cb);
           $display("     countA=%0d countB=%0d", ca, cb);
-          check("A = 2 (по одному кадру на tx_a и rx_a)", ca == 32'd2);
-          check("B = 2 (по одному кадру на tx_b и rx_b)", cb == 32'd2);
+          `check("A = 2 (по одному кадру на tx_a и rx_a)", ca == 32'd2);
+          `check("B = 2 (по одному кадру на tx_b и rx_b)", cb == 32'd2);
 
           // ── 5. чужой кадр: drop растёт, таймстемп НЕ меняется ────────────
           $display("\n[5] чужой кадр (без маркера) не сдвигает таймстемп");
@@ -508,9 +519,9 @@ module tb_probe_taps;
           send(0, 2, 1'b0);              // SYN-подобный: 2 слова, маркера нет
           repeat (10) @(negedge clk);
           axi_read(A_TS_TX_A, v);
-          check("таймстемп T1' не изменился", v == t1p);
+          `check("таймстемп T1' не изменился", v == t1p);
           axi_read(A_NF_DRP_A, db);
-          check("dropA вырос", db == da + 1);
+          `check("dropA вырос", db == da + 1);
 
           // ── 6. односоловный кадр после нашего (ловушка single_word) ──────
           $display("\n[6] ловушка: односоловный кадр после нашего, minWords=1");
@@ -521,21 +532,21 @@ module tb_probe_taps;
           send(2, 1, 1'b0);              // односоловный чужой туда же
           repeat (6) @(negedge clk);
           axi_read(A_TS_TX_B, v);
-          check("таймстемп T1 не сдвинулся чужим односоловным", v == t1);
+          `check("таймстемп T1 не сдвинулся чужим односоловным", v == t1);
           axi_write(A_MINWORDS, 32'd2);
 
           // ── 7. прозрачность за весь прогон ───────────────────────────────
           $display("\n[7] прозрачность врезок (проверялась каждый такт)");
-          check("passthrough ни разу не исказил шину", pass_err == 0);
+          `check("passthrough ни разу не исказил шину", pass_err == 0);
 
           // ── 8. backpressure проходит насквозь ────────────────────────────
           $display("\n[8] tready от приёмника доходит до источника");
           @(negedge clk); sink_tx_a_tr = 1'b0;
           @(negedge clk);
-          check("tready=0 виден на входе врезки", i_tx_a_tr == 1'b0);
+          `check("tready=0 виден на входе врезки", i_tx_a_tr == 1'b0);
           @(negedge clk); sink_tx_a_tr = 1'b1;
           @(negedge clk);
-          check("tready=1 виден на входе врезки", i_tx_a_tr == 1'b1);
+          `check("tready=1 виден на входе врезки", i_tx_a_tr == 1'b1);
 
           $display("");
           if (errors == 0 && pass_err == 0)

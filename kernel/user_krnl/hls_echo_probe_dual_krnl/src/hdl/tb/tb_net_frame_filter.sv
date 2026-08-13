@@ -19,6 +19,27 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
+// ПОЧЕМУ МАКРОС, А НЕ task check(input string name, ...).
+//
+// Сначала было `input [255:0] name` -- вектор на 32 байта, и сообщения на
+// кириллице (2 байта на символ в UTF-8) обрезались посередине: прогон 13.08
+// печатал «ok   М (tag=6  SYN» вместо полной строки. Замена на `input string`
+// НЕ ПОМОГЛА -- xvlog 2024.1 всё равно приводит аргумент задачи к вектору.
+//
+// Макрос решает это тем, что строка НИКУДА НЕ ПЕРЕДАЁТСЯ: литерал
+// подставляется прямо в $display на месте вызова, где длина ничем не
+// ограничена.
+//
+// Тело обёрнуто в begin/end намеренно: голый if/else в макросе присоединил бы
+// чужой else, если вызов окажется внутри незаскобленного if. Здесь таких мест
+// нет, но макрос переживёт правку тестбенча.
+`define check(NAME, COND) \
+     begin \
+          if (COND) $display("  ok   %0s", NAME); \
+          else begin $display("  FAIL %0s", NAME); errors = errors + 1; end \
+     end
+
+
 module tb_net_frame_filter;
 
      localparam [47:0] MARKER = 48'h5A3C96E1B7D2;
@@ -65,15 +86,6 @@ module tb_net_frame_filter;
           end
      end
 
-     // name -- string, а НЕ [255:0]: вектор вмещает 32 байта, и сообщения
-     // на кириллице (2 байта на символ в UTF-8) обрезались посередине.
-     // Прогон 13.08 печатал «ok   М (tag=6  SYN» вместо полной строки.
-     task check(input string name, input cond);
-          begin
-               if (cond) $display("  ok   %0s", name);
-               else begin $display("  FAIL %0s", name); errors = errors + 1; end
-          end
-     endtask
 
      // Один кадр: nwords слов, маркер кладём только в ПЕРВОЕ слово.
      // marked=0 имитирует чужой кадр (ARP/ACK/SYN) -- там на битах 511:464
@@ -137,8 +149,7 @@ module tb_net_frame_filter;
           rst_n = 1'b1;
           repeat (2) @(negedge clk);
 
-          check("после сброса счётчики нулевые",
-                (count_ours == 0) && (count_drop == 0));
+          `check("после сброса счётчики нулевые", (count_ours == 0) && (count_drop == 0));
 
           // ── 1. норма: minWords=2 ────────────────────────────────────────
           $display("\n[1] наш кадр среди служебных, minWords=2");
@@ -148,18 +159,18 @@ module tb_net_frame_filter;
           send_frame(2, 2, 1'b1);   // НАШ     -- 2 слова + маркер
           send_frame(3, 1, 1'b0);   // ACK     -- 1 слово
           repeat (2) @(negedge clk);
-          check("ровно один строб", (strobes - s0) == 1);
-          check("строб на НАШЕМ кадре (tag=2)", last_strobe_tag == 2);
-          check("count_ours=1", count_ours == 1);
-          check("count_drop=2", count_drop == 2);
+          `check("ровно один строб", (strobes - s0) == 1);
+          `check("строб на НАШЕМ кадре (tag=2)", last_strobe_tag == 2);
+          `check("count_ours=1", count_ours == 1);
+          `check("count_drop=2", count_drop == 2);
 
           // ── 2. SYN с опциями: длину проходит, маркер нет ─────────────────
           $display("\n[2] TCP SYN с опциями (2 слова, без маркера)");
           s0 = strobes; d0 = count_drop;
           send_frame(4, 2, 1'b0);
           repeat (2) @(negedge clk);
-          check("строба НЕТ -- отсечён МАРКЕРОМ", (strobes - s0) == 0);
-          check("посчитан как отброшенный", count_drop == d0 + 1);
+          `check("строба НЕТ -- отсечён МАРКЕРОМ", (strobes - s0) == 0);
+          `check("посчитан как отброшенный", count_drop == d0 + 1);
 
           // ── 3. SYN прямо перед нашим кадром ──────────────────────────────
           $display("\n[3] SYN, сразу за ним наш кадр");
@@ -167,8 +178,8 @@ module tb_net_frame_filter;
           send_frame(5, 2, 1'b0);
           send_frame(6, 2, 1'b1);
           repeat (2) @(negedge clk);
-          check("ровно один строб", (strobes - s0) == 1);
-          check("строб на НАШЕМ (tag=6), не на SYN", last_strobe_tag == 6);
+          `check("ровно один строб", (strobes - s0) == 1);
+          `check("строб на НАШЕМ (tag=6), не на SYN", last_strobe_tag == 6);
 
           // ── 4. ЛОВУШКА: односоловный кадр сразу ПОСЛЕ нашего ────────────
           //
@@ -180,9 +191,8 @@ module tb_net_frame_filter;
           send_frame(7, 2, 1'b1);   // наш
           send_frame(8, 1, 1'b0);   // ACK, БЕЗ маркера
           repeat (2) @(negedge clk);
-          check("ровно один строб", (strobes - s0) == 1);
-          check("строб на НАШЕМ (tag=7), ACK не просочился",
-                last_strobe_tag == 7);
+          `check("ровно один строб", (strobes - s0) == 1);
+          `check("строб на НАШЕМ (tag=7), ACK не просочился", last_strobe_tag == 7);
 
           // ── 5. то же при minWords=0 ──────────────────────────────────────
           $display("\n[5] то же при minWords=0 (длина выключена совсем)");
@@ -192,24 +202,24 @@ module tb_net_frame_filter;
           send_frame(10, 1, 1'b0);
           send_frame(11, 1, 1'b0);
           repeat (2) @(negedge clk);
-          check("ровно один строб", (strobes - s0) == 1);
-          check("строб на НАШЕМ (tag=9)", last_strobe_tag == 9);
+          `check("ровно один строб", (strobes - s0) == 1);
+          `check("строб на НАШЕМ (tag=9)", last_strobe_tag == 9);
 
           // ── 6. свип по размерам ──────────────────────────────────────────
           $display("\n[6] свип: minWords по формуле, наш кадр всегда ловится");
           // msgBytes 32,64->2  128->3  256->5  512->9  1024->17  1500->25
           min_words = 32'd2;  s0 = strobes; send_frame(20, 2,  1'b1);
-          repeat (2) @(negedge clk); check("msg<=64  (2 слова)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg<=64  (2 слова)",  (strobes-s0)==1);
           min_words = 32'd3;  s0 = strobes; send_frame(21, 3,  1'b1);
-          repeat (2) @(negedge clk); check("msg=128  (3 слова)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=128  (3 слова)",  (strobes-s0)==1);
           min_words = 32'd5;  s0 = strobes; send_frame(22, 5,  1'b1);
-          repeat (2) @(negedge clk); check("msg=256  (5 слов)",   (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=256  (5 слов)",   (strobes-s0)==1);
           min_words = 32'd9;  s0 = strobes; send_frame(23, 9,  1'b1);
-          repeat (2) @(negedge clk); check("msg=512  (9 слов)",   (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=512  (9 слов)",   (strobes-s0)==1);
           min_words = 32'd17; s0 = strobes; send_frame(24, 17, 1'b1);
-          repeat (2) @(negedge clk); check("msg=1024 (17 слов)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=1024 (17 слов)",  (strobes-s0)==1);
           min_words = 32'd25; s0 = strobes; send_frame(25, 25, 1'b1);
-          repeat (2) @(negedge clk); check("msg=1500 (25 слов)",  (strobes-s0)==1);
+          repeat (2) @(negedge clk); `check("msg=1500 (25 слов)",  (strobes-s0)==1);
 
           // ── 7. порог завышен: режет ВСЁ, включая наш кадр ────────────────
           $display("\n[7] minWords завышен -- фильтр режет всё");
@@ -217,9 +227,8 @@ module tb_net_frame_filter;
           s0 = strobes; d0 = count_drop;
           send_frame(30, 2, 1'b1);   // наш, но всего 2 слова
           repeat (2) @(negedge clk);
-          check("строба нет", (strobes - s0) == 0);
-          check("ушёл в drop (это и видно как passed=0 при растущем dropped)",
-                count_drop == d0 + 1);
+          `check("строба нет", (strobes - s0) == 0);
+          `check("ушёл в drop (это и видно как passed=0 при растущем dropped)", count_drop == d0 + 1);
 
           // ── 8. backpressure и паузы ──────────────────────────────────────
           //
@@ -231,22 +240,21 @@ module tb_net_frame_filter;
           s0 = strobes;
           send_frame_stalled(40, 3, 1'b1);
           repeat (2) @(negedge clk);
-          check("наш 3-словный кадр опознан несмотря на паузы",
-                (strobes - s0) == 1);
-          check("строб на нём (tag=40)", last_strobe_tag == 40);
+          `check("наш 3-словный кадр опознан несмотря на паузы", (strobes - s0) == 1);
+          `check("строб на нём (tag=40)", last_strobe_tag == 40);
 
           // ── 9. сброс обнуляет счётчики ───────────────────────────────────
           $display("\n[9] сброс обнуляет счётчики");
           @(negedge clk); rst_n = 1'b0;
           repeat (3) @(negedge clk); rst_n = 1'b1;
           @(negedge clk);
-          check("count_ours=0 после сброса", count_ours == 0);
-          check("count_drop=0 после сброса", count_drop == 0);
+          `check("count_ours=0 после сброса", count_ours == 0);
+          `check("count_drop=0 после сброса", count_drop == 0);
           // и логика жива после сброса
           min_words = 32'd2; s0 = strobes;
           send_frame(50, 2, 1'b1);
           repeat (2) @(negedge clk);
-          check("после сброса фильтр работает", (strobes - s0) == 1);
+          `check("после сброса фильтр работает", (strobes - s0) == 1);
 
           $display("");
           if (errors == 0) $display("=== tb_net_frame_filter: ВСЁ ЗЕЛЁНОЕ ===");
