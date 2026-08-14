@@ -1168,6 +1168,107 @@ proc epd_collect {count {n 1}} {
 }
 
 # =============================================================================
+# hls_recv_krnl -- КОНТРОЛЬНЫЙ ОПЫТ, апстримное ядро без единой нашей строки
+# =============================================================================
+#
+# ЗАЧЕМ ОНО ЗДЕСЬ. Три битстрима подряд дают одно: enable читается обратно,
+# listenAttempts=0, portState=0. По сгенерированному RTL исключены все пять
+# известных дефектов HLS, неверный адрес, чужой битстрим и сброс; стек при этом
+# ЖИВОЙ -- пинги идут, ARP отвечает. То есть отладка упёрлась в вопрос, который
+# нельзя решить чтением кода: виноваты наши ядра или связка BD+JTAG?
+#
+# hls_recv_krnl отвечает на него, потому что он:
+#   * АПСТРИМНЫЙ -- создан zhe в 2020, последняя правка 2022, нами не тронут;
+#   * ОТКРЫВАЕТ LISTEN -- ровно тот путь, который у нас не работает;
+#   * СЫРОЕ HLS БЕЗ ОБЁРТКИ -- проверяет BD и JTAG в чистом виде;
+#   * использует ШТАТНУЮ схему s_axilite + ap_ctrl_hs, от которой мы отказались
+#     в пользу ap_ctrl_none + регистры в HDL-обёртке.
+#
+# Исход читается однозначно:
+#   соединение установилось -> штатная схема и JTAG исправны, виновата НАША;
+#   не установилось         -> проблема в BD/JTAG, наши ядра ни при чём.
+#
+# ПРО JTAG ВМЕСТО XRT. Ядро писалось под XRT+XDMA, но это неважно: jtag_axi --
+# обычный AXI-Lite мастер, и для s_axilite-ядра источник транзакций неотличим.
+# Доказательство прямо в этой же сборке: network_krnl -- тоже апстримное ядро с
+# s_axilite и ap_ctrl_hs под XRT, и по JTAG оно работает (пинги идут). XRT
+# добавлял только выделение буферов в DDR (мы делаем это руками через
+# network_set_buffers) и ожидание прерываний (мы опрашиваем регистр).
+#
+# ЗАПУСК ЧЕРЕЗ ap_start, А НЕ ЧЕРЕЗ enable -- и это, возможно, суть различия.
+# Здесь хост пишет параметры и дёргает ap_start; у наших ядер ap_start в обёртке
+# нужен «для вида», а работу разрешает отдельный регистр enable. Если у recv
+# заработает, версия «дело в отказе от ap_start как пускового механизма» станет
+# правдоподобной.
+#
+# СМЕЩЕНИЯ -- из сгенерированного xhls_recv_krnl_hw.h (печатается в конце
+# export_hls_ip.tcl), не угаданы:
+set ::RECV_OFF_AP_CTRL   0x00
+set ::RECV_OFF_USECONN   0x10
+set ::RECV_OFF_BASEPORT  0x18
+set ::RECV_OFF_RXBYTES   0x20
+
+# Настройка + запуск. useConn портов начиная с basePort.
+#
+# expectedRxByteCnt -- сколько байт ядро ждёт на сессию; для проверки listen
+# значение неважно, берём заведомо большое, чтобы ядро не завершилось раньше,
+# чем мы успеем подключиться.
+proc recv_start {{basePort 5001} {useConn 1} {rxBytes 1000000} {n 1}} {
+     set base [ouch_base_user $n]
+
+     axi_write32 [expr {$base + $::RECV_OFF_USECONN}]  $useConn
+     axi_write32 [expr {$base + $::RECV_OFF_BASEPORT}] $basePort
+     axi_write32 [expr {$base + $::RECV_OFF_RXBYTES}]  $rxBytes
+
+     # Читаем обратно ДО запуска: если параметры не доехали, ap_start бессмысленен.
+     set rd_conn [axi_read32 [expr {$base + $::RECV_OFF_USECONN}]]
+     set rd_port [axi_read32 [expr {$base + $::RECV_OFF_BASEPORT}]]
+     puts "recv\[$n\]: useConn=$rd_conn basePort=$rd_port rxBytes=$rxBytes"
+     if {$rd_conn != $useConn || $rd_port != $basePort} {
+          puts "  *** WRITE NOT CONFIRMED -- проверь ouch_base_user $n и битстрим"
+          return 0
+     }
+     puts "  write confirmed"
+
+     # ap_start + auto_restart, как в network_start: ядро должно работать
+     # непрерывно, а не отработать один раз и остановиться.
+     axi_write32 [expr {$base + $::RECV_OFF_AP_CTRL}] 0x81
+     recv_status $n
+     return 1
+}
+
+# ap_ctrl глазами хоста. ap_done очищается ЧТЕНИЕМ (Read/COR), поэтому два
+# чтения подряд дадут разное -- это нормально, не признак поломки.
+proc recv_status {{n 1}} {
+     set ctrl [axi_read32 [expr {[ouch_base_user $n] + $::RECV_OFF_AP_CTRL}]]
+     puts [format "recv\[%d\]: ap_ctrl=0x%02x (ap_start=%d ap_done=%d ap_idle=%d auto_restart=%d)" \
+               $n $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}] \
+               [expr {($ctrl >> 2) & 1}] [expr {($ctrl >> 7) & 1}]]
+     if {($ctrl & 1) == 0} {
+          puts "  -> ap_start снят: ядро завершилось и не перезапустилось."
+          puts "     Для контрольного опыта это уже ответ: значит ap_ctrl_hs"
+          puts "     отрабатывает, но auto_restart не удержал ядро запущенным."
+     }
+     return $ctrl
+}
+
+# Полный контрольный опыт одной командой.
+#
+# ПОСЛЕ НЕЁ -- подключиться с PC: ncat <ip> <basePort>. Установившееся
+# соединение означает, что listen-порт реально открыт в стеке.
+proc recv_bringup {ip_str mac_str {basePort 5001} {n 1}} {
+     echo_bringup $ip_str $mac_str $n
+     puts ""
+     recv_start $basePort 1 1000000 $n
+     puts ""
+     puts "Теперь с PC:  ncat [_de_dotted $ip_str] $basePort"
+     puts "  соединение установилось -> listen РАБОТАЕТ (штатная схема исправна)"
+     puts "  отказ в соединении      -> listen не открылся"
+     puts ""
+     puts "Если ncat недоступен:  telnet [_de_dotted $ip_str] $basePort"
+}
+
+# =============================================================================
 # vio_dump -- TCP stack counters from the VIO
 # =============================================================================
 #
