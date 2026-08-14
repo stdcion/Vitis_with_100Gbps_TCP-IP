@@ -101,6 +101,39 @@ generate_target {synthesis instantiation_template} $ip_xci
 export_ip_user_files -of_objects $ip_xci -no_script -sync -force -quiet
 puts "output products для ${KRNL}_ip сгенерированы"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ОТЛАДОЧНЫЙ VIO — ВРЕМЕННЫЙ, УДАЛИТЬ ВМЕСТЕ С vio_dbg_inst В ОБЁРТКЕ
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Восемь проб: четыре 32-битные и четыре однобитные. Обоснование каждой — в
+# шапке инстанса в hls_dual_echo_krnl_wrapper.sv; коротко: они различают, где
+# именно рвётся цепочка «регистр -> провод -> ядро -> запрос в стек», потому что
+# по сгенерированному RTL это уже не различить.
+#
+# Конфигурация скопирована с vio_network (kernel/network_krnl/network_stack.tcl:238)
+# — VIO, который на этом железе читается через vio_dump. Читаться будет так же:
+# vio_dump находит все VIO сам, править jtag_ctrl.tcl не нужно.
+create_ip -name vio -vendor xilinx.com -library ip -version 3.0 \
+     -module_name vio_dual_echo_dbg
+set_property -dict [list \
+     CONFIG.C_NUM_PROBE_IN     {8} \
+     CONFIG.C_NUM_PROBE_OUT    {0} \
+     CONFIG.C_PROBE_IN0_WIDTH  {32} \
+     CONFIG.C_PROBE_IN1_WIDTH  {32} \
+     CONFIG.C_PROBE_IN2_WIDTH  {32} \
+     CONFIG.C_PROBE_IN3_WIDTH  {32} \
+     CONFIG.C_PROBE_IN4_WIDTH  {1} \
+     CONFIG.C_PROBE_IN5_WIDTH  {1} \
+     CONFIG.C_PROBE_IN6_WIDTH  {1} \
+     CONFIG.C_PROBE_IN7_WIDTH  {1} \
+     CONFIG.Component_Name     {vio_dual_echo_dbg} \
+] [get_ips vio_dual_echo_dbg]
+
+set vio_xci [get_files -all vio_dual_echo_dbg.xci]
+generate_target {synthesis instantiation_template} $vio_xci
+export_ip_user_files -of_objects $vio_xci -no_script -sync -force -quiet
+puts "output products для vio_dual_echo_dbg сгенерированы"
+
 set_property top hls_dual_echo_krnl_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
