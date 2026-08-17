@@ -1426,6 +1426,32 @@ set ::DE_OFF_LISTEN_ATT_B    0x50
 set ::DE_OFF_PORT_STATE_B    0x60
 set ::DE_OFF_NOTIFY_B        0x70
 
+# ── CTRL-регистры при каждом ap_vld-выходе ───────────────────────────────────
+#
+# HLS ставит рядом с каждым выходным скаляром парный CTRL, у которого бит 0 --
+# это *_ap_vld со семантикой Read/COR (clear on read):
+#
+#     0x20  listenAttempts_a  DATA        0x24  ..._CTRL  bit0 = ap_vld
+#     0x30  portState_a       DATA        0x34  ..._CTRL
+#     ...
+#
+# ЗАЧЕМ ЭТО ЗНАТЬ. DATA хранит последнее значение, отданное ядром, а CTRL
+# говорит, БЫЛО ЛИ ОНО ОБНОВЛЕНО с прошлого чтения. Симуляция показала, почему
+# это важно: тестбенч читал шину напрямую и получал нули при работающем ядре --
+# между обновлениями значение на выходе не определено, держит его только теневой
+# регистр внутри. В s_axilite за это отвечает DATA, но свежесть -- в CTRL.
+#
+# ЧИТАТЬ CTRL НАДО ОСТОРОЖНО: бит COR, то есть чтение его СБРАСЫВАЕТ. Поэтому
+# dual_echo_status читает только DATA -- для отладки достаточно значения, а
+# сбрасывать флаги на каждом опросе значит терять информацию о том, обновлялось
+# ли что-то между опросами.
+set ::DE_OFF_LISTEN_ATT_A_CTRL   0x24
+set ::DE_OFF_PORT_STATE_A_CTRL   0x34
+set ::DE_OFF_NOTIFY_A_CTRL       0x44
+set ::DE_OFF_LISTEN_ATT_B_CTRL   0x54
+set ::DE_OFF_PORT_STATE_B_CTRL   0x64
+set ::DE_OFF_NOTIFY_B_CTRL       0x74
+
 # Write the listen ports -- one per half. portB defaults to portA when
 # omitted, which keeps the old single-port behaviour available.
 #

@@ -98,7 +98,16 @@ BITSTREAM = $(PROJ_DIR)/net_vivado.runs/impl_1/net_bd_wrapper.bit
 # видит enable) выглядел бы как баг в HLS, а не как пропущенный шаг.
 KRNL_HDL_DIR  = $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/src/hdl
 KRNL_PACK_TCL = $(REPO_ROOT)/kernel/user_krnl/$(USER_KRNL)/package_$(USER_KRNL).tcl
-HAS_WRAPPER   = $(if $(wildcard $(KRNL_HDL_DIR)),yes,no)
+# Обёртка есть, если в src/hdl/ лежат ФАЙЛЫ RTL, а не просто существует каталог.
+#
+# Проверка по каталогу ломалась: у hls_dual_echo_krnl обёртку удалили (ядро
+# перешло на s_axilite + ap_ctrl_hs, регистры генерирует HLS), но в src/hdl/
+# осталась tb/ с тестбенчами. Makefile считал, что обёртка на месте, требовал
+# package_*.tcl и валил сборку на шаге pack.
+#
+# Глоб только по верхнему уровню src/hdl/, БЕЗ tb/ -- тестбенчи к упаковке
+# отношения не имеют.
+HAS_WRAPPER   = $(if $(wildcard $(KRNL_HDL_DIR)/*.v $(KRNL_HDL_DIR)/*.sv),yes,no)
 
 # jobs=2, а не больше: на 8 vCPU / 30 ГБ восемь параллельных синтезов Vivado
 # съедали всю память и подвешивали инстанс так, что не отвечал ни ssh, ни
