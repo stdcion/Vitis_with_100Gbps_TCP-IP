@@ -177,6 +177,25 @@ struct notifyState
      ap_uint<32> notifications;
 };
 
+/*
+ * Состояние публикатора телеметрии — тоже В СТРУКТУРЕ, по той же причине, что
+ * notifyState выше: dual_echo_publish вызывается ДВАЖДЫ, по разу на половину, и
+ * static внутри неё HLS отвергает:
+ *
+ *     ERROR: [HLS 200-471] Dataflow form checks found feedback dependence
+ *            in dataflow-region for global/static variable lastAttempts
+ *
+ * Первая версия публикатора держала lastAttempts/lastState в static — и csynth
+ * упал ровно на этом. Урок тот же, что был усвоен для notify/drain: две стадии
+ * одного dataflow-региона не могут делить static, состояние выносится наружу и
+ * передаётся по ссылке.
+ */
+struct publishState
+{
+     ap_uint<32> lastAttempts;
+     ap_uint<32> lastState;
+};
+
 struct drainState_t
 {
      enum { IDLE, FORWARD } st;
@@ -387,14 +406,18 @@ void dual_echo_listen(int enable,
  * короткая.
  *
  * ЗНАЧЕНИЯ ДЕРЖАТСЯ МЕЖДУ ОБНОВЛЕНИЯМИ. Пустой поток -- не повод затирать
- * прошлое: держим последнее опубликованное в static. Иначе хост читал бы нули
- * в промежутках между событиями, а это ровно тот ложный симптом, который стоил
- * нам недели.
+ * прошлое: последнее опубликованное живёт в ps. Иначе хост читал бы нули в
+ * промежутках между событиями, а это ровно тот ложный симптом, который стоил нам
+ * недели.
+ *
+ * СОСТОЯНИЕ ПРИХОДИТ АРГУМЕНТОМ, А НЕ static: стадия вызывается дважды, и static
+ * внутри неё HLS отвергает как feedback dependence (см. publishState).
  *
  * ap_done ЭТОЙ СТАДИИ БЕЗВРЕДЕН. Барьер ap_sync_done держат обе половины
  * listen, а не она; её завершение ничего не блокирует.
  */
-void dual_echo_publish(hls::stream<ap_uint<32> >& attemptsFifo,
+void dual_echo_publish(publishState& ps,
+                       hls::stream<ap_uint<32> >& attemptsFifo,
                        hls::stream<ap_uint<32> >& stateFifo,
                        ap_uint<32>& listenAttempts,
                        ap_uint<32>& portState)
@@ -402,18 +425,13 @@ void dual_echo_publish(hls::stream<ap_uint<32> >& attemptsFifo,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     static ap_uint<32> lastAttempts = 0;
-#pragma HLS RESET variable=lastAttempts
-     static ap_uint<32> lastState = 0;
-#pragma HLS RESET variable=lastState
-
      if (!attemptsFifo.empty())
-          lastAttempts = attemptsFifo.read();
+          ps.lastAttempts = attemptsFifo.read();
      if (!stateFifo.empty())
-          lastState = stateFifo.read();
+          ps.lastState = stateFifo.read();
 
-     listenAttempts = lastAttempts;
-     portState      = lastState;
+     listenAttempts = ps.lastAttempts;
+     portState      = ps.lastState;
 }
 
 /*
@@ -658,6 +676,13 @@ void dual_echo_core(
      static hls::stream<ap_uint<16> > rxLengthFifo_b("rxLengthFifo_b");
      #pragma HLS STREAM variable=rxLengthFifo_b depth=512
 
+     // Состояние публикаторов — раздельное на половину, как st/ns/ds выше:
+     // стадия вызывается дважды, static внутри неё HLS отвергает.
+     static publishState pubs_a = {0, 0};
+     #pragma HLS RESET variable=pubs_a
+     static publishState pubs_b = {0, 0};
+     #pragma HLS RESET variable=pubs_b
+
      // Каналы телеметрии listen -> publish. Глубина 2: значения перезаписываются,
      // а не накапливаются, и publish читает чаще, чем listen пишет (тот пишет по
      // событию: запрос порта, подтверждение, повтор по таймауту).
@@ -685,7 +710,7 @@ void dual_echo_core(
                       attemptsFifo_a, stateFifo_a,
                       m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a);
 
-     dual_echo_publish(attemptsFifo_a, stateFifo_a,
+     dual_echo_publish(pubs_a, attemptsFifo_a, stateFifo_a,
                        listenAttempts_a, portState_a);
 
      dual_echo_rx_notify(ns_a, notifyCount_a,
@@ -700,7 +725,7 @@ void dual_echo_core(
                       attemptsFifo_b, stateFifo_b,
                       m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
-     dual_echo_publish(attemptsFifo_b, stateFifo_b,
+     dual_echo_publish(pubs_b, attemptsFifo_b, stateFifo_b,
                        listenAttempts_b, portState_b);
 
      dual_echo_rx_notify(ns_b, notifyCount_b,
