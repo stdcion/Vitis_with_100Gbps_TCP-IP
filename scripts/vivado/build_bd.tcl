@@ -229,15 +229,26 @@ set USER_PACKAGED "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/build_pack/packaged"
 if {[file exists "$USER_PACKAGED/component.xml"]} {
      puts "user-ядро: HDL-обёртка (build_pack/packaged) + HLS-IP как subcore"
      lappend ip_repos $USER_PACKAGED
-} elseif {[file isdirectory "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hdl"]} {
+} elseif {[llength [glob -nocomplain \
+               "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hdl/*.v" \
+               "$REPO_ROOT/kernel/user_krnl/$USER_KRNL/src/hdl/*.sv"]] > 0} {
      # Обёртка нужна, но не собрана — падаем здесь, а не через час на плате,
-     # где симптомом будет "ядро не видит enable".
+     # где симптомом будет "ядро не видит регистры управления".
+     #
+     # ПРОВЕРКА ПО ФАЙЛАМ, А НЕ ПО КАТАЛОГУ. Раньше стояло
+     # `file isdirectory .../src/hdl`, и это ломалось: у hls_dual_echo_krnl
+     # обёртку удалили (ядро перешло на s_axilite + ap_ctrl_hs, регистры
+     # генерирует HLS), но в src/hdl/ осталась tb/ с тестбенчами. Скрипт считал
+     # обёртку обязательной и валил шаг bd на ядре, которому она не нужна.
+     #
+     # Глоб только по верхнему уровню src/hdl/, без tb/ — тестбенчи в BD не идут.
+     # То же исправление в Makefile.vivado, переменная HAS_WRAPPER.
      puts ""
-     error "у $USER_KRNL есть src/hdl/, но нет build_pack/packaged/component.xml.\
-            Пропущен шаг 2.5 (упаковка обёртки):\
+     error "у $USER_KRNL есть src/hdl/*.v или *.sv, но нет\
+            build_pack/packaged/component.xml. Пропущен шаг 2.5 (упаковка обёртки):\
             make -f Makefile.vivado pack USER_KRNL=$USER_KRNL BOARD=$BOARD\
             Без него в BD попадёт сырое HLS-ядро без регистров управления,\
-            и хост не сможет задать порты и enable."
+            и хост не сможет задать порты."
 } else {
      puts "user-ядро: сырое HLS-IP (обёртки нет)"
 }
