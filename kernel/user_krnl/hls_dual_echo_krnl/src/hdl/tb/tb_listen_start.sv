@@ -1,31 +1,52 @@
 // =============================================================================
-// tb_listen_start -- почему стадия listen не открывает порт
+// tb_listen_start -- доходит ли до стадии listen поздно записанный enable
 // =============================================================================
 //
-// ЧТО ЭТО ПРОВЕРЯЕТ. Ровно одно утверждение:
+// ЧТО ЭТО ПРОВЕРЯЕТ. Один вопрос, ровно тот, что стоит на плате:
 //
-//     стадия dual_echo_listen делает конечное число проходов и замирает,
-//     если ap_start подан КОНСТАНТОЙ 1'b1, и работает непрерывно,
-//     если ap_start подан ИМПУЛЬСАМИ (как это делает auto_restart).
+//     стадия dual_echo_listen отработала при enable=0 (сразу после сброса,
+//     когда JTAG ещё ничего не записал). Заметит ли она enable=1, записанный
+//     через много тактов после этого?
+//
+// На плате наблюдается listenAttempts=0 при enable=1, читаемом обратно верно.
+// Значит либо стадия не видит enable, либо её больше не запускают. Здесь это
+// различается напрямую.
 //
 // Симулируется СГЕНЕРИРОВАННЫЙ HLS-RTL (hls_dual_echo_krnl_dual_echo_listen.v),
-// а не наша модель замысла. Поэтому результат -- свойство того железа, которое
-// прошивается в плату, а не наших рассуждений о нём.
+// то есть железо из битстрима, а не модель замысла.
 //
-// ЗАЧЕМ ОТДЕЛЬНЫЙ ТЕСТБЕНЧ, А НЕ csim. csim гоняет C++ и про ap_start не знает
-// вообще: в C++ вызов функции просто происходит. Механизм ap_start/ap_ready/
-// ap_sync появляется только при синтезе, поэтому дефект в нём НЕВИДИМ для csim
-// -- ядро проходило csim зелёным и не работало на плате. Здесь он виден.
+// ЧЕГО НЕ ПРОВЕРЯЕТ csim: механизм ap_start/ap_ready/ap_sync появляется только
+// при синтезе. В C++ вызов функции просто происходит, поэтому дефект в запуске
+// стадии для csim НЕВИДИМ -- ядро проходило csim зелёным и не работало на плате.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ИСТОРИЯ ЭТОГО ФАЙЛА -- ЧТОБЫ НЕ ПОВТОРИТЬ ОШИБКУ.
+//
+// Первая версия сравнивала ap_start константой против ap_start импульсами
+// (гипотеза: константа 1'b1 не даёт сбросить ap_sync_reg, поэтому стадия делает
+// один проход). Оба сценария дали ОДНУ запись, гипотеза опровергнута.
+//
+// Но опровергнута она была НЕ ПОТОМУ, что неверна, а потому что тестбенч был
+// слепым: он крутил 4000 тактов, а стадия ждёт ответа стека
+//
+//     dual_echo_listen.v:678
+//         assign icmp_ln250_fu_230_p2 = ((st_b_waitTimer > 20'd999999) ? 1 : 0);
+//
+// то есть МИЛЛИОН тактов (LISTEN_TIMEOUT в .cpp). За 4000 тактов повторный
+// запрос не наступает ни при какой схеме запуска -- измерялся штатный интервал
+// ожидания, а не дефект. Отсюда правило: длительность прогона проверять против
+// констант в СГЕНЕРИРОВАННОМ RTL, а не против интуиции.
+//
+// Заодно первая версия держала enable=1 с нулевого такта -- «условия лучше, чем
+// на плате». Это и убило проверку: на плате enable приходит ПОЗДНО, и весь
+// вопрос именно в этом. Теперь сценарий платы воспроизводится буквально.
+// ─────────────────────────────────────────────────────────────────────────────
 //
 // ПОЧЕМУ НЕ ИНСТАНЦИРУЕТСЯ dual_echo_core. У него 221 порт, из них измеряемых
-// три. Вместо этого берётся сама стадия, а логика ap_sync вокруг неё
-// ВОСПРОИЗВЕДЕНА ниже по сгенерированному RTL дословно (см. ap_sync_reg) --
-// с указанием строк оригинала, чтобы расхождение было видно при сверке.
+// три. Берётся сама стадия, а логика ap_sync вокруг неё воспроизведена ниже по
+// сгенерированному RTL дословно, со ссылками на строки оригинала.
 //
-// ЧЕГО НЕ ПРОВЕРЯЕТ: тайминг (это impl) и поведение стека (это плата).
-//
-// Сообщения на латинице -- $display в xsim 2024.1 портит многобайтовые
-// символы, см. пояснение в src/hdl/tb/run_sim.sh соседнего ядра.
+// Сообщения на латинице -- $display в xsim 2024.1 портит многобайтовые символы.
 
 `timescale 1ns / 1ps
 `default_nettype none
@@ -34,59 +55,49 @@ module tb_listen_start;
 
 // ── тактирование ─────────────────────────────────────────────────────────────
 logic ap_clk = 1'b0;
-always #2.5 ap_clk = ~ap_clk;          // 200 МГц, период не важен для логики
+always #2.5 ap_clk = ~ap_clk;          // 200 МГц; период на логику не влияет
 
-logic ap_rst = 1'b1;                   // HLS-стадия ждёт АКТИВНЫЙ-ВЫСОКИЙ сброс
+logic ap_rst = 1'b1;                   // стадия ждёт АКТИВНЫЙ-ВЫСОКИЙ сброс
 
-// ── общие входы стадии ───────────────────────────────────────────────────────
-//
-// enableB и listenPortB держим ВКЛЮЧЁННЫМИ с самого начала теста -- то есть
-// ставим ядро в условия ЛУЧШИЕ, чем на плате. На плате JTAG записывает enable
-// через десятки секунд после снятия сброса; если стадия молчит даже когда
-// enable=1 стоял всегда, то дело точно не в моменте записи.
-logic [31:0] enableB    = 32'd1;
+// ── входы стадии ─────────────────────────────────────────────────────────────
+logic [31:0] enableB     = 32'd0;      // НАЧИНАЕМ С НУЛЯ -- как на плате
 logic [15:0] listenPortB = 16'd5001;
 
-// Стек всегда готов принять запрос и никогда не отвечает статусом. Это
-// НАМЕРЕННО: нас интересует, сколько раз стадия ПОПЫТАЕТСЯ записать порт, а
-// не что будет после ответа. Отсутствие ответа -- то же, что на плате, где
-// listenAttempts остался нулём.
-logic m_axis_tcp_listen_port_b_TREADY  = 1'b1;
-logic s_axis_tcp_port_status_b_TVALID  = 1'b0;
-logic [7:0] s_axis_tcp_port_status_b_TDATA = 8'd0;
-logic [0:0] s_axis_tcp_port_status_b_TKEEP = 1'b1;
-logic [0:0] s_axis_tcp_port_status_b_TSTRB = 1'b1;
-logic [0:0] s_axis_tcp_port_status_b_TLAST = 1'b1;
-logic ap_ce = 1'b1;
+// Стек готов принять запрос, но статусом не отвечает НИКОГДА. Это сценарий
+// платы: там listenAttempts остался нулём, то есть до ответа дело не дошло.
+// Молчащий стек заставляет стадию идти по ветке waitTimer -> LISTEN_TIMEOUT,
+// которая и должна повторить запрос.
+logic       m_axis_tcp_listen_port_b_TREADY  = 1'b1;
+logic       s_axis_tcp_port_status_b_TVALID  = 1'b0;
+logic [7:0] s_axis_tcp_port_status_b_TDATA   = 8'd0;
+logic [0:0] s_axis_tcp_port_status_b_TKEEP   = 1'b1;
+logic [0:0] s_axis_tcp_port_status_b_TSTRB   = 1'b1;
+logic [0:0] s_axis_tcp_port_status_b_TLAST   = 1'b1;
+logic       ap_ce = 1'b1;
 
-// ── управление, которое и является предметом теста ───────────────────────────
+// ── управление ───────────────────────────────────────────────────────────────
+//
+// ap_start подаётся КОНСТАНТОЙ 1'b1 -- ровно как в собранном битстриме:
+//     hls_dual_echo_krnl.v:779  assign dual_echo_core_U0_ap_start = 1'b1;
+// Сравнение с импульсным вариантом убрано: оно проверяло опровергнутую
+// гипотезу и при верной длительности прогона ничего не различает.
 logic ap_start_drive = 1'b0;
 logic ap_continue    = 1'b1;
 
 wire ap_done, ap_idle, ap_ready;
 
-// ── ВОСПРОИЗВЕДЕНИЕ ap_sync ИЗ dual_echo_core.v ─────────────────────────────
+// ── ВОСПРОИЗВЕДЕНИЕ ap_sync ИЗ dual_echo_core.v ──────────────────────────────
 //
-// Дословно по сгенерированному RTL:
-//
-//   dual_echo_core.v:1373
-//       assign dual_echo_listen_U0_ap_start =
-//              ((ap_sync_reg_dual_echo_listen_U0_ap_ready ^ 1'b1) & ap_start);
-//
-//   dual_echo_core.v:1341
-//       assign ap_sync_dual_echo_listen_U0_ap_ready =
-//              (dual_echo_listen_U0_ap_ready | ap_sync_reg_..._ap_ready);
-//
-//   dual_echo_core.v:1179-1184  (регистр)
-//       if (ap_rst) ap_sync_reg <= 1'b0;
-//       else if ((ap_sync_ready & ap_start) == 1'b1) ap_sync_reg <= 1'b0;
-//       else ap_sync_reg <= ap_sync_..._ap_ready;
+//   core.v:1373  assign ..._ap_start = ((ap_sync_reg_..._ap_ready ^ 1'b1) & ap_start);
+//   core.v:1341  assign ap_sync_..._ap_ready = (..._ap_ready | ap_sync_reg_...);
+//   core.v:1179  if (ap_rst) ap_sync_reg <= 0;
+//                else if ((ap_sync_ready & ap_start) == 1) ap_sync_reg <= 0;
+//                else ap_sync_reg <= ap_sync_..._ap_ready;
 //
 // ap_sync_ready в оригинале -- И по ВСЕМ 14 стадиям (core.v:1347). Здесь стадия
-// одна, поэтому берём её собственную готовность. Это делает модель ОПТИМИСТИЧНЕЕ
-// настоящего железа: в реальном core сброс ap_sync_reg требует согласия всех 14
-// стадий, то есть случается РЕЖЕ, чем здесь. Если даже в оптимистичной модели
-// стадия замирает -- на плате тем более.
+// одна, поэтому берётся её собственная готовность. Модель ОПТИМИСТИЧНЕЕ железа:
+// в настоящем core сброс ap_sync_reg требует согласия всех 14 стадий, то есть
+// происходит РЕЖЕ. Если стадия замирает даже здесь -- на плате тем более.
 logic ap_sync_reg = 1'b0;
 wire  ap_sync_ap_ready = ap_ready | ap_sync_reg;
 wire  ap_sync_ready    = ap_sync_ap_ready;
@@ -144,33 +155,29 @@ hls_dual_echo_krnl_dual_echo_listen dut (
 
 // ── измерение ────────────────────────────────────────────────────────────────
 //
-// Считаем ПЕРЕДАЧИ на m_axis_tcp_listen_port_b -- это и есть «ядро попросило
-// стек открыть порт». Именно этот счётчик на плате читается как listenAttempts
-// и был нулём.
+// Считаем ПЕРЕДАЧИ на m_axis_tcp_listen_port_b: «ядро попросило стек открыть
+// порт». Именно этот счётчик на плате читается как listenAttempts и был нулём.
 int unsigned port_writes = 0;
-int unsigned cycles      = 0;
 
 always @(posedge ap_clk) begin
-     if (!ap_rst) begin
-          cycles <= cycles + 1;
+     if (!ap_rst)
           if (m_axis_tcp_listen_port_b_TVALID && m_axis_tcp_listen_port_b_TREADY)
                port_writes <= port_writes + 1;
-     end
 end
 
-task automatic reset_all();
-     ap_rst = 1'b1;
-     ap_start_drive = 1'b0;
-     @(posedge ap_clk); @(posedge ap_clk);
-     port_writes = 0;
-     cycles      = 0;
-     ap_rst = 1'b0;
-     @(posedge ap_clk);
-endtask
+// Проход стадии = импульс ap_ready. Отдельный счётчик отвечает на вопрос
+// «стадию ещё запускают, или она замерла?» -- без него «нет записи» не
+// отличить от «нет запусков».
+int unsigned ready_pulses = 0;
+
+always @(posedge ap_clk) begin
+     if (!ap_rst)
+          if (ap_ready)
+               ready_pulses <= ready_pulses + 1;
+end
 
 // ── прогон ───────────────────────────────────────────────────────────────────
 int unsigned fails = 0;
-int unsigned writes_const, writes_pulse;
 
 task automatic check(string what, bit cond);
      if (cond) $display("  ok   %s", what);
@@ -180,83 +187,88 @@ task automatic check(string what, bit cond);
      end
 endtask
 
-localparam int RUN_CYCLES = 4000;
+// LISTEN_TIMEOUT из сгенерированного RTL: st_b_waitTimer > 20'd999999
+// (dual_echo_listen.v:678). Прогон ПОСЛЕ enable должен заведомо перекрыть его,
+// иначе повторный запрос не наступит и тест снова окажется слепым.
+localparam int LISTEN_TIMEOUT = 1_000_000;
+localparam int AFTER_ENABLE   = LISTEN_TIMEOUT + 200_000;
+
+// Сколько тактов ядро крутится при enable=0 -- имитация задержки JTAG. На плате
+// это десятки секунд; здесь достаточно тысяч, потому что вопрос качественный:
+// стадия уже отработала проход при enable=0 и ушла в ap_done.
+localparam int BEFORE_ENABLE = 5_000;
+
+int unsigned writes_before, ready_before;
 
 initial begin
-     $display("=== tb_listen_start: ap_start const vs pulsed ===");
+     $display("=== tb_listen_start: does a late enable reach the stage? ===");
      $display("");
 
-     // ── СЦЕНАРИЙ A: ap_start = 1'b1 навсегда ────────────────────────────
-     //
-     // Это ТОЧНО то, что стоит в собранном битстриме:
-     //     hls_dual_echo_krnl.v:779  assign dual_echo_core_U0_ap_start = 1'b1;
-     $display("--- A: ap_start tied to 1'b1 (what the bitstream has) ---");
-     reset_all();
-     ap_start_drive = 1'b1;
-     repeat (RUN_CYCLES) @(posedge ap_clk);
-     writes_const = port_writes;
-     $display("  listen_port writes in %0d cycles: %0d", RUN_CYCLES, writes_const);
+     // ── сброс ────────────────────────────────────────────────────────────
+     ap_rst         = 1'b1;
+     ap_start_drive = 1'b0;
+     repeat (4) @(posedge ap_clk);
+     ap_rst         = 1'b0;
+     @(posedge ap_clk);
+     ap_start_drive = 1'b1;              // как 1'b1 в битстриме
+
+     // ── фаза 1: enable=0, ядро живёт само по себе ────────────────────────
+     $display("--- phase 1: enable=0 (JTAG has not written yet) ---");
+     repeat (BEFORE_ENABLE) @(posedge ap_clk);
+     writes_before = port_writes;
+     ready_before  = ready_pulses;
+     $display("  port writes  : %0d", writes_before);
+     $display("  ready pulses : %0d", ready_before);
      $display("  portState=%0d listenAttempts=%0d", portState_b, listenAttempts_b);
 
-     // Стадия обязана слать запрос ПОВТОРНО, пока стек не подтвердил порт: в
-     // dual_echo_listen на это есть ветка LISTEN_TIMEOUT, которая сбрасывает
-     // portRequested. Если запись всего одна -- значит конвейер встал, и ветка
-     // таймаута никогда не исполнится.
-     check("A: stage keeps retrying (more than 1 write)", writes_const > 1);
+     // При enable=0 стадия обязана молчать: в .cpp это ветка
+     // if (!enable) { portState = 0; return; }
+     check("phase 1: no port request while disabled", writes_before == 0);
 
-     // ── СЦЕНАРИЙ B: ap_start импульсами, как делает auto_restart ─────────
+     // Стадию ДОЛЖНЫ запускать повторно. Если проходов ноль или один -- она
+     // замерла, и тогда никакой enable её уже не разбудит. ЭТО ГЛАВНАЯ
+     // ПРОВЕРКА: именно она отвечает на вопрос платы.
+     check("phase 1: stage is still being restarted (ready pulses > 1)",
+           ready_before > 1);
+
+     // ── фаза 2: JTAG записал enable=1 ────────────────────────────────────
+     $display("");
+     $display("--- phase 2: enable=1 written late ---");
+     enableB = 32'd1;
+
+     // Ждём немного: первый запрос должен уйти почти сразу после enable.
+     repeat (100) @(posedge ap_clk);
+     $display("  after 100 cycles: port writes=%0d portState=%0d listenAttempts=%0d",
+              port_writes, portState_b, listenAttempts_b);
+     check("phase 2: first port request goes out right after enable",
+           port_writes >= 1);
+
+     // ── фаза 3: молчащий стек -> повтор по таймауту ──────────────────────
      //
-     // control_s_axi.v:284-286 (сгенерированный HLS для hls_recv_krnl):
-     //     if (WDATA[0])      int_ap_start <= 1'b1;
-     //     else if (ap_ready) int_ap_start <= int_auto_restart;
-     // То есть ap_start опускается на ap_ready и снова поднимается. Здесь это
-     // воспроизведено буквально.
+     // Стек не отвечает, значит через LISTEN_TIMEOUT тактов стадия обязана
+     // сбросить portRequested и попросить снова. Прогон с запасом.
      $display("");
-     $display("--- B: ap_start pulsed on ap_ready (what auto_restart does) ---");
-     reset_all();
-     fork
-          begin : pulse_driver
-               ap_start_drive = 1'b1;
-               forever begin
-                    @(posedge ap_clk);
-                    if (ap_ready) begin
-                         ap_start_drive = 1'b0;   // спад -- как int_ap_start
-                         @(posedge ap_clk);
-                         ap_start_drive = 1'b1;   // auto_restart поднимает снова
-                    end
-               end
-          end
-          begin : run_b
-               repeat (RUN_CYCLES) @(posedge ap_clk);
-          end
-     join_any
-     disable fork;
-     writes_pulse = port_writes;
-     $display("  listen_port writes in %0d cycles: %0d", RUN_CYCLES, writes_pulse);
+     $display("--- phase 3: stack stays silent, retry after LISTEN_TIMEOUT ---");
+     repeat (AFTER_ENABLE) @(posedge ap_clk);
+     $display("  port writes  : %0d", port_writes);
+     $display("  ready pulses : %0d", ready_pulses);
      $display("  portState=%0d listenAttempts=%0d", portState_b, listenAttempts_b);
-
-     check("B: stage keeps retrying (more than 1 write)", writes_pulse > 1);
-
-     // ── ГЛАВНОЕ СРАВНЕНИЕ ───────────────────────────────────────────────
-     $display("");
-     $display("--- verdict ---");
-     $display("  const ap_start : %0d writes", writes_const);
-     $display("  pulsed ap_start: %0d writes", writes_pulse);
-     check("pulsed ap_start produces strictly more writes than const",
-           writes_pulse > writes_const);
+     check("phase 3: request is retried (more than one write)", port_writes > 1);
+     check("phase 3: listenAttempts follows the writes",
+           listenAttempts_b == port_writes);
 
      $display("");
-     if (fails == 0) begin
+     if (fails == 0)
           $display("=== ALL GREEN ===");
-     end else begin
+     else
           $display("=== FAILED: %0d ===", fails);
-     end
      $finish;
 end
 
-// Страховка от вечного прогона, если стадия почему-то залипнет в X.
+// Страховка. Прогон длинный (>1.2 млн тактов при 5 нс = ~6 мс модельного
+// времени), поэтому лимит с запасом.
 initial begin
-     #200000;
+     #20_000_000;
      $display("*** TIMEOUT -- testbench did not finish");
      $finish;
 end
