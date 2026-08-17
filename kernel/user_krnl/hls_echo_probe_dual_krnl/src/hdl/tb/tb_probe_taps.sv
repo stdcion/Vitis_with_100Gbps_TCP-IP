@@ -194,9 +194,6 @@ module hls_echo_probe_dual_krnl_ip (
      input  wire [31:0] listenPort,
      input  wire [31:0] msgBytes,
      input  wire [31:0] triggerGo,
-     input  wire [31:0] enableConn,
-     input  wire [31:0] enableTraffic,
-     input  wire [31:0] enableListen,
 
      output wire [31:0] connAttempts,
      output wire [31:0] sentCount,       output wire sentCount_ap_vld,

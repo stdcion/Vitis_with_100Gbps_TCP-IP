@@ -97,9 +97,8 @@ module tb_probe_ctrl;
      // ломалась цепочка при s_axilite -- регистр читался верно, а на провод
      // приходил ноль. Подсматриваем прямо в инстанс обёртки иерархическим
      // именем: так проверяется то, что реально доедет до ядра.
-     wire [31:0] w_enableConn    = dut.hls_echo_probe_dual_krnl_inst.enableConn;
-     wire [31:0] w_enableTraffic = dut.hls_echo_probe_dual_krnl_inst.enableTraffic;
-     wire [31:0] w_enableListen  = dut.hls_echo_probe_dual_krnl_inst.enableListen;
+     // Проводов enable в ядро больше нет: их роль взял ap_start. Регистр 0x10
+     // остался и проверяется чтением -- см. фазу 3.
      wire [31:0] w_serverIp      = dut.hls_echo_probe_dual_krnl_inst.serverIp;
      wire [31:0] w_serverPort    = dut.hls_echo_probe_dual_krnl_inst.serverPort;
      wire [31:0] w_listenPort    = dut.hls_echo_probe_dual_krnl_inst.listenPort;
@@ -281,17 +280,28 @@ module tb_probe_ctrl;
           // дефекта HLS (скаляр, читаемый тремя стадиями, размножается
           // несимметрично и вешает регион). Снаружи по-прежнему один регистр
           // 0x10, и вот это здесь и проверяется: все три порта идут от него.
-          $display("\n[3] enable: one register drives three kernel ports");
-          `chk("all three are 0 before the write",
-               (w_enableConn === 32'b0) && (w_enableTraffic === 32'b0) &&
-               (w_enableListen === 32'b0));
+          // ── 3. enable: РЕГИСТР ОСТАЛСЯ, В ЯДРО НЕ ИДЁТ ──────────────────
+          //
+          // Раньше здесь проверялось, что enable_reg доходит до трёх портов ядра
+          // (enableConn/enableTraffic/enableListen). Этих портов больше нет: их
+          // роль взял ap_start -- ядро ap_ctrl_hs и стоит в ap_idle, пока хост не
+          // записал ap_ctrl, поэтому обратиться к стеку раньше network_start
+          // физически не может. Ровно та гонка, ради которой enable и вводился.
+          //
+          // Сам регистр 0x10 оставлен намеренно: он читается обратно и служит
+          // признаком «битстрим жив, регистры отвечают», а адресная карта и
+          // jtag_ctrl.tcl не меняются. Проверяем именно это -- запись и чтение.
+          $display("\n[3] enable register: readable, no longer wired to the kernel");
           axi_write(A_ENABLE, 32'd1);
           repeat (2) @(negedge clk);
           axi_read(A_ENABLE, v);
           `chk("enable readback", v === 32'd1);
-          `chk("enableConn    = 1", w_enableConn    === 32'd1);
-          `chk("enableTraffic = 1", w_enableTraffic === 32'd1);
-          `chk("enableListen  = 1", w_enableListen  === 32'd1);
+          axi_write(A_ENABLE, 32'd0);
+          repeat (2) @(negedge clk);
+          axi_read(A_ENABLE, v);
+          `chk("enable clears", v === 32'd0);
+          axi_write(A_ENABLE, 32'd1);
+          repeat (2) @(negedge clk);
 
           // ── 4. triggerGo меняется МНОГОКРАТНО ────────────────────────────
           //
@@ -482,9 +492,9 @@ module tb_probe_ctrl;
           axi_read(A_ENABLE, v);   `chk("enable cleared by reset",  v === 32'b0);
           axi_read(A_TRIGGER, v);  `chk("triggerGo cleared",        v === 32'b0);
           axi_read(A_SMPREADY, v); `chk("sampleReady cleared",      v === 32'b0);
-          `chk("enable wires to the kernel are 0 again",
-               (w_enableConn === 32'b0) && (w_enableTraffic === 32'b0) &&
-               (w_enableListen === 32'b0));
+          // Проводов enable в ядро больше нет -- проверяем сам регистр.
+          axi_read(A_ENABLE, v);
+          `chk("enable register cleared by reset", v === 32'd0);
 
           $display("");
           if (errors == 0) $display("=== tb_probe_ctrl: ALL GREEN ===");

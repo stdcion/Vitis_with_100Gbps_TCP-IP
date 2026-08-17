@@ -1077,9 +1077,12 @@ hls_echo_probe_dual_krnl_ip hls_echo_probe_dual_krnl_inst (
      // стадия останавливала весь DATAFLOW-регион. Именно так сломался
      // hls_dual_echo_krnl на плате: enable=1 читался обратно, а ядро не
      // исполнялось вовсе.
-     .enableConn     ( enable_reg     ),
-     .enableTraffic  ( enable_reg     ),
-     .enableListen   ( enable_reg     ),
+     // enableConn/enableTraffic/enableListen БОЛЬШЕ НЕ ПОДКЛЮЧАЮТСЯ: у ядра нет
+     // таких портов. Их роль взял ap_start -- ядро ap_ctrl_hs и стоит в ap_idle,
+     // пока хост не записал ap_ctrl, поэтому раньше network_start к стеку не
+     // обратится. Регистр 0x10 в probe_control_s_axi оставлен: он читается
+     // обратно и служит признаком «битстрим жив, регистры отвечают», а
+     // jtag_ctrl.tcl и адресная карта не меняются.
 
      // ── счётчики событий наружу ──
      //

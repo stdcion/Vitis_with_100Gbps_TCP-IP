@@ -167,7 +167,7 @@ static_assert((EPD_MAX_WORDS & (EPD_MAX_WORDS - 1)) == 0,
  * одновременно, и клиент может успеть раньше сервера. Поэтому при
  * отказе ждём retryDelay тактов и пробуем снова, а не сдаёмся.
  */
-void epd_client_connect(int enable,
+void epd_client_connect(
                         int serverIp,
                         int serverPort,
                         ap_uint<32>& connAttempts,
@@ -190,9 +190,11 @@ void epd_client_connect(int enable,
      // listen-порт. 100000 тактов ≈ 0.6 мс на 165 МГц.
      const ap_uint<32> retryDelay = 100000;
 
-     if (!enable)
-          return;
-
+     // Ветки `if (!enable) return;` здесь больше нет: роль enable взял на себя
+     // ap_start. Ядро стоит в ap_idle, пока хост не записал ap_ctrl, поэтому
+     // стадия физически не может обратиться к стеку раньше network_start -- ровно
+     // та гонка, ради которой enable и вводился. Заодно ушёл ранний return,
+     // который в PIPELINE-стадии защёлкивал ap_done_reg.
      switch (st)
      {
      case IDLE:
@@ -258,7 +260,7 @@ void epd_client_connect(int enable,
  * данные. Если писать данные раньше подтверждения, стек их отбросит.
  * Порядок взят из hls_pingpong_krnl, где он проверен тестбенчем.
  */
-void epd_client_traffic(int enable,
+void epd_client_traffic(
                         int msgBytes,
                         int triggerGo,
                         hls::stream<ap_uint<16> >& sessionFifo,
@@ -304,7 +306,9 @@ void epd_client_traffic(int enable,
           connected = true;
      }
 
-     if (!enable || !connected)
+     // Условие enable убрано (его роль у ap_start), проверка connected остаётся:
+     // без открытой сессии отправлять нечего.
+     if (!connected)
           return;
 
      // Число слов для сообщения: ceil(msgBytes / 64), с ограничением.
@@ -509,7 +513,7 @@ void epd_client_traffic(int enable,
  * Структура повторяет ppp_listen из hls_pingpong_probe_krnl — там она
  * продумана и снабжена пояснением про гонку с enable.
  */
-void epd_server_listen(int enable,
+void epd_server_listen(
                        int listenPort,
                        ap_uint<32>& listenAttempts,
                        ap_uint<32>& portState,
@@ -528,15 +532,9 @@ void epd_server_listen(int enable,
      static ap_uint<32> attempts = 0;
 #pragma HLS RESET variable=attempts
 
-     if (!enable)
-     {
-          // Не затираем 2, если порт уже был открыт: enable=0 не закрывает
-          // listen в стеке, так что рапортовать "ждём enable" было бы
-          // неправдой. Ноль показываем только до первого запроса.
-          if (!portRequested)
-               portState = 0;
-          return;
-     }
+     // Ветка `if (!enable)` убрана: ядро не работает до ap_start, а после него
+     // останавливать listen незачем -- enable=0 всё равно не закрывал порт в
+     // стеке. portState=0 до первого запроса выставляется ниже, в самом автомате.
 
      if (!portRequested)
      {
@@ -875,7 +873,6 @@ void epd_core(
      // параметры
      // enableConn/Traffic/Listen — одно значение из обёртки, раздельные
      // аргументы, чтобы у каждого был ОДИН читатель (см. шапку топ-функции).
-     int enableConn, int enableTraffic, int enableListen,
      int serverIp, int serverPort, int listenPort,
      int msgBytes, int triggerGo,
      // счётчики событий. Время по их ap_vld штампует HDL-обёртка — таймстемпов
@@ -914,9 +911,6 @@ void epd_core(
      // читается и сравнивается с прошлым значением. Скаляр, меняющийся КАЖДЫЙ
      // такт, здесь больше не передаётся — попытка так сделать (cycleCount)
      // кончилась несимметричным размножением через FIFO, см. пояснение выше.
-#pragma HLS stable variable = enableConn
-#pragma HLS stable variable = enableTraffic
-#pragma HLS stable variable = enableListen
 #pragma HLS stable variable = serverIp
 #pragma HLS stable variable = serverPort
 #pragma HLS stable variable = listenPort
@@ -935,11 +929,11 @@ void epd_core(
      // ap_vld счётчиков событий.
 
      // --- клиент (порт 0) ---
-     epd_client_connect(enableConn, serverIp, serverPort, connAttempts,
+     epd_client_connect(serverIp, serverPort, connAttempts,
                         sessionFifo,
                         m_axis_tcp_open_connection_a, s_axis_tcp_open_status_a);
 
-     epd_client_traffic(enableTraffic, msgBytes, triggerGo,
+     epd_client_traffic(msgBytes, triggerGo,
                         sessionFifo,
                         sentCount, recvCount, timeoutCount,
                         m_axis_tcp_tx_meta_a, m_axis_tcp_tx_data_a,
@@ -948,7 +942,7 @@ void epd_core(
                         s_axis_tcp_rx_meta_a, s_axis_tcp_rx_data_a);
 
      // --- сервер-эхо (порт 1) ---
-     epd_server_listen(enableListen, listenPort, listenAttempts, portState,
+     epd_server_listen(listenPort, listenAttempts, portState,
                        m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
      epd_server_echo(echoRxCount, echoCount,
@@ -1042,7 +1036,7 @@ void hls_echo_probe_dual_krnl(
                // Растущий listenAttempts при portState=1 означает, что стек
                // не отвечает на запрос listen.
                ap_uint<32>& listenAttempts,
-               ap_uint<32>& portState,
+               ap_uint<32>& portState
 
                // ── ТАЙМСТЕМПОВ ЗДЕСЬ БОЛЬШЕ НЕТ ──
                //
@@ -1061,41 +1055,17 @@ void hls_echo_probe_dual_krnl(
                // Вычитание беззнаковое по модулю 2^32 — переполнение счётчика
                // (раз в 26 с на 165 МГц) измерение не портит.
 
-               // enable — разрешение начать работу. Пока 0, ядро не трогает
-               // ни один порт стека: до этого момента параметры в регистрах
-               // могут быть не записаны.
+               // ── enable БОЛЬШЕ НЕ АРГУМЕНТ ──
                //
-               // Раньше здесь стояло «ВСЕГДА последний»: при s_axilite
-               // смещения регистров зависели от порядка аргументов, и сдвиг
-               // enable молча ломал jtag_ctrl.tcl. Теперь адресная карта
-               // задана руками в probe_control_s_axi.v, и порядок аргументов
-               // на смещения не влияет вообще.
-               // ── enable: ТРИ аргумента на одно значение ──
+               // Было три: enableConn/enableTraffic/enableListen -- разделены,
+               // чтобы у каждого был ОДИН читатель, иначе HLS размножает скаляр
+               // несимметрично (одной стадии провод, другой FIFO с блокировкой).
                //
-               // Обёртка подаёт на все три один и тот же регистр (0x10), так что
-               // снаружи это по-прежнему ОДИН enable: адресная карта и
-               // jtag_ctrl.tcl не меняются.
-               //
-               // ЗАЧЕМ РАЗДЕЛЕНО. Пока это был один аргумент, его читали ТРИ
-               // стадии (epd_client_connect, epd_client_traffic,
-               // epd_server_listen), и HLS раздавал такой скаляр
-               // НЕСИММЕТРИЧНО: часть читателей получала провод, часть —
-               // FIFO-канал с блокировкой по empty_n. Стадия на канале
-               // вставала, а через ap_ready/ap_continue DATAFLOW-региона
-               // вставал весь регион.
-               //
-               // Это НЕ теория: ровно так сломался hls_dual_echo_krnl на плате
-               // (dual_echo_core.v: половине a достался .enable(empty_176),
-               // половине b — .enable_dout/.enable_empty_n/.enable_read через
-               // FIFO p_c_U). Симптом: регистры живые, enable=1 читается
-               // обратно, а вся телеметрия нули навсегда и ядро не исполняется.
-               // csynth при этом был чистый — видно только в syn/verilog.
-               //
-               // Теперь у каждого аргумента ОДИН читатель. Тот же приём, что с
-               // cycleCount: не давать HLS решать, как размножить скаляр.
-               int enableConn,
-               int enableTraffic,
-               int enableListen
+               // Их роль взял ap_start: ядро ap_ctrl_hs и стоит в ap_idle, пока
+               // хост не записал ap_ctrl, поэтому обратиться к стеку раньше
+               // network_start физически не может -- ровно та гонка, ради которой
+               // enable и вводился. Регистр 0x10 в probe_control_s_axi остался
+               // (обёртку не трогаем), но в ядро больше не идёт.
                       ) {
 
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
@@ -1248,9 +1218,6 @@ void hls_echo_probe_dual_krnl(
 // register: значение защёлкивается на входе порта, что даёт чистую границу для
 // таймингового анализа и снимает длинный комбинационный путь от регистра в
 // обёртке до логики стадии.
-#pragma HLS INTERFACE ap_none register port = enableConn
-#pragma HLS INTERFACE ap_none register port = enableTraffic
-#pragma HLS INTERFACE ap_none register port = enableListen
 #pragma HLS INTERFACE ap_none register port = serverIp
 #pragma HLS INTERFACE ap_none register port = serverPort
 #pragma HLS INTERFACE ap_none register port = listenPort
@@ -1278,7 +1245,6 @@ void hls_echo_probe_dual_krnl(
               m_axis_tcp_tx_meta_b, m_axis_tcp_tx_data_b,
               s_axis_tcp_tx_status_b,
 
-              enableConn, enableTraffic, enableListen,
               serverIp, serverPort, listenPort,
               msgBytes, triggerGo,
 
