@@ -177,25 +177,6 @@ struct notifyState
      ap_uint<32> notifications;
 };
 
-/*
- * Состояние публикатора телеметрии — тоже В СТРУКТУРЕ, по той же причине, что
- * notifyState выше: dual_echo_publish вызывается ДВАЖДЫ, по разу на половину, и
- * static внутри неё HLS отвергает:
- *
- *     ERROR: [HLS 200-471] Dataflow form checks found feedback dependence
- *            in dataflow-region for global/static variable lastAttempts
- *
- * Первая версия публикатора держала lastAttempts/lastState в static — и csynth
- * упал ровно на этом. Урок тот же, что был усвоен для notify/drain: две стадии
- * одного dataflow-региона не могут делить static, состояние выносится наружу и
- * передаётся по ссылке.
- */
-struct publishState
-{
-     ap_uint<32> lastAttempts;
-     ap_uint<32> lastState;
-};
-
 struct drainState_t
 {
      enum { IDLE, FORWARD } st;
@@ -212,147 +193,47 @@ struct listenState
 /*
  * Открывает listen-порт и держит его.
  *
- * portState отдаётся наружу проводом (регистр держит HDL-обёртка), чтобы по
- * JTAG было видно, на чём именно встало: 0=ждём enable, 1=запрос отправлен,
- * 2=порт открыт. Без этого "соединение не устанавливается" не отличить от
- * "порт не открылся", а на плате это единственный способ понять разницу.
+ * КОРОТКАЯ СТАДИЯ, БЕЗ ЦИКЛА -- ФОРМА КАК У АПСТРИМА. При ap_ctrl_hs непрерывность
+ * даёт auto_restart: хост пишет 0x81, и железо перезапускает регион само, без
+ * участия хоста. Именно так работает hls_recv_krnl на этой плате.
+ *
+ * ЗДЕСЬ БЫЛ `while (enable)`, И ОН БОЛЬШЕ НЕ НУЖЕН. Цикл появился, чтобы стадия
+ * не выдавала ap_done и тем держала барьер ap_sync_done в нуле (тот барьер --
+ * И по ap_done всех стадий региона, dual_echo_core.v). При ap_ctrl_none барьер
+ * оживал и замораживал регион после одного прохода; цикл это лечил, но ломал
+ * выходные скаляры: HLS отдаёт их при возврате из функции, а возврата не было.
+ * С ap_ctrl_hs барьер снимается импульсом ap_start от auto_restart, поэтому цикл
+ * не нужен, и телеметрия работает штатно.
+ *
+ * ГОНКУ СО СТЕКОМ ТЕПЕРЬ РЕШАЕТ ap_start, А НЕ enable. Ядро стоит в ap_idle,
+ * пока хост не записал ap_ctrl -- значит listen физически не может уйти в стек
+ * раньше network_start. Аргумент enable удалён: он дублировал ap_start.
+ *
+ * portState: 0=ещё не запрашивали, 1=запрос отправлен, 2=порт подтверждён. Без
+ * него "соединение не устанавливается" не отличить от "порт не открылся", а на
+ * плате это единственный способ понять разницу.
+ *
+ * ПОВТОР ПО ТАЙМАУТУ. waitTimer тикает раз на ПРОХОД стадии, а не раз на такт:
+ * при auto_restart проходы идут непрерывно, поэтому смысл сохраняется, но
+ * абсолютное время до повтора зависит от каденции перезапусков. Для listen это
+ * неважно -- нужен сам факт повтора, а не его точный период.
  */
-void dual_echo_listen(int enable,
-                      int listenPort,
+void dual_echo_listen(int listenPort,
                       listenState& st,
-                      hls::stream<ap_uint<64> >& telemetryFifo,
+                      ap_uint<32>& listenAttempts,
+                      ap_uint<32>& portState,
                       hls::stream<pkt16>& m_axis_tcp_listen_port,
                       hls::stream<pkt8>& s_axis_tcp_port_status)
 {
+#pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     // ── ТЕЛЕМЕТРИЯ ИДЁТ ПОТОКОМ, А НЕ ВЫХОДНЫМ СКАЛЯРОМ ─────────────────────
-     //
-     // Выходной скаляр (`ap_uint<32>&`) здесь не работает В ПРИНЦИПЕ, и это
-     // проверено двумя прогонами, а не выведено рассуждением:
-     //
-     //   1. `while (true)` -> HLS выбросил порты совсем:
-     //        WARNING: [RTGEN 206-101] Port 'portState_a' has no fanin or
-     //                                 fanout and is left dangling.
-     //   2. `while (enable)` + инициализация до цикла -> порты выжили и стали
-     //      ap_vld, но значения НЕ ОБНОВЛЯЛИСЬ: тест показал portState=0 и
-     //      listenAttempts=0 при трёх реальных записях listen-порта на шине.
-     //
-     // Причина структурная: HLS вынес тело цикла в ОТДЕЛЬНЫЙ модуль
-     // (`dual_echo_listen_Pipeline_VITIS_LOOP_*` в логе csynth), а выходной
-     // скаляр отдаётся на пути к возврату из ВНЕШНЕЙ функции. Записи из тела до
-     // порта родителя не доходят -- наружу уходит только то, что записано перед
-     // циклом.
-     //
-     // Поэтому счётчики уходят в hls::stream, а публикует их отдельная короткая
-     // стадия `dual_echo_publish` (см. ниже): она возвращается каждый проход,
-     // поэтому её ap_vld-выход работает штатно -- ровно как у `rx_notify`, где
-     // notifyCount никогда и не терялся, потому что та стадия без цикла.
-     //
-     // Глубина 2 достаточна: значения перезаписываются, а не накапливаются;
-     // публикатор читает быстрее, чем listen пишет (тот пишет по событию, не
-     // каждый такт).
-
-     // ── ВЕЧНЫЙ ЦИКЛ: СТАДИЯ НЕ ДОЛЖНА ВЫДАВАТЬ ap_done ──────────────────────
-     //
-     // ЗАЧЕМ. В dataflow-регионе `ap_continue` каждой стадии равен `ap_sync_done`
-     // — логическому И по `ap_done` ВСЕХ 14 стадий (dual_echo_core.v:1337). А
-     // внутри стадии `ap_done_reg` сбрасывается только по `ap_continue`
-     // (dual_echo_listen.v:303), и пока он поднят, конвейер заблокирован (:609).
-     //
-     // Пока ВСЕ стадии короткие, `ap_sync_done` вычисляется каждый такт и требует
-     // совпадения 14 сигналов с разными периодами (у нас смесь II=1 и II=2).
-     // Совпадения не происходит, `ap_continue` не приходит, и каждая стадия
-     // встаёт после ПЕРВОГО прохода. Измерено на полном ядре в tb_core_ap_done:
-     // 3 млн тактов при enable=1 и TREADY=1 дали ОДНУ запись listen-порта вместо
-     // повторов по таймауту.
-     //
-     // Достаточно ОДНОЙ незавершающейся стадии, чтобы `ap_sync_done` навсегда
-     // ушёл в ноль: тогда барьер просто не срабатывает, и остальные стадии
-     // перестают в него упираться. Именно так устроен упстрим — и это НЕ
-     // самодеятельность:
-     //
-     //   * hls_recv_krnl, recvData_handshake (communication.hpp:1218):
-     //         do { ... } while (rxByteCnt < expRxBytePerSession);
-     //     `expRxBytePerSession` задаёт хост, на плате это минуты работы.
-     //     В отчёте csynth латентность такой стадии — «?», ap_done не выдаётся.
-     //   * iperf_krnl, client (iperf_client.cpp:170) — FSM в цикле, тоже не
-     //     завершается.
-     //
-     // То есть у авторов барьер `ap_sync_done` МЁРТВ ПО ПОСТРОЕНИЮ: его держит
-     // долгоживущая стадия. Мы его случайно оживили, сделав все стадии
-     // короткими.
-     //
-     // ПОЧЕМУ ПРАГМА ПЕРЕЕХАЛА ВНУТРЬ. `PIPELINE II=1` относится к телу цикла, а
-     // не к функции: снаружи он бы конвейеризовал функцию целиком и цикл остался
-     // бы последовательным.
-     //
-     // `return` ЗАМЕНЁН НА `continue` — иначе выход из функции завершил бы её и
-     // вернул ту самую `ap_done`, ради отсутствия которой цикл и заведён.
-     //
-     // `static`-состояние (st) остаётся снаружи: внутри цикла оно живёт всё время
-     // работы ядра, рестарта больше нет. Ср. hls-early-return-stops-stage.
-     //
-     // ПРО ГРАНИЦУ ЦИКЛА В csim. Вечный цикл повесил бы csim: тестбенч вызывает
-     // топ-функцию и ждёт возврата (test_hls_dual_echo_krnl.cpp:113). Поэтому
-     // УСЛОВИЕ ВЫХОДА — enable, А НЕ `true` И НЕ ТАЙМЕР.
-     //
-     // Сначала здесь стоял `while (true)`, и это дало новый дефект: HLS выбросил
-     // выходные скаляры, потому что бесконечная функция не возвращается и отдавать
-     // значение некому. В логе csynth это видно дословно:
-     //
-     //     WARNING: [RTGEN 206-101] Port 'portState_a' has no fanin or fanout
-     //                              and is left dangling.
-     //     (то же для listenAttempts_a/_b, portState_b)
-     //
-     // То есть listenAttempts и portState на плате читались бы нулями при
-     // работающем ядре — ровно тот симптом, который мы месяц искали.
-     //
-     // КАК ЭТО СДЕЛАНО У УПСТРИМА. recvData_handshake (communication.hpp:1239):
-     //
-     //     ap_uint<64> rxByteCnt = 0;
-     //     do { ... rxByteCnt += length; } while (rxByteCnt < expRxBytePerSession);
-     //
-     // Условие выхода — ПАРАМЕТР ОТ ХОСТА, а счётчик растёт только от реального
-     // трафика. Нет трафика — цикл не выходит никогда, сколько бы времени ни
-     // прошло. Это НЕ таймер: работа заканчивается, когда сделана, а не когда
-     // истекло время.
-     //
-     // У listen естественного «объёма работы» нет — порт держится бессрочно.
-     // Прямой аналог здесь — сам enable: пока хост его держит, работаем; снял —
-     // выходим. Свойства получаются те же, что у упстрима:
-     //
-     //   * пока enable=1, функция НЕ возвращается -> ap_done не выдаётся ->
-     //     барьер ap_sync_done (И по всем 14 стадиям, core.v:1337) не срабатывает,
-     //     и ap_continue больше никого не блокирует;
-     //   * функция ФОРМАЛЬНО завершается -> выходные скаляры живы, телеметрия
-     //     доходит до обёртки;
-     //   * csim завершается сам: тестбенч ставит enable=0.
-     //
-     // Ветка `if (!enable) { portState = 0; ... }` из тела убрана — теперь это
-     // условие цикла. portState=0 выставляется ДО входа, иначе при enable=0 с
-     // самого старта хост не увидел бы «ждём enable» вообще.
-     // ОБА ВЫХОДА ПИШУТСЯ ДО ЦИКЛА, И ЭТО НЕ КОСМЕТИКА.
-     //
-     // Публикация в поток НЕБЛОКИРУЮЩАЯ: если публикатор почему-то не успел,
-     // теряется отчёт, а не работа. Блокирующая запись остановила бы стадию,
-     // держащую барьер, — то есть телеметрия смогла бы уронить всё ядро.
-     // Пара (attempts, state) в одном слове: запись атомарна, значения на хосте
-     // всегда согласованы между собой.
-     if (!telemetryFifo.full())
-          telemetryFifo.write(((ap_uint<64>)0 << 32) | st.attempts);
-
-     while (enable)
+     if (!st.portRequested)
      {
-     #pragma HLS PIPELINE II=1
-
-          if (!st.portRequested)
+          // Порт занят предыдущим запросом? Не пишем в полный поток --
+          // блокирующая запись остановила бы стадию.
+          if (!m_axis_tcp_listen_port.full())
           {
-               // Порт занят предыдущим запросом? Не пишем в полный поток —
-               // блокирующая запись остановила бы всю стадию.
-               if (m_axis_tcp_listen_port.full())
-                    continue;
-
                pkt16 listen_port_pkt;
                listen_port_pkt.data = 0;
                listen_port_pkt.data(15, 0) = (ap_uint<16>)listenPort;
@@ -360,105 +241,41 @@ void dual_echo_listen(int enable,
                st.portRequested = true;
                st.waitTimer = 0;
                st.attempts++;
-               if (!telemetryFifo.full())
-                    telemetryFifo.write(((ap_uint<64>)1 << 32) | st.attempts);
-          }
-          else if (!st.portOpened)
-          {
-               if (!s_axis_tcp_port_status.empty())
-               {
-                    pkt8 status_pkt = s_axis_tcp_port_status.read();
-                    bool success = status_pkt.data(0, 0);
-                    if (success)
-                    {
-                         st.portOpened = true;
-                         if (!telemetryFifo.full())
-                              telemetryFifo.write(((ap_uint<64>)2 << 32) | st.attempts);
-                    }
-                    else
-                    {
-                         // не открылось — просим снова на следующем такте
-                         st.portRequested = false;
-                    }
-               }
-               else if (st.waitTimer >= (ap_uint<32>)LISTEN_TIMEOUT)
-               {
-                    // Стек молчит. Раньше здесь наступало вечное ожидание;
-                    // теперь повторяем запрос — растущий listenAttempts на
-                    // хосте прямо показывает, что ответа так и нет.
-                    st.portRequested = false;
-               }
-               else
-               {
-                    st.waitTimer++;
-               }
           }
      }
-}
+     else if (!st.portOpened)
+     {
+          if (!s_axis_tcp_port_status.empty())
+          {
+               pkt8 status_pkt = s_axis_tcp_port_status.read();
+               bool success = status_pkt.data(0, 0);
+               if (success)
+                    st.portOpened = true;
+               else
+                    st.portRequested = false;   // не открылось -- просим снова
+          }
+          else if (st.waitTimer >= (ap_uint<32>)LISTEN_TIMEOUT)
+          {
+               // Стек промолчал. Без этой ветки автомат остался бы в
+               // "запрос отправлен, ответа ждём" НАВСЕГДА, и снаружи это выглядит
+               // как молчание без объяснения.
+               st.portRequested = false;
+          }
+          else
+          {
+               st.waitTimer++;
+          }
+     }
 
-/*
- * Публикатор телеметрии: читает потоки от listen и отдаёт значения наружу
- * выходными скалярами.
- *
- * ЗАЧЕМ ОТДЕЛЬНАЯ СТАДИЯ. У listen выходной скаляр не работает: тело её цикла
- * HLS выносит в отдельный модуль, и записи из тела до порта родителя не доходят
- * (проверено -- см. пояснение в dual_echo_listen). Здесь цикла нет, функция
- * возвращается каждый проход, поэтому ap_vld-выход штатный. Тот же приём, что у
- * rx_notify, чей notifyCount работал с самого начала именно потому, что стадия
- * короткая.
- *
- * ЗНАЧЕНИЯ ДЕРЖАТСЯ МЕЖДУ ОБНОВЛЕНИЯМИ. Пустой поток -- не повод затирать
- * прошлое: последнее опубликованное живёт в ps. Иначе хост читал бы нули в
- * промежутках между событиями, а это ровно тот ложный симптом, который стоил нам
- * недели.
- *
- * СОСТОЯНИЕ ПРИХОДИТ АРГУМЕНТОМ, А НЕ static: стадия вызывается дважды, и static
- * внутри неё HLS отвергает как feedback dependence (см. publishState).
- *
- * ap_done ЭТОЙ СТАДИИ БЕЗВРЕДЕН. Барьер ap_sync_done держат обе половины
- * listen, а не она; её завершение ничего не блокирует.
- */
-void dual_echo_publish(publishState& ps,
-                       hls::stream<ap_uint<64> >& telemetryFifo,
-                       ap_uint<32>& listenAttempts,
-                       ap_uint<32>& portState)
-{
-#pragma HLS PIPELINE II=1
-#pragma HLS INLINE off
-
-     // ── ОДИН ПОТОК, ОДНА ЗАПИСЬ, ФОРМА КАК У rx_notify ──────────────────────
-     //
-     // Первая версия читала ДВА потока и писала ДВА выхода за проход. HLS её НЕ
-     // конвейеризовал (в логе csynth нет строки «Pipelining function
-     // dual_echo_publish», в отличие от rx_notify), а непайплайненная стадия
-     // получает FSM, в которой состояние инициализируется на входе в каждый
-     // проход:
-     //
-     //     pubs_a_lastState <= 32'd0;            // не по ap_rst!
-     //
-     // Поэтому наружу уходили нули: значение, прочитанное из FIFO, затиралось
-     // раньше, чем его успевали отдать. В тесте это выглядело как
-     // portState=0 при трёх реальных записях listen-порта.
-     //
-     // Для сравнения, у работающей rx_notify состояние сбрасывается ТОЛЬКО по
-     // ap_rst (rx_notify.v:343) -- обычный регистр, переживающий проходы.
-     //
-     // Приводим к её форме: ранний выход при пустом потоке, одно поле состояния,
-     // один поток. Оба счётчика идут в ОДНОМ потоке как пара, упакованная в 64
-     // бита -- так и запись атомарна (state и attempts всегда согласованы), и
-     // стадия остаётся достаточно простой, чтобы конвейеризоваться.
-     //
-     //     [31:0]  attempts
-     //     [63:32] portState
-     if (telemetryFifo.empty())
-          return;                       // нечего публиковать -- выходы держит preg
-
-     ap_uint<64> word = telemetryFifo.read();
-     ps.lastAttempts = word(31, 0);
-     ps.lastState    = word(63, 32);
-
-     listenAttempts = ps.lastAttempts;
-     portState      = ps.lastState;
+     // Телеметрия -- ПРЯМЫМИ выходными скалярами, без FIFO и стадии publish.
+     // Присваивание безусловное, каждый проход: так HLS создаёт теневой регистр
+     // *_preg и держит значение между обновлениями (проверено на rx_notify, чей
+     // notifyCount работал всегда). Стадия завершается, значит ap_done есть и
+     // отдавать значение есть куда -- ровно то, чего не было при ap_ctrl_none.
+     listenAttempts = st.attempts;
+     portState      = st.portOpened ? (ap_uint<32>)2
+                                    : (st.portRequested ? (ap_uint<32>)1
+                                                        : (ap_uint<32>)0);
 }
 
 /*
@@ -645,8 +462,6 @@ void dual_echo_core(
      // управление и телеметрия. enableA/enableB — одно значение из обёртки,
      // раздельные аргументы, чтобы у каждого был ОДИН читатель (см. шапку
      // топ-функции: один общий enable HLS раздавал половинам несимметрично).
-     int enableA,
-     int enableB,
      int listenPortA,
      int listenPortB,
      ap_uint<32>& listenAttempts_a,
@@ -666,8 +481,6 @@ void dual_echo_core(
      // Ровно так же помечены скаляры в epd_core у probe-ядра, где всё доезжает
      // проводами. Это ЕДИНСТВЕННАЯ граница DATAFLOW в ядре — вложенных больше
      // нет, см. комментарий выше.
-#pragma HLS stable variable = enableA
-#pragma HLS stable variable = enableB
 #pragma HLS stable variable = listenPortA
 #pragma HLS stable variable = listenPortB
 
@@ -703,21 +516,6 @@ void dual_echo_core(
      static hls::stream<ap_uint<16> > rxLengthFifo_b("rxLengthFifo_b");
      #pragma HLS STREAM variable=rxLengthFifo_b depth=512
 
-     // Состояние публикаторов — раздельное на половину, как st/ns/ds выше:
-     // стадия вызывается дважды, static внутри неё HLS отвергает.
-     static publishState pubs_a = {0, 0};
-     #pragma HLS RESET variable=pubs_a
-     static publishState pubs_b = {0, 0};
-     #pragma HLS RESET variable=pubs_b
-
-     // Каналы телеметрии listen -> publish. Глубина 2: значения перезаписываются,
-     // а не накапливаются, и publish читает чаще, чем listen пишет (тот пишет по
-     // событию: запрос порта, подтверждение, повтор по таймауту).
-     static hls::stream<ap_uint<64> > telemetryFifo_a("telemetryFifo_a");
-     #pragma HLS STREAM variable=telemetryFifo_a depth=2
-     static hls::stream<ap_uint<64> > telemetryFifo_b("telemetryFifo_b");
-     #pragma HLS STREAM variable=telemetryFifo_b depth=2
-
      // ── восемь стадий ПЛОСКО, по четыре на половину ──
      //
      // Ни одного вложенного DATAFLOW: скаляры (enableA/B, listenPortA/B)
@@ -729,10 +527,8 @@ void dual_echo_core(
      // стадии короткие, их ap_done ничего не блокирует.
 
      // половина a -> network_krnl_1 (QSFP0)
-     dual_echo_listen(enableA, listenPortA, st_a, telemetryFifo_a,
+     dual_echo_listen(listenPortA, st_a, listenAttempts_a, portState_a,
                       m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a);
-
-     dual_echo_publish(pubs_a, telemetryFifo_a, listenAttempts_a, portState_a);
 
      dual_echo_rx_notify(ns_a, notifyCount_a,
                          s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
@@ -742,10 +538,8 @@ void dual_echo_core(
                         rxSessionFifo_a, rxLengthFifo_a);
 
      // половина b -> network_krnl_2 (QSFP1)
-     dual_echo_listen(enableB, listenPortB, st_b, telemetryFifo_b,
+     dual_echo_listen(listenPortB, st_b, listenAttempts_b, portState_b,
                       m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
-
-     dual_echo_publish(pubs_b, telemetryFifo_b, listenAttempts_b, portState_b);
 
      dual_echo_rx_notify(ns_b, notifyCount_b,
                          s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
@@ -828,34 +622,7 @@ void hls_dual_echo_krnl(
                ap_uint<32>& notifyCount_a,     // уведомлений о данных
                ap_uint<32>& listenAttempts_b,
                ap_uint<32>& portState_b,
-               ap_uint<32>& notifyCount_b,
-
-               // ── enable: ДВА аргумента на одно значение ──
-               //
-               // Обёртка подаёт на оба один и тот же регистр (0x10), так что
-               // снаружи это по-прежнему ОДИН enable — адресная карта и
-               // jtag_ctrl.tcl не меняются.
-               //
-               // ЗАЧЕМ РАЗДЕЛЕНО. Пока это был один аргумент, его читали ОБЕ
-               // половины, и HLS раздал его НЕСИММЕТРИЧНО (проверено в
-               // сгенерированном RTL, dual_echo_core.v):
-               //
-               //     .enable(empty_176)              <- половине a провод
-               //     .enable_dout(p_c_dout)          <- половине b FIFO p_c_U
-               //     .enable_empty_n(p_c_empty_n)
-               //     .enable_read(...)
-               //
-               // Половина b блокировалась на пустом канале, а через
-               // ap_ready/ap_continue DATAFLOW-региона вставала и половина a.
-               // Симптом на плате: регистры живые, enable=1 читается, а
-               // listenAttempts=0 и вся телеметрия нули НАВСЕГДА. Ядро не
-               // исполнялось ни в одной половине.
-               //
-               // Теперь у каждого аргумента ОДИН читатель — размножать нечего,
-               // и независимость стала свойством кода, а не расписания HLS.
-               // Тот же дефект был у probe-ядра со скаляром cycleCount.
-               int enableA,
-               int enableB)
+               ap_uint<32>& notifyCount_b)
 {
 #pragma HLS INTERFACE axis port = s_axis_udp_rx_a
 #pragma HLS INTERFACE axis port = m_axis_udp_tx_a
@@ -892,21 +659,48 @@ void hls_dual_echo_krnl(
 #pragma HLS INTERFACE axis port = s_axis_tcp_tx_status_b
 
 // ─────────────────────────────────────────────────────────────────────────────
-// НИ ОДНОГО s_axilite — это обязательное условие ap_ctrl_none, см. подробное
-// пояснение в шапке файла. Скаляры выше (listenPortA/B, enable, счётчики)
-// остаются обычными аргументами и становятся портами RTL — проводами, которые
-// подключает hls_dual_echo_krnl_wrapper.sv. Регистры и адресная карта живут в
-// dual_echo_control_s_axi.v.
+// s_axilite + ap_ctrl_hs — ШТАТНАЯ СХЕМА, КАК У hls_recv_krnl.
 //
-// ap_ctrl_none: ядро "течёт" каждый такт, стадии ниже сохраняют состояние в
-// static с RESET. Каденция II=1 сохранена, поэтому LISTEN_TIMEOUT считается в
-// тактах (как и задумано), а rx_drain успевает за 100G.
+// РАНЬШЕ ЗДЕСЬ БЫЛ ap_ctrl_none И HDL-ОБЁРТКА. Цепочка решений была такая:
+// «нужна непрерывная работа -> ap_ctrl_none -> UG1393 запрещает s_axilite ->
+// регистры в свою HDL-обёртку». Ошибка в первом звене: непрерывность даёт
+// auto_restart (бит 7 регистра ap_ctrl, отсюда запись 0x81), а не ap_ctrl_none.
+// Доказательство — hls_recv_krnl: s_axilite + ap_ctrl_hs, ДВА файла вместо
+// восьми, работает на этой плате, принимает TCP и шлёт RST. То же у network_krnl
+// (в логе bringup видно ap_ctrl=0x81).
 //
-// Блочный протокол ap_ctrl_hs, который ждёт от ядра XRT/BD, реализует
-// обёртка — ровно как iperf_krnl.xml заявляет ap_ctrl_hs при ap_ctrl_none у
-// самой HLS-функции.
+// ЧТО ЭТО ДАЁТ, КРОМЕ УДАЛЕНИЯ 1000+ СТРОК HDL:
+//
+//   * ГОНКА СО СТЕКОМ РЕШАЕТСЯ САМА. Ядро стоит в ap_idle, пока хост не записал
+//     ap_start, поэтому listen НЕ уходит в стек до network_start. Именно для
+//     этого и вводился enable — теперь его роль выполняет сам ap_start.
+//   * ТЕЛЕМЕТРИЯ НАЧИНАЕТ РАБОТАТЬ. Выходной скаляр HLS отдаётся при ap_done;
+//     при ap_ctrl_none ap_done нет, и мы неделю обходили это FIFO и стадией
+//     publish. Теперь механизм штатный.
+//   * АДРЕСНАЯ КАРТА ГЕНЕРИРУЕТСЯ. Появляется xhls_dual_echo_krnl_hw.h, и
+//     смещения в jtag_ctrl.tcl больше не ручные (шаг user_ip раньше явно
+//     предупреждал «не найден *_hw.h»).
+//   * ЭТО ФОРМА ПОД XRT. На новой плате, где прошивка через XRT возможна, ядро
+//     не потребуется переделывать.
+//
+// ЧТО ПРОВЕРЕНО ДО ЭТОЙ ПРАВКИ, а не после (tb_core_ap_done, режимы 0/1):
+// импульсный ap_start не ухудшает поведение региона. Барьер ap_sync_done при
+// незавершающихся стадиях listen не срабатывает ни в одном из режимов.
+//
+// ЧЕГО ЖДАТЬ ОТ ap_ctrl_hs. Скаляры защёлкиваются на старте прохода. Для этого
+// ядра безвредно: listenPortA/B пишутся один раз ДО ap_start, ровно как basePort
+// и useConn у recv_krnl. Для probe с его triggerGo, меняющимся между замерами,
+// это ограничение существенно — там вопрос решается отдельно.
 // ─────────────────────────────────────────────────────────────────────────────
-#pragma HLS INTERFACE ap_ctrl_none port = return
+#pragma HLS INTERFACE s_axilite port = listenPortA bundle = control
+#pragma HLS INTERFACE s_axilite port = listenPortB bundle = control
+#pragma HLS INTERFACE s_axilite port = listenAttempts_a bundle = control
+#pragma HLS INTERFACE s_axilite port = portState_a bundle = control
+#pragma HLS INTERFACE s_axilite port = notifyCount_a bundle = control
+#pragma HLS INTERFACE s_axilite port = listenAttempts_b bundle = control
+#pragma HLS INTERFACE s_axilite port = portState_b bundle = control
+#pragma HLS INTERFACE s_axilite port = notifyCount_b bundle = control
+#pragma HLS INTERFACE s_axilite port = return bundle = control
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DATAFLOW НА ТОП-ФУНКЦИИ — БЕЗ ЭТОЙ СТРОКИ СКАЛЯРЫ НЕ ДОХОДЯТ.
@@ -945,22 +739,9 @@ void hls_dual_echo_krnl(
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma HLS DATAFLOW disable_start_propagation
 
-// ВХОДНЫЕ СКАЛЯРЫ — ЯВНО ПРОВОДА.
-//
-// Без этих строк режим определялся неявным умолчанием. csynth подтверждал, что
-// умолчание верное ("Setting interface mode on port 'enable' to 'ap_none'"), и
-// битстрим на этом собрался. Но полагаться на умолчание в ядре, где неверная
-// форма скаляра уже стоила нескольких сессий на плате, — плохая идея: оно
-// молчаливое и может измениться с версией инструмента.
-//
-// Форма взята у iperf_krnl (iperf_client.cpp:572-582) — ядра, работающего на
-// этом железе. register даёт защёлку на входе порта: чистая граница для
-// таймингового анализа и никакого длинного комбинационного пути от регистра в
-// обёртке до логики стадии.
-#pragma HLS INTERFACE ap_none register port = enableA
-#pragma HLS INTERFACE ap_none register port = enableB
-#pragma HLS INTERFACE ap_none register port = listenPortA
-#pragma HLS INTERFACE ap_none register port = listenPortB
+// ap_none register НА СКАЛЯРАХ БОЛЬШЕ НЕТ: они теперь s_axilite (см. выше).
+// Прежняя форма нужна была только при ap_ctrl_none, когда регистры держала
+// HDL-обёртка и скаляры обязаны были быть проводами.
 
      dual_echo_core(s_axis_udp_rx_a, m_axis_udp_tx_a,
                     s_axis_udp_rx_meta_a, m_axis_udp_tx_meta_a,
@@ -982,7 +763,7 @@ void hls_dual_echo_krnl(
                     m_axis_tcp_tx_meta_b, m_axis_tcp_tx_data_b,
                     s_axis_tcp_tx_status_b,
 
-                    enableA, enableB, listenPortA, listenPortB,
+                    listenPortA, listenPortB,
                     listenAttempts_a, portState_a, notifyCount_a,
                     listenAttempts_b, portState_b, notifyCount_b);
 }
