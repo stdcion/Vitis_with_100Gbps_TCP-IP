@@ -1355,7 +1355,7 @@ proc vio_dump {} {
 # Bringup order (the order matters, see below):
 #     echo_bringup_dual 0a01d498 000a35029de5 0a01d499 000a35029de6
 #     dual_echo_configure 7001 7002
-#     dual_echo_enable 1
+#     if {![dual_echo_start]} { return 0 }
 #     dual_echo_status              ; # did the listen ports actually open?
 #
 # Or all of it in one call, arguments grouped per interface (ip mac port):
@@ -1377,34 +1377,54 @@ proc vio_dump {} {
 # listen port before the stack is up is exactly the race that leaves the
 # port half-open with no way to tell from outside.
 #
-# OFFSETS ARE NO LONGER GUESSES. They used to be placeholders copied from a
-# generated driver header (HLS assigns s_axilite offsets itself, and inserts an
-# ap_vld register after every output, so they could not be derived from the C++
-# argument order). The registers now live in hand-written HDL --
-# kernel/user_krnl/hls_dual_echo_krnl/src/hdl/dual_echo_control_s_axi.v -- and
-# that file's localparam block IS the address map. The values below are copied
-# from it directly; if you change one, change both.
+# ADDRESS MAP -- see the Russian note below for where it comes from and why it
+# changed completely. Summary:
 #
-#   0x00  ap_ctrl      bit0=ap_start bit1=ap_done bit7=auto_restart
-#   0x10  enable       RW   host-said-go flag the logic actually checks
-#   0x18  listenPortA  RW
-#   0x20  listenPortB  RW
-#   0x30  listenAtt_a  RO   read straight off the kernel's wires
-#   0x34  portState_a  RO
-#   0x38  notify_a     RO
-#   0x40  listenAtt_b  RO
-#   0x44  portState_b  RO
-#   0x48  notify_b     RO
+#   0x00  ap_ctrl        bit0=ap_start bit1=ap_done bit2=ap_idle bit7=auto_restart
+#   0x10  listenPortA    RW
+#   0x18  listenPortB    RW
+#   0x20  listenAtt_a    RO
+#   0x30  portState_a    RO   0=not requested 1=requested 2=OPEN
+#   0x40  notify_a       RO
+#   0x50  listenAtt_b    RO
+#   0x60  portState_b    RO
+#   0x70  notify_b       RO
+#
+# There is no enable register any more: ap_start took over that role. The kernel
+# stays in ap_idle until ap_start is written, so it cannot touch the stack before
+# network_start -- which is exactly what enable was invented for.
+# Смещения ВЗЯТЫ ИЗ СГЕНЕРИРОВАННОГО xhls_dual_echo_krnl_hw.h, а не подобраны.
+#
+# Путь к файлу печатает шаг user_ip; полностью он такой:
+#   src/hls/hls_dual_echo_krnl_ip_proj/sol1/impl/ip/drivers/
+#       hls_dual_echo_krnl_v1_0/src/xhls_dual_echo_krnl_hw.h
+#
+# ЭТО НЕ КОСМЕТИКА. Пока ядро было ap_ctrl_none с рукописной HDL-обёрткой,
+# *_hw.h не генерировался вообще, и смещения жили только здесь -- их не сверяло
+# НИЧТО. После перехода на s_axilite карта изменилась ЦЕЛИКОМ, ни одно значение не
+# совпало со старым:
+#
+#     listenPortA      0x18 -> 0x10        listenAttempts_b 0x40 -> 0x50
+#     listenPortB      0x20 -> 0x18        portState_b      0x44 -> 0x60
+#     listenAttempts_a 0x30 -> 0x20        notifyCount_b    0x48 -> 0x70
+#     portState_a      0x34 -> 0x30
+#     notifyCount_a    0x38 -> 0x40
+#
+# Причём по старому 0x10 лежал enable, а теперь там listenPortA: со старой картой
+# порт уходил бы в чужой регистр, а телеметрия читалась бы из пустоты -- ровно тот
+# класс отказа, который мы неделю искали в логике ядра.
+#
+# ПОСЛЕ ЛЮБОЙ ПРАВКИ СОСТАВА АРГУМЕНТОВ .cpp СВЕРИТЬ ЗАНОВО: HLS раскладывает
+# регистры по своему порядку, добавление одного скаляра сдвигает всё ниже него.
 set ::DE_OFF_AP_CTRL         0x00
-set ::DE_OFF_ENABLE          0x10
-set ::DE_OFF_LISTEN_PORT_A   0x18
-set ::DE_OFF_LISTEN_PORT_B   0x20
-set ::DE_OFF_LISTEN_ATT_A    0x30
-set ::DE_OFF_PORT_STATE_A    0x34
-set ::DE_OFF_NOTIFY_A        0x38
-set ::DE_OFF_LISTEN_ATT_B    0x40
-set ::DE_OFF_PORT_STATE_B    0x44
-set ::DE_OFF_NOTIFY_B        0x48
+set ::DE_OFF_LISTEN_PORT_A   0x10
+set ::DE_OFF_LISTEN_PORT_B   0x18
+set ::DE_OFF_LISTEN_ATT_A    0x20
+set ::DE_OFF_PORT_STATE_A    0x30
+set ::DE_OFF_NOTIFY_A        0x40
+set ::DE_OFF_LISTEN_ATT_B    0x50
+set ::DE_OFF_PORT_STATE_B    0x60
+set ::DE_OFF_NOTIFY_B        0x70
 
 # Write the listen ports -- one per half. portB defaults to portA when
 # omitted, which keeps the old single-port behaviour available.
@@ -1438,52 +1458,60 @@ proc dual_echo_configure {listenPortA {listenPortB ""} {n 1}} {
 
 # Start the kernel. LAST, after dual_echo_configure and echo_bringup_dual.
 #
-# WHAT ACTUALLY STARTS THE WORK: the enable register at 0x10, nothing else.
-# The HLS core is ap_ctrl_none -- it has been running since reset was released
-# and reads enable/listenPortA/listenPortB off plain wires from the HDL wrapper,
-# every single cycle. So writing enable=1 is what makes it request the listen
-# ports, and it takes effect on the next clock edge.
+# WHAT STARTS THE WORK: ap_start (bit 0 of ap_ctrl at 0x00), nothing else.
 #
-# ap_start is written too, but only as a courtesy to the block protocol the BD
-# expects: the wrapper implements ap_ctrl_hs around the free-running core (same
-# arrangement as iperf_krnl, whose XML declares ap_ctrl_hs while iperf_client.cpp
-# is ap_ctrl_none). ap_start_pulse also clears the wrapper's counters, so it is
-# useful as a soft reset. The kernel does NOT need it to run.
+# The kernel is s_axilite + ap_ctrl_hs, exactly like hls_recv_krnl and
+# network_krnl. Writing 0x81 sets ap_start together with auto_restart (bit 7), so
+# the hardware relaunches the region by itself and the kernel runs continuously --
+# no host involvement per pass.
 #
-# This is the fix for the bug that cost the earlier board sessions: enable used
-# to be an s_axilite argument of the ap_ctrl_none HLS function, which UG1393
-# forbids. HLS accepted it silently and latched the scalars once in state2 of
-# the top FSM -- right after reset, before JTAG had written anything -- so the
-# register read back 1 while the logic saw 0. The registers now live in HDL
-# (dual_echo_control_s_axi.v), where a write is visible immediately.
-proc dual_echo_enable {{v 1} {n 1}} {
+# THIS ALSO CLOSES THE RACE WITH THE STACK, which is why the enable register is
+# gone. The kernel sits in ap_idle until ap_start is written, so it physically
+# cannot request a listen port before network_start has given TOE its IP. enable
+# existed only to hold the kernel back; ap_start does that by construction.
+#
+# HISTORY, so nobody reintroduces the old scheme. The kernel used to be
+# ap_ctrl_none with the control registers in a hand-written HDL wrapper, because
+# UG1393 forbids s_axilite on a free-running kernel. That cost a week:
+#
+#   * ap_sync_done -- the AND over ap_done of all 14 dataflow stages -- froze the
+#     region after a single pass, so listenAttempts stayed 0 while the registers
+#     read back fine;
+#   * output scalars do not work without ap_done, so telemetry was always zero;
+#   * the address map was hand-maintained and verified by nothing.
+#
+# All three vanish with ap_ctrl_hs: auto_restart provides continuity,
+# ap_done provides telemetry, and xhls_dual_echo_krnl_hw.h provides the map.
+# Verified by simulation before any board time (tb_core_ap_done, ALL GREEN):
+# 10 listen retries per 3M cycles, portState=1, listenAttempts matching the bus,
+# both halves identical.
+proc dual_echo_start {{n 1}} {
      set base [ouch_base_user $n]
      set addr [expr {$base + $::DE_OFF_AP_CTRL}]
 
-     axi_write32 [expr {$base + $::DE_OFF_ENABLE}] $v
-     set rd [axi_read32 [expr {$base + $::DE_OFF_ENABLE}]]
-     puts "dual_echo\[$n\]: enable=$rd"
-     if {$rd != $v} {
-          puts "  *** enable NOT CONFIRMED (read $rd, expected $v)"
-          puts "      Either this bitstream has no s_axi_control on the kernel,"
-          puts "      or DE_OFF_* do not match dual_echo_control_s_axi.v."
-          return 0
-     }
-
-     if {$v} {
-          # ap_start=1 + auto_restart=1. Not what enables the logic (see above),
-          # but it pulses the counter reset and gives the BD the handshake it
-          # expects.
-          axi_write32 $addr 0x81
-          puts "dual_echo\[$n\]: ap_start=1 auto_restart=1 (ap_ctrl=0x81)"
-     } else {
-          axi_write32 $addr 0x00
-          puts "dual_echo\[$n\]: ap_start=0 (enable=0 is what actually stops it)"
-     }
+     # ap_start=1 + auto_restart=1. Same value network_krnl is started with.
+     axi_write32 $addr 0x81
 
      set ctrl [axi_read32 $addr]
-     puts [format "  ap_ctrl=0x%02x (ap_start=%d ap_done=%d)" \
-               $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}]]
+     puts [format "dual_echo\[$n\]: ap_ctrl=0x%02x (ap_start=%d ap_done=%d ap_idle=%d)" \
+               $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}] [expr {($ctrl >> 2) & 1}]]
+
+     # ap_idle must drop: it is the one bit that says the region actually started.
+     # A kernel that stays idle means ap_start never took -- wrong address, or no
+     # s_axi_control in this bitstream.
+     if {($ctrl >> 2) & 1} {
+          puts "  *** STILL IDLE -- ap_start did not take."
+          puts "      Check that DE_OFF_* match xhls_dual_echo_krnl_hw.h and that"
+          puts "      this bitstream has s_axi_control on the kernel."
+          return 0
+     }
+     return 1
+}
+
+proc dual_echo_stop {{n 1}} {
+     set base [ouch_base_user $n]
+     axi_write32 [expr {$base + $::DE_OFF_AP_CTRL}] 0x00
+     puts "dual_echo\[$n\]: auto_restart cleared -- stops after the current pass"
      return 1
 }
 
@@ -1504,12 +1532,12 @@ proc dual_echo_status {{n 1}} {
 
      foreach {nm st att} [list a $st_a $att_a b $st_b $att_b] {
           if {$st == 0} {
-               puts "  half $nm -> waiting for enable: was dual_echo_enable 1 called?"
+               puts "  half $nm -> never requested a port: was dual_echo_start called?"
           } elseif {$st == 1 && $att > 3} {
                puts "  half $nm -> the stack is not answering the listen request."
                puts "     listenAttempts keeps growing, so the kernel retries but"
                puts "     gets no port_status. Check that echo_bringup_dual ran"
-               puts "     BEFORE enable, and run vio_dump."
+               puts "     BEFORE dual_echo_start, and run vio_dump."
           }
      }
      return [list $att_a $st_a $nt_a $att_b $st_b $nt_b]
@@ -1517,7 +1545,7 @@ proc dual_echo_status {{n 1}} {
 
 proc _de_state {v} {
      switch -- $v {
-          0 { return "0(wait-enable)" }
+          0 { return "0(not-requested)" }
           1 { return "1(requested)" }
           2 { return "2(OPEN)" }
           default { return "$v(?)" }
@@ -1540,7 +1568,7 @@ proc dual_echo_bringup {ip_str1 mac_str1 port1 ip_str2 mac_str2 port2} {
      echo_bringup_dual $ip_str1 $mac_str1 $ip_str2 $mac_str2
      puts ""
      if {![dual_echo_configure $port1 $port2]} { return 0 }
-     dual_echo_enable 1
+     if {![dual_echo_start]} { return 0 }
      puts ""
      dual_echo_status
      puts ""
