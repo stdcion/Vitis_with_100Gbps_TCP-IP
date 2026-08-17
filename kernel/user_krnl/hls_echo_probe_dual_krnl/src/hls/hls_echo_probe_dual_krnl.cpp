@@ -886,7 +886,11 @@ void epd_core(
      ap_uint<32>& listenAttempts, ap_uint<32>& portState)
 {
 #pragma HLS INLINE off
-#pragma HLS DATAFLOW disable_start_propagation
+
+// disable_start_propagation убран и здесь -- по той же причине, что на топе: он не
+// даёт импульсу ap_start дойти до стадий, и барьер ap_sync_done остаётся
+// взведённым. См. подробное пояснение у ap_ctrl_hs в топ-функции.
+#pragma HLS DATAFLOW
 
      // ЗДЕСЬ stable ОСТАЁТСЯ, И ЭТО НЕ ПРОТИВОРЕЧИТ ap_none ВЫШЕ.
      //
@@ -1158,15 +1162,48 @@ void hls_echo_probe_dual_krnl(
 // видимыми каждый такт. Регистры и адресную карту держит
 // src/hdl/probe_control_s_axi.v, подключает src/hdl/*_wrapper.sv.
 //
-// Блочный протокол ap_ctrl_hs, который ждёт от ядра XRT/BD, реализует обёртка —
-// ровно как iperf_krnl.xml заявляет ap_ctrl_hs при ap_ctrl_none у самой
-// HLS-функции.
 // ─────────────────────────────────────────────────────────────────────────────
-#pragma HLS INTERFACE ap_ctrl_none port = return
+// ap_ctrl_hs БЕЗ s_axilite: РЕГИСТРЫ ОСТАЮТСЯ В ОБЁРТКЕ, А ap_start ПРИХОДИТ
+// ПОРТОМ.
+//
+// ЗАЧЕМ МЕНЯЛИ. При ap_ctrl_none регион не работал: барьер ap_sync_done -- И по
+// ap_done ВСЕХ стадий (epd_core.v) -- требует, чтобы все были готовы В ОДИН
+// такт. У стадий разный II, совпадения не наступает, и каждая встаёт после
+// ПЕРВОГО прохода. На плате это давало
+//
+//     connAttempts=0 sent=0 echoRx=0 echoes=0 recv=0 timeouts=0
+//     server listen: attempts=0 state=0(no-request)
+//
+// ВСЕ счётчики нули, включая timeouts -- то есть ядро не стартовало, а не
+// «измерение не сошлось». На hls_dual_echo_krnl та же причина измерена
+// тестбенчем на полном регионе: writes 1/1 при ap_ctrl_none против 10/10 после
+// перехода на ap_ctrl_hs с auto_restart. Импульсный ap_start сбрасывает
+// ap_sync_reg стадий, и барьер перестаёт держать.
+//
+// ПОЧЕМУ БЕЗ s_axilite. Регистры управления и все восемь таймстемпов уже живут в
+// probe_control_s_axi.v, и там же логика auto_restart, скопированная из
+// сгенерированного HLS (int_ap_start <= int_auto_restart на ap_ready). Дать ядру
+// ещё и свой s_axilite значило бы два AXI-Lite на одном IP -- BD подключает
+// ОДИН s_axi_control, пришлось бы писать адресный декодер. Вместо этого
+// ap_start/ap_done/ap_ready/ap_idle становятся обычными портами RTL, и обёртка
+// соединяет их со своими регистрами. Так устроен network_krnl: рукописный
+// SystemVerilog с ap_ctrl_hs и внешними регистрами.
+//
+// ЧТО ЭТО НЕ ДАЁТ, в отличие от dual_echo: xhls_*_hw.h не генерируется, карта
+// регистров остаётся рукописной (EPD_OFF_* в jtag_ctrl.tcl против localparam в
+// probe_control_s_axi.v -- менять обе). Плата за то, что врезки, шкала времени и
+// 51 проверка тестбенчей остаются нетронутыми.
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma HLS INTERFACE ap_ctrl_hs port = return
 
 // DATAFLOW, а не PIPELINE — как в hls_pingpong_krnl: половины и
 // измеритель работают как независимые процессы.
-#pragma HLS DATAFLOW disable_start_propagation
+//
+// disable_start_propagation УБРАН: он означает «не раздавать ap_start стадиям»,
+// и при ap_ctrl_hs ломает ровно то, ради чего затевалась правка -- импульс до
+// стадий не доходит, ap_sync_reg не сбрасывается, барьер остаётся взведённым.
+// Измерено на dual_echo: writes 1/1 с этим pragma, 10/10 без него.
+#pragma HLS DATAFLOW
 
 // ─────────────────────────────────────────────────────────────────────────────
 // СКАЛЯРЫ — ЯВНО ПРОВОДА: ap_none register.
