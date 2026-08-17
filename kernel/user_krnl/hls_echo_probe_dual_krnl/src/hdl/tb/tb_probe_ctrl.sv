@@ -327,11 +327,9 @@ module tb_probe_ctrl;
 
           // сначала нормальный случай: круг замкнулся -> флаг встал
           force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
-          force dut.s_axis_tcp_rx_data_a_tready = 1'b1;
           force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
           @(negedge clk);
           release dut.s_axis_tcp_rx_data_a_tvalid;
-          release dut.s_axis_tcp_rx_data_a_tready;
           release dut.s_axis_tcp_rx_data_a_tlast;
           repeat (2) @(negedge clk);
           axi_read(A_SMPREADY, v);
@@ -377,11 +375,9 @@ module tb_probe_ctrl;
                               // это и есть тот единственный такт.
                               if (dut.triggerGo_reg !== prev) begin
                                    force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
-                                   force dut.s_axis_tcp_rx_data_a_tready = 1'b1;
                                    force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
                                    @(posedge clk);
                                    release dut.s_axis_tcp_rx_data_a_tvalid;
-                                   release dut.s_axis_tcp_rx_data_a_tready;
                                    release dut.s_axis_tcp_rx_data_a_tlast;
                                    hit = 1'b1;
                               end
@@ -424,12 +420,14 @@ module tb_probe_ctrl;
           release dut.m_axis_tcp_tx_data_a_tlast;
           repeat (5) @(negedge clk);
 
+          // tready у s_axis_* НЕ ФОРСИМ: это ВЫХОД обёртки, его драйвит заглушка
+          // ядра (в tb_probe_taps все s_axis_*_TREADY зашиты в 1). Форс на выход
+          // конфликтует с этим драйвером -- в первой версии из-за него t2'
+          // защёлкнулся не в свой такт, а позже, вместе с t2.
           force dut.s_axis_tcp_rx_data_b_tvalid = 1'b1;
-          force dut.s_axis_tcp_rx_data_b_tready = 1'b1;
           force dut.s_axis_tcp_rx_data_b_tlast  = 1'b1;
           @(negedge clk);
           release dut.s_axis_tcp_rx_data_b_tvalid;
-          release dut.s_axis_tcp_rx_data_b_tready;
           release dut.s_axis_tcp_rx_data_b_tlast;
           repeat (5) @(negedge clk);
 
@@ -443,11 +441,9 @@ module tb_probe_ctrl;
           repeat (5) @(negedge clk);
 
           force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
-          force dut.s_axis_tcp_rx_data_a_tready = 1'b1;
           force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
           @(negedge clk);
           release dut.s_axis_tcp_rx_data_a_tvalid;
-          release dut.s_axis_tcp_rx_data_a_tready;
           release dut.s_axis_tcp_rx_data_a_tlast;
           repeat (5) @(negedge clk);
 
