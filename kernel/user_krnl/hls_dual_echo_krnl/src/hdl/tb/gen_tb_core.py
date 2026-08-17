@@ -421,10 +421,32 @@ add("")
 add("     // При молчащем стеке listen ОБЯЗАН повторять запрос по таймауту в ЛЮБОМ")
 add("     // режиме. Одна запись за прогон = регион заморожен.")
 add('     $display("");')
-add('     check("mode 0: half a retries (>1 write)", res_writes_a[0] > 1);')
-add('     check("mode 0: half b retries (>1 write)", res_writes_b[0] > 1);')
-add('     check("mode 1: half a retries (>1 write)", res_writes_a[1] > 1);')
-add('     check("mode 1: half b retries (>1 write)", res_writes_b[1] > 1);')
+# ЧТО ТРЕБОВАТЬ ОТ КАЖДОЙ ПОЛОВИНЫ -- ЗАВИСИТ ОТ РОЛИ, А НЕ ОТ СИММЕТРИИ.
+#
+#   dual_echo: обе половины СЛУШАЮТ порт. Стек молчит -> обе обязаны повторять
+#              запрос по таймауту, значит writes > 1 у обеих, и они равны.
+#   probe:     половина a -- КЛИЕНТ (open_connection в цикле, пока стек молчит),
+#              половина b -- СЕРВЕР (listen один раз и держит). Требовать от
+#              сервера повторов неверно: одна запись это правильное поведение.
+#
+# Первая версия теста требовала симметрии от обоих ядер -- она писалась под
+# dual_echo, и на probe давала FAIL там, где ядро работало правильно
+# (writes a=857143 b=1).
+if BUS_A == BUS_B.replace("_b", "_a"):
+    # одинаковые роли (dual_echo): обе повторяют, значения равны
+    add('     check("mode 0: half a retries (>1 write)", res_writes_a[0] > 1);')
+    add('     check("mode 0: half b retries (>1 write)", res_writes_b[0] > 1);')
+    add('     check("mode 1: half a retries (>1 write)", res_writes_a[1] > 1);')
+    add('     check("mode 1: half b retries (>1 write)", res_writes_b[1] > 1);')
+else:
+    # разные роли (probe): от клиента ждём повторов, от сервера -- хотя бы одного
+    # обращения. Ноль у любой половины означал бы, что регион встал.
+    add('     $display("  half a drives %s (client), half b drives %s (server)");'
+        % (BUS_A, BUS_B))
+    add('     check("mode 0: client half retries (>1 write)", res_writes_a[0] > 1);')
+    add('     check("mode 0: server half asked at least once", res_writes_b[0] >= 1);')
+    add('     check("mode 1: client half retries (>1 write)", res_writes_a[1] > 1);')
+    add('     check("mode 1: server half asked at least once", res_writes_b[1] >= 1);')
 add("")
 add("     // ТЕЛЕМЕТРИЯ ДОЛЖНА ДОХОДИТЬ ДО ПОРТА, а не только считаться внутри.")
 add("     // HLS отдаёт выходной скаляр на пути к возврату из функции, поэтому")
@@ -459,8 +481,11 @@ add("     // Половины сидят на РАЗНЫХ network_krnl и до�
 add("     // расхождение означает, что что-то в дизайне их различает, и это тот")
 add("     // класс дефекта, который легко не заметить (ср. два CMAC на одном GT-")
 add("     // квадре: сборка зелёная, а работает только один канал).")
-add('     check("both halves behave identically (writes)",')
-add("           port_writes_a == port_writes_b);")
+if BUS_A == BUS_B.replace("_b", "_a"):
+    add('     check("both halves behave identically (writes)",')
+    add("           port_writes_a == port_writes_b);")
+else:
+    add("     // Симметрии здесь НЕ ждём: у половин разные роли (см. выше).")
 if have_state:
     add('     check("both halves behave identically (portState)",')
     add("           lat_portState_a == lat_portState_b);")
