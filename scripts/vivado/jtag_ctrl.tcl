@@ -450,6 +450,9 @@ proc echo_bringup_dual {ip_str1 mac_str1 ip_str2 mac_str2} {
 # the wrapper. Inputs keep the 8-byte stride so the layout stays familiar;
 # read-only values are packed 4 bytes apart, since they are plain wires from the
 # kernel with no ap_vld field.
+# ap_ctrl: бит0=ap_start, бит1=ap_done, бит2=ap_idle, бит7=auto_restart.
+# Запись 0x81 -- то, что реально запускает ядро (см. epd_enable ниже).
+set ::EPD_OFF_AP_CTRL       0x00
 set ::EPD_OFF_ENABLE        0x10
 set ::EPD_OFF_SERVER_IP     0x18
 set ::EPD_OFF_SERVER_PORT   0x20
@@ -574,9 +577,58 @@ proc epd_configure {serverIp serverPort msgBytes {n 1}} {
 
 # enable LAST: before it the kernel does not touch the stack ports, because
 # the serverIp/serverPort registers may not have been written yet.
+# ЧТО СТАРТУЕТ ЯДРО: ap_start (бит 0 регистра ap_ctrl, 0x00), а НЕ enable.
+#
+# Ядро объявлено ap_ctrl_hs и стоит в ap_idle, пока хост не записал ap_ctrl.
+# Запись 0x81 поднимает ap_start вместе с auto_restart (бит 7), и дальше железо
+# перезапускает регион само -- та же схема, что у network_krnl и hls_recv_krnl.
+#
+# ПОЧЕМУ ЭТО ЗАМЕНИЛО enable. Раньше ядро было ap_ctrl_none, «текло» с момента
+# снятия сброса, и регистр enable был единственным способом удержать его до
+# network_start. При ap_ctrl_hs эта гонка закрыта по построению: до ap_start ядро
+# физически не может обратиться к стеку.
+#
+# Регистр 0x10 остался в probe_control_s_axi и пишется здесь же -- он читается
+# обратно и служит признаком «битстрим жив, регистры отвечают». В ядро он больше
+# НЕ идёт, поэтому сам по себе работу не разрешает.
+#
+# БЕЗ ЗАПИСИ ap_ctrl ЯДРО НЕ ЗАПУСТИТСЯ ВООБЩЕ. Прежняя версия этой процедуры
+# писала только enable -- с новым битстримом это дало бы полную тишину и
+# connAttempts=0, то есть ровно тот симптом, который мы месяц распутывали.
 proc epd_enable {{v 1} {n 1}} {
-     puts "epd\[$n\]: enable=$v"
-     axi_write32 [expr {[ouch_base_user $n] + $::EPD_OFF_ENABLE}] $v
+     set base [ouch_base_user $n]
+     set addr [expr {$base + $::EPD_OFF_AP_CTRL}]
+
+     # Регистр enable -- только как признак живых регистров; в ядро не идёт.
+     axi_write32 [expr {$base + $::EPD_OFF_ENABLE}] $v
+     set rd [axi_read32 [expr {$base + $::EPD_OFF_ENABLE}]]
+     if {$rd != $v} {
+          puts "epd\[$n\]: *** enable NOT CONFIRMED (read $rd, expected $v)"
+          puts "      Either this bitstream has no s_axi_control on the kernel,"
+          puts "      or EPD_OFF_* do not match probe_control_s_axi.v."
+          return 0
+     }
+
+     if {$v} {
+          axi_write32 $addr 0x81
+     } else {
+          axi_write32 $addr 0x00
+     }
+
+     set ctrl [axi_read32 $addr]
+     puts [format "epd\[$n\]: enable=$rd ap_ctrl=0x%02x (ap_start=%d ap_done=%d ap_idle=%d)" \
+               $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}] [expr {($ctrl >> 2) & 1}]]
+
+     # ap_idle обязан упасть: это единственный бит, который говорит, что регион
+     # реально пошёл. Ядро, оставшееся idle, означает, что ap_start не взялся --
+     # неверный адрес или в битстриме нет s_axi_control.
+     if {$v && (($ctrl >> 2) & 1)} {
+          puts "  *** STILL IDLE -- ap_start did not take."
+          puts "      Check EPD_OFF_AP_CTRL against probe_control_s_axi.v and that"
+          puts "      this bitstream has s_axi_control on the kernel."
+          return 0
+     }
+     return 1
 }
 
 # Counters: they show which stage things got stuck at.
@@ -599,13 +651,18 @@ proc epd_status {{n 1}} {
      # comes first -- if the port never opened, nothing downstream can work,
      # and before portState existed this was indistinguishable from a dead link.
      if {$pst == 0} {
-          puts "  -> the server has not requested a listen port: enable=0?"
+          puts "  -> the server has not requested a listen port."
+          puts "     Was epd_enable called? It writes ap_ctrl=0x81, and ONLY that"
+          puts "     starts the kernel -- the enable register no longer wires in."
      } elseif {$pst == 1} {
           puts "  -> the server asked for a listen port and the stack has not"
           puts "     answered (attempts=$lat, and it retries on a timeout)."
           puts "     Check that echo_bringup_dual ran BEFORE epd_enable, then vio_dump."
+          puts "     The client now retries a silent open_connection on a timeout,"
+          puts "     so a growing connAttempts means the stack is not answering."
      } elseif {$att == 0} {
-          puts "  -> the client never tried to open a connection: enable=0?"
+          puts "  -> the client never tried to open a connection."
+          puts "     Was epd_enable called? ap_ctrl=0x81 is what starts the kernel."
      } elseif {$snt == 0 && $att > 3} {
           puts "  -> connection did not open even though the port is OPEN."
           puts "     Check addressing (same /24, different last octets) and vio_dump."
