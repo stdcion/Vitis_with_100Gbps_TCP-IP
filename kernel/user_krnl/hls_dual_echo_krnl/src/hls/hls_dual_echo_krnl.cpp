@@ -201,12 +201,39 @@ struct listenState
 void dual_echo_listen(int enable,
                       int listenPort,
                       listenState& st,
-                      ap_uint<32>& listenAttempts,
-                      ap_uint<32>& portState,
+                      hls::stream<ap_uint<32> >& attemptsFifo,
+                      hls::stream<ap_uint<32> >& stateFifo,
                       hls::stream<pkt16>& m_axis_tcp_listen_port,
                       hls::stream<pkt8>& s_axis_tcp_port_status)
 {
 #pragma HLS INLINE off
+
+     // ── ТЕЛЕМЕТРИЯ ИДЁТ ПОТОКОМ, А НЕ ВЫХОДНЫМ СКАЛЯРОМ ─────────────────────
+     //
+     // Выходной скаляр (`ap_uint<32>&`) здесь не работает В ПРИНЦИПЕ, и это
+     // проверено двумя прогонами, а не выведено рассуждением:
+     //
+     //   1. `while (true)` -> HLS выбросил порты совсем:
+     //        WARNING: [RTGEN 206-101] Port 'portState_a' has no fanin or
+     //                                 fanout and is left dangling.
+     //   2. `while (enable)` + инициализация до цикла -> порты выжили и стали
+     //      ap_vld, но значения НЕ ОБНОВЛЯЛИСЬ: тест показал portState=0 и
+     //      listenAttempts=0 при трёх реальных записях listen-порта на шине.
+     //
+     // Причина структурная: HLS вынес тело цикла в ОТДЕЛЬНЫЙ модуль
+     // (`dual_echo_listen_Pipeline_VITIS_LOOP_*` в логе csynth), а выходной
+     // скаляр отдаётся на пути к возврату из ВНЕШНЕЙ функции. Записи из тела до
+     // порта родителя не доходят -- наружу уходит только то, что записано перед
+     // циклом.
+     //
+     // Поэтому счётчики уходят в hls::stream, а публикует их отдельная короткая
+     // стадия `dual_echo_publish` (см. ниже): она возвращается каждый проход,
+     // поэтому её ap_vld-выход работает штатно -- ровно как у `rx_notify`, где
+     // notifyCount никогда и не терялся, потому что та стадия без цикла.
+     //
+     // Глубина 2 достаточна: значения перезаписываются, а не накапливаются;
+     // публикатор читает быстрее, чем listen пишет (тот пишет по событию, не
+     // каждый такт).
 
      // ── ВЕЧНЫЙ ЦИКЛ: СТАДИЯ НЕ ДОЛЖНА ВЫДАВАТЬ ap_done ──────────────────────
      //
@@ -289,23 +316,11 @@ void dual_echo_listen(int enable,
      // самого старта хост не увидел бы «ждём enable» вообще.
      // ОБА ВЫХОДА ПИШУТСЯ ДО ЦИКЛА, И ЭТО НЕ КОСМЕТИКА.
      //
-     // HLS отдаёт выходной скаляр наружу на пути к возврату из функции. Записи,
-     // которые лежат ТОЛЬКО внутри тела цикла, для него недостижимы -- порт
-     // выбрасывается:
-     //
-     //     WARNING: [RTGEN 206-101] Port 'listenAttempts_a' has no fanin or
-     //                              fanout and is left dangling.
-     //
-     // Именно так и вышло в первом заходе: portState выжил (у него была запись
-     // portState = 0 перед циклом и он стал ap_vld), а listenAttempts исчез,
-     // потому что писался только в теле. На плате это читалось бы как «ядро не
-     // делает попыток» при работающем ядре -- тот же ложный симптом, который мы
-     // и распутывали.
-     //
-     // Поэтому инициализируем ОБА. Значения осмысленны сами по себе: до входа в
-     // цикл попыток нет и состояние -- «ждём enable».
-     portState      = 0;
-     listenAttempts = st.attempts;
+     // Публикация в поток НЕБЛОКИРУЮЩАЯ: если публикатор почему-то не успел,
+     // теряется отчёт, а не работа. Блокирующая запись остановила бы стадию,
+     // держащую барьер, — то есть телеметрия смогла бы уронить всё ядро.
+     if (!stateFifo.full())
+          stateFifo.write(0);          // «ждём enable» до входа в цикл
 
      while (enable)
      {
@@ -325,8 +340,8 @@ void dual_echo_listen(int enable,
                st.portRequested = true;
                st.waitTimer = 0;
                st.attempts++;
-               listenAttempts = st.attempts;
-               portState = 1;
+               if (!attemptsFifo.full()) attemptsFifo.write(st.attempts);
+               if (!stateFifo.full())    stateFifo.write(1);
           }
           else if (!st.portOpened)
           {
@@ -337,7 +352,7 @@ void dual_echo_listen(int enable,
                     if (success)
                     {
                          st.portOpened = true;
-                         portState = 2;
+                         if (!stateFifo.full()) stateFifo.write(2);
                     }
                     else
                     {
@@ -358,6 +373,47 @@ void dual_echo_listen(int enable,
                }
           }
      }
+}
+
+/*
+ * Публикатор телеметрии: читает потоки от listen и отдаёт значения наружу
+ * выходными скалярами.
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ СТАДИЯ. У listen выходной скаляр не работает: тело её цикла
+ * HLS выносит в отдельный модуль, и записи из тела до порта родителя не доходят
+ * (проверено -- см. пояснение в dual_echo_listen). Здесь цикла нет, функция
+ * возвращается каждый проход, поэтому ap_vld-выход штатный. Тот же приём, что у
+ * rx_notify, чей notifyCount работал с самого начала именно потому, что стадия
+ * короткая.
+ *
+ * ЗНАЧЕНИЯ ДЕРЖАТСЯ МЕЖДУ ОБНОВЛЕНИЯМИ. Пустой поток -- не повод затирать
+ * прошлое: держим последнее опубликованное в static. Иначе хост читал бы нули
+ * в промежутках между событиями, а это ровно тот ложный симптом, который стоил
+ * нам недели.
+ *
+ * ap_done ЭТОЙ СТАДИИ БЕЗВРЕДЕН. Барьер ap_sync_done держат обе половины
+ * listen, а не она; её завершение ничего не блокирует.
+ */
+void dual_echo_publish(hls::stream<ap_uint<32> >& attemptsFifo,
+                       hls::stream<ap_uint<32> >& stateFifo,
+                       ap_uint<32>& listenAttempts,
+                       ap_uint<32>& portState)
+{
+#pragma HLS PIPELINE II=1
+#pragma HLS INLINE off
+
+     static ap_uint<32> lastAttempts = 0;
+#pragma HLS RESET variable=lastAttempts
+     static ap_uint<32> lastState = 0;
+#pragma HLS RESET variable=lastState
+
+     if (!attemptsFifo.empty())
+          lastAttempts = attemptsFifo.read();
+     if (!stateFifo.empty())
+          lastState = stateFifo.read();
+
+     listenAttempts = lastAttempts;
+     portState      = lastState;
 }
 
 /*
@@ -602,15 +658,35 @@ void dual_echo_core(
      static hls::stream<ap_uint<16> > rxLengthFifo_b("rxLengthFifo_b");
      #pragma HLS STREAM variable=rxLengthFifo_b depth=512
 
-     // ── шесть стадий ПЛОСКО, по три на половину ──
+     // Каналы телеметрии listen -> publish. Глубина 2: значения перезаписываются,
+     // а не накапливаются, и publish читает чаще, чем listen пишет (тот пишет по
+     // событию: запрос порта, подтверждение, повтор по таймауту).
+     static hls::stream<ap_uint<32> > attemptsFifo_a("attemptsFifo_a");
+     #pragma HLS STREAM variable=attemptsFifo_a depth=2
+     static hls::stream<ap_uint<32> > stateFifo_a("stateFifo_a");
+     #pragma HLS STREAM variable=stateFifo_a depth=2
+     static hls::stream<ap_uint<32> > attemptsFifo_b("attemptsFifo_b");
+     #pragma HLS STREAM variable=attemptsFifo_b depth=2
+     static hls::stream<ap_uint<32> > stateFifo_b("stateFifo_b");
+     #pragma HLS STREAM variable=stateFifo_b depth=2
+
+     // ── восемь стадий ПЛОСКО, по четыре на половину ──
      //
      // Ни одного вложенного DATAFLOW: скаляры (enableA/B, listenPortA/B)
      // пересекают одну границу региона и остаются проводами. См. большой
      // комментарий выше о том, что было при вложенности.
+     //
+     // listen НЕ ЗАВЕРШАЕТСЯ (цикл по enable) и потому держит барьер
+     // ap_sync_done в нуле -- в этом весь смысл, см. пояснение у неё. Остальные
+     // стадии короткие, их ap_done ничего не блокирует.
 
      // половина a -> network_krnl_1 (QSFP0)
-     dual_echo_listen(enableA, listenPortA, st_a, listenAttempts_a, portState_a,
+     dual_echo_listen(enableA, listenPortA, st_a,
+                      attemptsFifo_a, stateFifo_a,
                       m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a);
+
+     dual_echo_publish(attemptsFifo_a, stateFifo_a,
+                       listenAttempts_a, portState_a);
 
      dual_echo_rx_notify(ns_a, notifyCount_a,
                          s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
@@ -620,8 +696,12 @@ void dual_echo_core(
                         rxSessionFifo_a, rxLengthFifo_a);
 
      // половина b -> network_krnl_2 (QSFP1)
-     dual_echo_listen(enableB, listenPortB, st_b, listenAttempts_b, portState_b,
+     dual_echo_listen(enableB, listenPortB, st_b,
+                      attemptsFifo_b, stateFifo_b,
                       m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
+
+     dual_echo_publish(attemptsFifo_b, stateFifo_b,
+                       listenAttempts_b, portState_b);
 
      dual_echo_rx_notify(ns_b, notifyCount_b,
                          s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
