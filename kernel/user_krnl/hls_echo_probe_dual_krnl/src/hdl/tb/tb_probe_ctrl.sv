@@ -13,13 +13,13 @@
 // не видят ни csim (там C++, регистров нет), ни модели на Python/Tcl:
 //
 //   1. sampleReady и ОДНОТАКТОВАЯ ГОНКА. В шапке обёртки описано, что сначала
-//      приоритет был у сброса, и при совпадении recvCount_ap_vld с тактом смены
+//      приоритет был у сброса, и при совпадении строба t2 с тактом смены
 //      triggerGo флаг НЕ вставал вовсе -- замер зависал до таймаута. Окно в
 //      один такт, то есть на плате это редкий невоспроизводимый `sample failed`.
 //      Дефект нашли моделированием и исправили приоритетом установки, но на RTL
 //      это НИКОГДА не проверялось. Здесь проверяется, причём именно в тот такт.
 //
-//   2. ap_ctrl_hs. Ядро бесконечное, ap_done оно само не выставит, поэтому
+//   2. ap_ctrl_hs. РАНЬШЕ ядро было ap_ctrl_none и ap_done подделывала обёртка
 //      обёртка объявляет транзакцию завершённой сразу после старта
 //      (ap_done = ap_start_pulse). BD/XRT ждёт корректного рукопожатия; если
 //      ap_done не придёт, хост повиснет на ap_start. Тоже ни разу не
@@ -309,21 +309,30 @@ module tb_probe_ctrl;
           //
           // ГЛАВНАЯ ПРОВЕРКА ЭТОГО ФАЙЛА.
           //
-          // Обёртка ставит sample_ready_r по recvCount_ap_vld и снимает по
-          // смене triggerGo. Раньше приоритет был у СБРОСА, и когда оба события
-          // попадали в один такт, флаг не вставал вовсе -- замер зависал до
-          // таймаута. На плате это выглядело бы как редкий невоспроизводимый
-          // `sample failed`.
+          // Обёртка ставит sample_ready_r по tap_t2_reply -- тому же строб, что
+          // защёлкивает t2 -- и снимает по смене triggerGo. Раньше приоритет был у
+          // СБРОСА, и когда оба события попадали в один такт, флаг не вставал
+          // вовсе: замер зависал до таймаута. На плате это выглядело бы как редкий
+          // невоспроизводимый `sample failed`.
           //
-          // Дефект нашли моделированием и вылечили приоритетом установки, но на
-          // RTL это не проверялось ни разу. Проверяем: force'ом поднимаем
-          // recvCount_ap_vld РОВНО в тот такт, когда меняется triggerGo.
+          // Дефект нашли моделированием и вылечили приоритетом установки, но на RTL
+          // это не проверялось ни разу. Проверяем: force'ом поднимаем строб РОВНО в
+          // тот такт, когда меняется triggerGo.
+          //
+          // СТРОБ ТЕПЕРЬ ШИННЫЙ, а не recvCount_ap_vld: готовность и сами
+          // таймстемпы приходят от ОДНОГО события, поэтому хост не может прочитать
+          // значения предыдущего замера при sampleReady=0. Раньше ap_vld мог
+          // подняться позже фактического прихода ответа.
           $display("\n[5] sampleReady: the one-cycle race");
 
           // сначала нормальный случай: круг замкнулся -> флаг встал
-          force dut.recvCount_ap_vld = 1'b1;
+          force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
+          force dut.s_axis_tcp_rx_data_a_tready = 1'b1;
+          force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
           @(negedge clk);
-          release dut.recvCount_ap_vld;
+          release dut.s_axis_tcp_rx_data_a_tvalid;
+          release dut.s_axis_tcp_rx_data_a_tready;
+          release dut.s_axis_tcp_rx_data_a_tlast;
           repeat (2) @(negedge clk);
           axi_read(A_SMPREADY, v);
           `chk("sampleReady set when the loop closes", v === 32'd1);
@@ -367,9 +376,13 @@ module tb_probe_ctrl;
                               // обновился, а trigger_r ещё держит старое --
                               // это и есть тот единственный такт.
                               if (dut.triggerGo_reg !== prev) begin
-                                   force dut.recvCount_ap_vld = 1'b1;
+                                   force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
+                                   force dut.s_axis_tcp_rx_data_a_tready = 1'b1;
+                                   force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
                                    @(posedge clk);
-                                   release dut.recvCount_ap_vld;
+                                   release dut.s_axis_tcp_rx_data_a_tvalid;
+                                   release dut.s_axis_tcp_rx_data_a_tready;
+                                   release dut.s_axis_tcp_rx_data_a_tlast;
                                    hit = 1'b1;
                               end
                          end
@@ -383,20 +396,60 @@ module tb_probe_ctrl;
           `chk("SET WINS over clear in the same cycle (no hung sample)",
                v === 32'd1);
 
-          // ── 6. защёлка таймстемпов по ap_vld ─────────────────────────────
+          // ── 6. защёлка таймстемпов ПО ШИНЕ ──────────────────────────────
           //
-          // Обёртка штампует cycle_counter по стробам ap_vld счётчиков ядра.
-          // Проверяем, что каждый строб попадает в СВОЙ регистр и что все
-          // четыре различны (иначе один общий регистр на всех).
-          $display("\n[6] timestamp latch: each ap_vld hits its own register");
-          force dut.sentCount_ap_vld = 1'b1;   @(negedge clk);
-          release dut.sentCount_ap_vld;        repeat (5) @(negedge clk);
-          force dut.echoRxCount_ap_vld = 1'b1; @(negedge clk);
-          release dut.echoRxCount_ap_vld;      repeat (5) @(negedge clk);
-          force dut.echoCount_ap_vld = 1'b1;   @(negedge clk);
-          release dut.echoCount_ap_vld;        repeat (5) @(negedge clk);
-          force dut.recvCount_ap_vld = 1'b1;   @(negedge clk);
-          release dut.recvCount_ap_vld;        repeat (5) @(negedge clk);
+          // Обёртка штампует cycle_counter по физическому событию на шине:
+          // tvalid & tready & tlast там, где сообщение пересекает границу ядра.
+          // Проверяем, что каждый строб попадает в СВОЙ регистр и что все четыре
+          // различны (иначе один общий регистр на всех).
+          //
+          // РАНЬШЕ ЗДЕСЬ ФОРСИЛИСЬ *_ap_vld СЧЁТЧИКОВ ЯДРА. Стробы переведены на
+          // шину, потому что ap_vld поднимается не в такте события, а когда стадия
+          // отдаёт значение наружу -- при ap_ctrl_hs это на ap_done прохода, то
+          // есть на несколько тактов позже. Внутри одной половины смещение
+          // сокращается (RTT, ECHO остаются верными), а NET_FWD = t2'-t1' и
+          // NET_REV = t2-t1 вычитают точки из РАЗНЫХ половин, и там оно даёт
+          // систематическую ошибку в единицы тактов. Хост её не увидит: баланс
+          // NET_FWD + ECHO + NET_REV == RTT сходится всегда.
+          //
+          // tlast обязателен: для 64 байт это одно слово, но при свипе до 1500
+          // (24 слова) без него точка уехала бы на длину сообщения.
+          $display("\n[6] timestamp latch: each bus event hits its own register");
+          force dut.m_axis_tcp_tx_data_a_tvalid = 1'b1;
+          force dut.m_axis_tcp_tx_data_a_tready = 1'b1;
+          force dut.m_axis_tcp_tx_data_a_tlast  = 1'b1;
+          @(negedge clk);
+          release dut.m_axis_tcp_tx_data_a_tvalid;
+          release dut.m_axis_tcp_tx_data_a_tready;
+          release dut.m_axis_tcp_tx_data_a_tlast;
+          repeat (5) @(negedge clk);
+
+          force dut.s_axis_tcp_rx_data_b_tvalid = 1'b1;
+          force dut.s_axis_tcp_rx_data_b_tready = 1'b1;
+          force dut.s_axis_tcp_rx_data_b_tlast  = 1'b1;
+          @(negedge clk);
+          release dut.s_axis_tcp_rx_data_b_tvalid;
+          release dut.s_axis_tcp_rx_data_b_tready;
+          release dut.s_axis_tcp_rx_data_b_tlast;
+          repeat (5) @(negedge clk);
+
+          force dut.m_axis_tcp_tx_data_b_tvalid = 1'b1;
+          force dut.m_axis_tcp_tx_data_b_tready = 1'b1;
+          force dut.m_axis_tcp_tx_data_b_tlast  = 1'b1;
+          @(negedge clk);
+          release dut.m_axis_tcp_tx_data_b_tvalid;
+          release dut.m_axis_tcp_tx_data_b_tready;
+          release dut.m_axis_tcp_tx_data_b_tlast;
+          repeat (5) @(negedge clk);
+
+          force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
+          force dut.s_axis_tcp_rx_data_a_tready = 1'b1;
+          force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
+          @(negedge clk);
+          release dut.s_axis_tcp_rx_data_a_tvalid;
+          release dut.s_axis_tcp_rx_data_a_tready;
+          release dut.s_axis_tcp_rx_data_a_tlast;
+          repeat (5) @(negedge clk);
 
           begin : ts_check
                reg [31:0] t1p, t2p, t1, t2;

@@ -71,6 +71,22 @@ module hls_echo_probe_dual_krnl_ip (
      input  wire ap_clk,
      input  wire ap_rst_n,
 
+     // ── БЛОЧНЫЙ ПРОТОКОЛ: ПОЯВИЛСЯ ВМЕСТЕ С ap_ctrl_hs ─────────────────────
+     //
+     // При ap_ctrl_none у ядра этих портов не было вообще, и обёртка подделывала
+     // рукопожатие сама (assign ap_done = ap_start_pulse). Это и было причиной
+     // отказа: запустить регион было нечем, а барьер ap_sync_done внутри держал
+     // его после первого прохода.
+     //
+     // Заглушка ведёт себя как ap_ctrl_hs-ядро с КОРОТКИМ проходом: ap_ready и
+     // ap_done через такт после ap_start, ap_idle пока не запущено. Этого
+     // достаточно, чтобы обёртка и probe_control_s_axi отработали рукопожатие и
+     // auto_restart -- сама логика ядра тестбенчу не нужна, он про обёртку.
+     input  wire ap_start,
+     output wire ap_done,
+     output wire ap_ready,
+     output wire ap_idle,
+
      // Половины a и b: 16 потоков на каждую. Объявлены обобщённо через
      // директиву -- см. ниже, здесь просто перечислены все сигналы.
      // (Verilog не умеет генерировать порты, поэтому руками.)
@@ -232,6 +248,29 @@ module hls_echo_probe_dual_krnl_ip (
      assign echoRxCount = 32'b0; assign echoRxCount_ap_vld = 1'b0;
      assign echoCount = 32'b0; assign echoCount_ap_vld = 1'b0;
      assign listenAttempts = 32'b0; assign portState = 32'b0;
+
+// ── поведение блочного протокола ────────────────────────────────────────────
+//
+// Один такт «работы» на каждый ap_start: этого хватает, чтобы обёртка увидела
+// ap_ready (по нему control_s_axi опускает int_ap_start и, если взведён
+// auto_restart, сразу поднимает обратно) и ap_done для бита 1 регистра ap_ctrl.
+reg run_r  = 1'b0;
+reg done_r = 1'b0;
+
+always @(posedge ap_clk) begin
+     if (!ap_rst_n) begin
+          run_r  <= 1'b0;
+          done_r <= 1'b0;
+     end else begin
+          done_r <= run_r;          // done через такт после старта прохода
+          run_r  <= ap_start & ~run_r;
+     end
+end
+
+assign ap_done  = done_r;
+assign ap_ready = done_r;
+assign ap_idle  = ~run_r & ~done_r;
+
 endmodule
 
 
