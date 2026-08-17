@@ -341,8 +341,20 @@ initial begin
      $display("  portState=%0d listenAttempts=%0d", portState_b, listenAttempts_b);
      check("phase 4: no write gets through while TREADY is low",
            port_writes == 0);
-     check("phase 4: listenAttempts stays at zero -- the board symptom",
-           listenAttempts_b == 32'd0);
+
+     // listenAttempts здесь равен 1, а НЕ нулю, и это правильно: счётчик
+     // инкрементируется в том же такте, где nbwritereq предъявляет запись
+     // (listen.v:367-368), то есть ДО того, как выяснилось, что TREADY закрыт.
+     // Он честно считает ПОПЫТКИ, как и обещает имя.
+     //
+     // Отсюда вывод: закрытый TREADY НЕ воспроизводит симптом платы. Там
+     // listenAttempts=0, значит стадия не дошла даже до попытки, и причина не в
+     // TREADY. Здесь раньше стояла проверка на ноль, написанная под неверный
+     // прогноз: она падала, хотя ядро вело себя правильно.
+     check("phase 4: listenAttempts counts the ATTEMPT, not the transfer",
+           listenAttempts_b == 32'd1);
+     check("phase 4: stage stalls on the blocked write (ready pulses <= 1)",
+           ready_pulses <= 1);
 
      // ── фаза 6: ap_continue ЗАВИСИТ ОТ ДРУГИХ СТАДИЙ ─────────────────────
      //
@@ -390,13 +402,62 @@ initial begin
      $display("  phase 6 (ap_continue gated by others) : %0d ready, %0d writes",
               ready_pulses, port_writes);
 
+     // ── фаза 7: ТОЧНЫЙ СЦЕНАРИЙ ПЛАТЫ ────────────────────────────────────
+     //
+     // Фаза 6 дала listenAttempts=1, а на плате наблюдается 0. Расхождение
+     // объясняется моментом enable: в фазе 6 он стоял с нулевого такта, и
+     // единственный проход успел записать порт. На плате JTAG пишет enable
+     // ЧЕРЕЗ ДЕСЯТКИ СЕКУНД -- к этому моменту стадия свой единственный проход
+     // уже израсходовала на ветку if (!enable) и встала. Реагировать на позднюю
+     // запись ей нечем.
+     //
+     // Здесь это воспроизводится буквально: сначала enable=0 и заблокированный
+     // ap_continue, потом enable=1. Ожидаемый результат -- ровно то, что
+     // печатает dual_echo_status на плате: listenAttempts=0, state=0.
      $display("");
-     $display("--- what phase 4 means ---");
-     if (port_writes == 0 && listenAttempts_b == 32'd0)
-          $display("  A closed TREADY reproduces the board symptom exactly:");
-     $display("  listenAttempts=0 with a fully working stage.");
-     $display("  Next step on hardware: probe m_axis_tcp_listen_port_TREADY,");
-     $display("  do NOT rewrite the kernel.");
+     $display("--- phase 7: the board, exactly -- late enable AND gated ap_continue ---");
+     ap_rst            = 1'b1;
+     ap_start_drive    = 1'b0;
+     m_axis_tcp_listen_port_b_TREADY = 1'b1;
+     enableB           = 32'd0;                 // JTAG ещё не писал
+     other_stages_done = 1'b0;                  // rx_drain не готов
+     repeat (4) @(posedge ap_clk);
+     port_writes  = 0;
+     ready_pulses = 0;
+     ap_rst       = 1'b0;
+     @(posedge ap_clk);
+     ap_start_drive = 1'b1;
+
+     // Ядро живёт само по себе, пока оператор набирает команды.
+     repeat (5000) @(posedge ap_clk);
+     $display("  before enable: ready pulses=%0d writes=%0d state=%0d att=%0d",
+              ready_pulses, port_writes, portState_b, listenAttempts_b);
+
+     // dual_echo_enable 1
+     enableB = 32'd1;
+     repeat (100_000) @(posedge ap_clk);
+     $display("  after  enable: ready pulses=%0d writes=%0d state=%0d att=%0d",
+              ready_pulses, port_writes, portState_b, listenAttempts_b);
+
+     check("phase 7: listenAttempts stays 0 -- EXACTLY the board symptom",
+           listenAttempts_b == 32'd0);
+     check("phase 7: portState stays 0 -- EXACTLY the board symptom",
+           portState_b == 32'd0);
+     check("phase 7: no listen request ever goes out", port_writes == 0);
+
+     $display("");
+     $display("--- verdict ---");
+     $display("  The stage itself is fine: phases 1-3 show enable arriving and");
+     $display("  the request repeating on timeout (1502549 passes, 2 writes).");
+     $display("");
+     $display("  What kills it is ap_continue. In dual_echo_core it is");
+     $display("  ap_sync_done -- AND over all 14 stages (core.v:1337). One stage");
+     $display("  that never asserts ap_done freezes listen after a single pass");
+     $display("  (phase 6), and with a late enable nothing is ever requested at");
+     $display("  all (phase 7) -- which is exactly what the board reports.");
+     $display("");
+     $display("  TREADY is NOT the cause: phase 4 still counts one attempt,");
+     $display("  while the board reports zero.");
 
      $display("");
      if (fails == 0)
