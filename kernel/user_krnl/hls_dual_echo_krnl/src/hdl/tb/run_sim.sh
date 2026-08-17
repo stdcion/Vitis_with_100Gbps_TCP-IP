@@ -11,11 +11,13 @@
 # симптом на плате (enable записан и читается, а portState=0) может дать и то, и
 # другое:
 #
-#   ./run_sim.sh listen   tb_listen_start    -- СГЕНЕРИРОВАННЫЙ HLS-RTL:
-#                                              работает ли стадия listen сама
+#   ./run_sim.sh listen   tb_listen_start    -- СГЕНЕРИРОВАННЫЙ HLS-RTL, одна
+#                                              стадия: механизм отказа
+#   ./run_sim.sh core     tb_core_ap_done    -- ВЕСЬ dual_echo_core, 14 стадий:
+#                                              КТО не выдаёт ap_done
 #   ./run_sim.sh ctrl     tb_dual_echo_ctrl  -- НАША HDL-ОБЁРТКА: доходит ли
 #                                              enable от AXI-Lite до порта ядра
-#   ./run_sim.sh          (то же, что all)   -- оба
+#   ./run_sim.sh          (то же, что all)   -- все три
 #
 # tb_listen_start берёт RTL не из репозитория, а из каталога HLS-проекта, то есть
 # ровно то железо, которое уходит в битстрим. Его надо сначала создать:
@@ -49,12 +51,12 @@ which xvlog >/dev/null 2>&1 || {
 
 WHICH="${1:-all}"
 
-# Сгенерированный RTL нужен ТОЛЬКО tb_listen_start. tb_dual_echo_ctrl работает от
-# src/hdl/*.v и заглушек, поэтому при `run_sim.sh ctrl` отсутствие HLS-проекта не
-# должно останавливать прогон: иначе проверку обёртки нельзя было бы сделать без
-# csynth, а она от ядра не зависит.
+# Сгенерированный RTL нужен tb_listen_start и tb_core_ap_done. tb_dual_echo_ctrl
+# работает от src/hdl/*.v и заглушек, поэтому при `run_sim.sh ctrl` отсутствие
+# HLS-проекта не должно останавливать прогон: иначе проверку обёртки нельзя было бы
+# сделать без csynth, а она от ядра не зависит.
 SYN_DIR=""
-if [ "$WHICH" = "all" ] || [ "$WHICH" = "listen" ]; then
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "listen" ] || [ "$WHICH" = "core" ]; then
      # Путь задаётся export_hls_ip.tcl: проект <ядро>_ip_proj, решение sol1.
      # Глоб по решению -- чтобы не ломаться при смене его имени.
      SYN_DIRS=( $(ls -d "$KRNL_DIR/src/hls/${KRNL}_ip_proj"/*/syn/verilog 2>/dev/null) )
@@ -141,6 +143,13 @@ run_one () {
 # tb_listen_start -- СГЕНЕРИРОВАННЫЙ HLS-RTL: работает ли сама стадия listen.
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "listen" ]; then
      run_one tb_listen_start "${SRCS_V[*]} $TB_DIR/tb_listen_start.sv"
+fi
+
+# tb_core_ap_done -- ВЕСЬ dual_echo_core со всеми 14 стадиями: КТО из них не
+# выдаёт ap_done и тем самым блокирует ap_continue всех остальных.
+# tb_listen_start показывает МЕХАНИЗМ (фазы 6-7), этот -- ВИНОВНИКА.
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ]; then
+     run_one tb_core_ap_done "${SRCS_V[*]} $TB_DIR/tb_core_ap_done.sv"
 fi
 
 # tb_dual_echo_ctrl -- НАША HDL-ОБЁРТКА: доходит ли enable от AXI-Lite до порта
