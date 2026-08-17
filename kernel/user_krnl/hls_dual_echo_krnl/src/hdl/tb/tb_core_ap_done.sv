@@ -548,6 +548,15 @@ always @(posedge ap_clk) begin
                if (stage_done[i]) done_cnt[i] <= done_cnt[i] + 1;
 end
 
+// ap_done РЕГИОНА -- он же ap_sync_done (core.v:1329). Нулевой счётчик означает,
+// что барьер не срабатывает ни разу, то есть ap_continue никого не блокирует.
+// Это прямой признак того, что правка while(true) достигла цели.
+int unsigned region_done_cnt = 0;
+
+always @(posedge ap_clk) begin
+     if (!ap_rst && ap_done) region_done_cnt <= region_done_cnt + 1;
+end
+
 // ── прогон ───────────────────────────────────────────────────────────────────
 int unsigned fails = 0;
 int unsigned n_never = 0;
@@ -601,6 +610,31 @@ initial begin
 
      // Утверждение теста: listen ОБЯЗАН повторять запрос при молчащем стеке.
      // Если нет -- регион заморожен, что и наблюдается на плате.
+     // ── ЧТО ИМЕННО ДОЛЖНА БЫЛА ИЗМЕНИТЬ ПРАВКА while(true) ───────────────
+     //
+     // Лечение состоит не в том, чтобы «стадия работала быстрее», а в том, чтобы
+     // барьер ap_sync_done ПЕРЕСТАЛ СРАБАТЫВАТЬ. Он равен И по ap_done всех 14
+     // стадий (core.v:1337); если хотя бы одна не завершается, он навсегда 0, и
+     // ap_continue никого не блокирует -- ровно как у упстрима, где эту роль
+     // играет recvData_handshake с do/while по счётчику байт.
+     //
+     // Поэтому проверяем ДВА независимых признака, а не один:
+     //   1) стадия listen больше не выдаёт ap_done (счётчик 0);
+     //   2) регион в целом не выдаёт ap_done.
+     // Первый признак прямо подтверждает, что while(true) сработал как задумано;
+     // второй -- что барьер снят. Без них «writes > 1» можно было бы получить и
+     // случайно, от изменения расписания.
+     $display("");
+     $display("--- did the fix do what it was supposed to? ---");
+     $display("  region ap_done cycles: %0d", region_done_cnt);
+     // Индексы 0 и 3 -- две половины dual_echo_listen (см. stage_name выше).
+     check("listen half a no longer finishes (ap_done never asserted)",
+           done_cnt[3] == 0);
+     check("listen half b no longer finishes (ap_done never asserted)",
+           done_cnt[0] == 0);
+     check("region ap_done stays low -- the barrier is gone",
+           region_done_cnt == 0);
+
      $display("");
      check("listen half a retries the request (>1 write)", port_writes_a > 1);
      check("listen half b retries the request (>1 write)", port_writes_b > 1);

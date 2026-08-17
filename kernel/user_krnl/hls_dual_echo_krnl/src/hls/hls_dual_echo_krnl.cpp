@@ -133,6 +133,14 @@ portRequested лишь когда стек ответил success=0. Если с
 // случался, а не был заметно чаще, чем стек успевает отвечать.
 #define LISTEN_TIMEOUT 1000000
 
+// Граница вечного цикла стадий ТОЛЬКО для csim (см. пояснение у while(true) в
+// dual_echo_listen). При синтезе не используется: в железе цикл бесконечен.
+// Значение с запасом — тестбенчу нужны единицы итераций на шаг протокола, а
+// лишние обходы холостые.
+#ifndef __SYNTHESIS__
+#define DE_CSIM_ITERS 10000
+#endif
+
 /*
  * Состояние автомата listen, вынесенное из static-переменных В ЯВНУЮ
  * СТРУКТУРУ.
@@ -200,63 +208,122 @@ void dual_echo_listen(int enable,
                       hls::stream<pkt16>& m_axis_tcp_listen_port,
                       hls::stream<pkt8>& s_axis_tcp_port_status)
 {
-#pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     // До разрешения хоста не трогаем стек: listenPort может быть ещё не
-     // записан, а сам стек — ещё не запущен (см. шапку файла). Значение
-     // порта приходит аргументом, поэтому одна и та же функция обслуживает
-     // обе половины со своими номерами.
-     if (!enable)
+     // ── ВЕЧНЫЙ ЦИКЛ: СТАДИЯ НЕ ДОЛЖНА ВЫДАВАТЬ ap_done ──────────────────────
+     //
+     // ЗАЧЕМ. В dataflow-регионе `ap_continue` каждой стадии равен `ap_sync_done`
+     // — логическому И по `ap_done` ВСЕХ 14 стадий (dual_echo_core.v:1337). А
+     // внутри стадии `ap_done_reg` сбрасывается только по `ap_continue`
+     // (dual_echo_listen.v:303), и пока он поднят, конвейер заблокирован (:609).
+     //
+     // Пока ВСЕ стадии короткие, `ap_sync_done` вычисляется каждый такт и требует
+     // совпадения 14 сигналов с разными периодами (у нас смесь II=1 и II=2).
+     // Совпадения не происходит, `ap_continue` не приходит, и каждая стадия
+     // встаёт после ПЕРВОГО прохода. Измерено на полном ядре в tb_core_ap_done:
+     // 3 млн тактов при enable=1 и TREADY=1 дали ОДНУ запись listen-порта вместо
+     // повторов по таймауту.
+     //
+     // Достаточно ОДНОЙ незавершающейся стадии, чтобы `ap_sync_done` навсегда
+     // ушёл в ноль: тогда барьер просто не срабатывает, и остальные стадии
+     // перестают в него упираться. Именно так устроен упстрим — и это НЕ
+     // самодеятельность:
+     //
+     //   * hls_recv_krnl, recvData_handshake (communication.hpp:1218):
+     //         do { ... } while (rxByteCnt < expRxBytePerSession);
+     //     `expRxBytePerSession` задаёт хост, на плате это минуты работы.
+     //     В отчёте csynth латентность такой стадии — «?», ap_done не выдаётся.
+     //   * iperf_krnl, client (iperf_client.cpp:170) — FSM в цикле, тоже не
+     //     завершается.
+     //
+     // То есть у авторов барьер `ap_sync_done` МЁРТВ ПО ПОСТРОЕНИЮ: его держит
+     // долгоживущая стадия. Мы его случайно оживили, сделав все стадии
+     // короткими.
+     //
+     // ПОЧЕМУ ПРАГМА ПЕРЕЕХАЛА ВНУТРЬ. `PIPELINE II=1` относится к телу цикла, а
+     // не к функции: снаружи он бы конвейеризовал функцию целиком и цикл остался
+     // бы последовательным.
+     //
+     // `return` ЗАМЕНЁН НА `continue` — иначе выход из функции завершил бы её и
+     // вернул ту самую `ap_done`, ради отсутствия которой цикл и заведён.
+     //
+     // `static`-состояние (st) остаётся снаружи: внутри цикла оно живёт всё время
+     // работы ядра, рестарта больше нет. Ср. hls-early-return-stops-stage.
+     //
+     // ПРО ГРАНИЦУ ЦИКЛА В csim. Вечный цикл повесил бы csim: тестбенч вызывает
+     // топ-функцию и ждёт возврата (test_hls_dual_echo_krnl.cpp:113). Поэтому
+     // число итераций ограничено ТОЛЬКО в программной сборке, а при синтезе
+     // остаётся бесконечным. Так же поступает упстрим, только иначе: у него
+     // условие выхода — счётчик принятых байт, который хост задаёт огромным
+     // (`expRxBytePerSession`), то есть цикл конечен формально и бесконечен
+     // практически. Наш вариант честнее: в железе НЕТ условия выхода вообще,
+     // а не «очень большое», поэтому и рассуждать о его достижимости не нужно.
+     //
+     // DE_CSIM_ITERS подобран так, чтобы тестбенчу хватило на все сценарии:
+     // ему нужны единицы итераций на каждый шаг протокола.
+#ifdef __SYNTHESIS__
+     while (true)
+#else
+     for (int csim_guard = 0; csim_guard < DE_CSIM_ITERS; csim_guard++)
+#endif
      {
-          portState = 0;
-          return;
-     }
+     #pragma HLS PIPELINE II=1
 
-     if (!st.portRequested)
-     {
-          // Порт занят предыдущим запросом? Не пишем в полный поток —
-          // блокирующая запись остановила бы всю стадию.
-          if (m_axis_tcp_listen_port.full())
-               return;
-
-          pkt16 listen_port_pkt;
-          listen_port_pkt.data = 0;
-          listen_port_pkt.data(15, 0) = (ap_uint<16>)listenPort;
-          m_axis_tcp_listen_port.write(listen_port_pkt);
-          st.portRequested = true;
-          st.waitTimer = 0;
-          st.attempts++;
-          listenAttempts = st.attempts;
-          portState = 1;
-     }
-     else if (!st.portOpened)
-     {
-          if (!s_axis_tcp_port_status.empty())
+          // До разрешения хоста не трогаем стек: listenPort может быть ещё не
+          // записан, а сам стек — ещё не запущен (см. шапку файла). Значение
+          // порта приходит аргументом, поэтому одна и та же функция обслуживает
+          // обе половины со своими номерами.
+          if (!enable)
           {
-               pkt8 status_pkt = s_axis_tcp_port_status.read();
-               bool success = status_pkt.data(0, 0);
-               if (success)
+               portState = 0;
+               continue;
+          }
+
+          if (!st.portRequested)
+          {
+               // Порт занят предыдущим запросом? Не пишем в полный поток —
+               // блокирующая запись остановила бы всю стадию.
+               if (m_axis_tcp_listen_port.full())
+                    continue;
+
+               pkt16 listen_port_pkt;
+               listen_port_pkt.data = 0;
+               listen_port_pkt.data(15, 0) = (ap_uint<16>)listenPort;
+               m_axis_tcp_listen_port.write(listen_port_pkt);
+               st.portRequested = true;
+               st.waitTimer = 0;
+               st.attempts++;
+               listenAttempts = st.attempts;
+               portState = 1;
+          }
+          else if (!st.portOpened)
+          {
+               if (!s_axis_tcp_port_status.empty())
                {
-                    st.portOpened = true;
-                    portState = 2;
+                    pkt8 status_pkt = s_axis_tcp_port_status.read();
+                    bool success = status_pkt.data(0, 0);
+                    if (success)
+                    {
+                         st.portOpened = true;
+                         portState = 2;
+                    }
+                    else
+                    {
+                         // не открылось — просим снова на следующем такте
+                         st.portRequested = false;
+                    }
+               }
+               else if (st.waitTimer >= (ap_uint<32>)LISTEN_TIMEOUT)
+               {
+                    // Стек молчит. Раньше здесь наступало вечное ожидание;
+                    // теперь повторяем запрос — растущий listenAttempts на
+                    // хосте прямо показывает, что ответа так и нет.
+                    st.portRequested = false;
                }
                else
                {
-                    // не открылось — просим снова на следующем такте
-                    st.portRequested = false;
+                    st.waitTimer++;
                }
-          }
-          else if (st.waitTimer >= (ap_uint<32>)LISTEN_TIMEOUT)
-          {
-               // Стек молчит. Раньше здесь наступало вечное ожидание;
-               // теперь повторяем запрос — растущий listenAttempts на
-               // хосте прямо показывает, что ответа так и нет.
-               st.portRequested = false;
-          }
-          else
-          {
-               st.waitTimer++;
           }
      }
 }
