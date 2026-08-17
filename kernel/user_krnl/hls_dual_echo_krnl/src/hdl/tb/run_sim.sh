@@ -168,7 +168,34 @@ fi
 # выдаёт ap_done и тем самым блокирует ap_continue всех остальных.
 # tb_listen_start показывает МЕХАНИЗМ (фазы 6-7), этот -- ВИНОВНИКА.
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ]; then
-     run_one tb_core_ap_done "${SRCS_V[*]} $TB_DIR/tb_core_ap_done.sv"
+     # Тестбенч подключает 219 портов dual_echo_core ПОИМЕННО, поэтому он
+     # привязан к текущему набору портов. Стоит правке в .cpp изменить состав
+     # скаляров -- элаборация упадёт с «cannot find port». Это не ложное
+     # срабатывание, а сигнал перегенерировать тестбенч (см. его шапку: он
+     # создаётся скриптом из hls_dual_echo_krnl_dual_echo_core.v).
+     #
+     # Проверяем состав заранее и говорим прямо, что делать: иначе десяток
+     # ошибок xelab читается как поломка теста, а не как устаревший список.
+     core_v="$SYN_DIR/${KRNL}_dual_echo_core.v"
+     if [ -f "$core_v" ]; then
+          n_ports_rtl=$(sed -n '/^module .*_dual_echo_core/,/^);/p' "$core_v" \
+                        | grep -cE "^\s+[a-zA-Z_][a-zA-Z0-9_]*,?\s*$")
+          n_ports_tb=$(grep -cE "^\s+\.[a-zA-Z_][a-zA-Z0-9_]*\(" \
+                        "$TB_DIR/tb_core_ap_done.sv")
+          if [ "$n_ports_rtl" -ne "$n_ports_tb" ]; then
+               echo ""
+               echo "*** tb_core_ap_done устарел: в RTL $n_ports_rtl портов, в тестбенче $n_ports_tb."
+               echo "    Состав портов dual_echo_core изменился после правки .cpp."
+               echo "    Тестбенч генерируется скриптом из"
+               echo "      $core_v"
+               echo "    -- см. шапку tb_core_ap_done.sv. Перегенерируйте его."
+               fails=$((fails+1))
+          else
+               run_one tb_core_ap_done "${SRCS_V[*]} $TB_DIR/tb_core_ap_done.sv"
+          fi
+     else
+          run_one tb_core_ap_done "${SRCS_V[*]} $TB_DIR/tb_core_ap_done.sv"
+     fi
 fi
 
 # tb_dual_echo_ctrl -- НАША HDL-ОБЁРТКА: доходит ли enable от AXI-Lite до порта
