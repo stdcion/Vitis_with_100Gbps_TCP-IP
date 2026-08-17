@@ -220,8 +220,7 @@ struct listenState
 void dual_echo_listen(int enable,
                       int listenPort,
                       listenState& st,
-                      hls::stream<ap_uint<32> >& attemptsFifo,
-                      hls::stream<ap_uint<32> >& stateFifo,
+                      hls::stream<ap_uint<64> >& telemetryFifo,
                       hls::stream<pkt16>& m_axis_tcp_listen_port,
                       hls::stream<pkt8>& s_axis_tcp_port_status)
 {
@@ -338,8 +337,10 @@ void dual_echo_listen(int enable,
      // Публикация в поток НЕБЛОКИРУЮЩАЯ: если публикатор почему-то не успел,
      // теряется отчёт, а не работа. Блокирующая запись остановила бы стадию,
      // держащую барьер, — то есть телеметрия смогла бы уронить всё ядро.
-     if (!stateFifo.full())
-          stateFifo.write(0);          // «ждём enable» до входа в цикл
+     // Пара (attempts, state) в одном слове: запись атомарна, значения на хосте
+     // всегда согласованы между собой.
+     if (!telemetryFifo.full())
+          telemetryFifo.write(((ap_uint<64>)0 << 32) | st.attempts);
 
      while (enable)
      {
@@ -359,8 +360,8 @@ void dual_echo_listen(int enable,
                st.portRequested = true;
                st.waitTimer = 0;
                st.attempts++;
-               if (!attemptsFifo.full()) attemptsFifo.write(st.attempts);
-               if (!stateFifo.full())    stateFifo.write(1);
+               if (!telemetryFifo.full())
+                    telemetryFifo.write(((ap_uint<64>)1 << 32) | st.attempts);
           }
           else if (!st.portOpened)
           {
@@ -371,7 +372,8 @@ void dual_echo_listen(int enable,
                     if (success)
                     {
                          st.portOpened = true;
-                         if (!stateFifo.full()) stateFifo.write(2);
+                         if (!telemetryFifo.full())
+                              telemetryFifo.write(((ap_uint<64>)2 << 32) | st.attempts);
                     }
                     else
                     {
@@ -417,18 +419,43 @@ void dual_echo_listen(int enable,
  * listen, а не она; её завершение ничего не блокирует.
  */
 void dual_echo_publish(publishState& ps,
-                       hls::stream<ap_uint<32> >& attemptsFifo,
-                       hls::stream<ap_uint<32> >& stateFifo,
+                       hls::stream<ap_uint<64> >& telemetryFifo,
                        ap_uint<32>& listenAttempts,
                        ap_uint<32>& portState)
 {
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     if (!attemptsFifo.empty())
-          ps.lastAttempts = attemptsFifo.read();
-     if (!stateFifo.empty())
-          ps.lastState = stateFifo.read();
+     // ── ОДИН ПОТОК, ОДНА ЗАПИСЬ, ФОРМА КАК У rx_notify ──────────────────────
+     //
+     // Первая версия читала ДВА потока и писала ДВА выхода за проход. HLS её НЕ
+     // конвейеризовал (в логе csynth нет строки «Pipelining function
+     // dual_echo_publish», в отличие от rx_notify), а непайплайненная стадия
+     // получает FSM, в которой состояние инициализируется на входе в каждый
+     // проход:
+     //
+     //     pubs_a_lastState <= 32'd0;            // не по ap_rst!
+     //
+     // Поэтому наружу уходили нули: значение, прочитанное из FIFO, затиралось
+     // раньше, чем его успевали отдать. В тесте это выглядело как
+     // portState=0 при трёх реальных записях listen-порта.
+     //
+     // Для сравнения, у работающей rx_notify состояние сбрасывается ТОЛЬКО по
+     // ap_rst (rx_notify.v:343) -- обычный регистр, переживающий проходы.
+     //
+     // Приводим к её форме: ранний выход при пустом потоке, одно поле состояния,
+     // один поток. Оба счётчика идут в ОДНОМ потоке как пара, упакованная в 64
+     // бита -- так и запись атомарна (state и attempts всегда согласованы), и
+     // стадия остаётся достаточно простой, чтобы конвейеризоваться.
+     //
+     //     [31:0]  attempts
+     //     [63:32] portState
+     if (telemetryFifo.empty())
+          return;                       // нечего публиковать -- выходы держит preg
+
+     ap_uint<64> word = telemetryFifo.read();
+     ps.lastAttempts = word(31, 0);
+     ps.lastState    = word(63, 32);
 
      listenAttempts = ps.lastAttempts;
      portState      = ps.lastState;
@@ -686,14 +713,10 @@ void dual_echo_core(
      // Каналы телеметрии listen -> publish. Глубина 2: значения перезаписываются,
      // а не накапливаются, и publish читает чаще, чем listen пишет (тот пишет по
      // событию: запрос порта, подтверждение, повтор по таймауту).
-     static hls::stream<ap_uint<32> > attemptsFifo_a("attemptsFifo_a");
-     #pragma HLS STREAM variable=attemptsFifo_a depth=2
-     static hls::stream<ap_uint<32> > stateFifo_a("stateFifo_a");
-     #pragma HLS STREAM variable=stateFifo_a depth=2
-     static hls::stream<ap_uint<32> > attemptsFifo_b("attemptsFifo_b");
-     #pragma HLS STREAM variable=attemptsFifo_b depth=2
-     static hls::stream<ap_uint<32> > stateFifo_b("stateFifo_b");
-     #pragma HLS STREAM variable=stateFifo_b depth=2
+     static hls::stream<ap_uint<64> > telemetryFifo_a("telemetryFifo_a");
+     #pragma HLS STREAM variable=telemetryFifo_a depth=2
+     static hls::stream<ap_uint<64> > telemetryFifo_b("telemetryFifo_b");
+     #pragma HLS STREAM variable=telemetryFifo_b depth=2
 
      // ── восемь стадий ПЛОСКО, по четыре на половину ──
      //
@@ -706,12 +729,10 @@ void dual_echo_core(
      // стадии короткие, их ap_done ничего не блокирует.
 
      // половина a -> network_krnl_1 (QSFP0)
-     dual_echo_listen(enableA, listenPortA, st_a,
-                      attemptsFifo_a, stateFifo_a,
+     dual_echo_listen(enableA, listenPortA, st_a, telemetryFifo_a,
                       m_axis_tcp_listen_port_a, s_axis_tcp_port_status_a);
 
-     dual_echo_publish(pubs_a, attemptsFifo_a, stateFifo_a,
-                       listenAttempts_a, portState_a);
+     dual_echo_publish(pubs_a, telemetryFifo_a, listenAttempts_a, portState_a);
 
      dual_echo_rx_notify(ns_a, notifyCount_a,
                          s_axis_tcp_notification_a, m_axis_tcp_read_pkg_a,
@@ -721,12 +742,10 @@ void dual_echo_core(
                         rxSessionFifo_a, rxLengthFifo_a);
 
      // половина b -> network_krnl_2 (QSFP1)
-     dual_echo_listen(enableB, listenPortB, st_b,
-                      attemptsFifo_b, stateFifo_b,
+     dual_echo_listen(enableB, listenPortB, st_b, telemetryFifo_b,
                       m_axis_tcp_listen_port_b, s_axis_tcp_port_status_b);
 
-     dual_echo_publish(pubs_b, attemptsFifo_b, stateFifo_b,
-                       listenAttempts_b, portState_b);
+     dual_echo_publish(pubs_b, telemetryFifo_b, listenAttempts_b, portState_b);
 
      dual_echo_rx_notify(ns_b, notifyCount_b,
                          s_axis_tcp_notification_b, m_axis_tcp_read_pkg_b,
