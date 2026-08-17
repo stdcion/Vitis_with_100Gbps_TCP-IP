@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Генератор tb_core_ap_done.sv из сгенерированного HLS-RTL.
+"""Генератор tb_core_ap_done.sv для hls_echo_probe_dual_krnl.
+
+Копия скрипта из hls_dual_echo_krnl/src/hdl/tb, отличаются только KRNL и
+CORE_SUFFIX. Логика общая: у probe тот же барьер ap_sync_done, и симптом на
+плате был идентичным -- все счётчики нули, state=0(no-request), timeouts=0.
 
 ЗАЧЕМ. dual_echo_core имеет ~219 портов, и тестбенч подключает их поимённо.
 Руками такой список не поддерживается: любая правка состава скаляров в .cpp
@@ -23,8 +27,8 @@ from pathlib import Path
 #
 #     python3 gen_tb_core.py                       # dual_echo, путь ищется сам
 #     python3 gen_tb_core.py <путь к *_core.v>     # любое ядро
-KRNL = "hls_dual_echo_krnl"
-CORE_SUFFIX = "_dual_echo_core"
+KRNL = "hls_echo_probe_dual_krnl"
+CORE_SUFFIX = "_epd_core"
 
 CTRL = {"ap_clk", "ap_rst", "ap_start", "ap_done", "ap_idle", "ap_ready",
         "ap_continue"}
