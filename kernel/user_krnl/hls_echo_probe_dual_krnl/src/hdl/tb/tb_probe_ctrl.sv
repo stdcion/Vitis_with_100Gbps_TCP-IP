@@ -326,11 +326,9 @@ module tb_probe_ctrl;
           $display("\n[5] sampleReady: the one-cycle race");
 
           // сначала нормальный случай: круг замкнулся -> флаг встал
-          force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
-          force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
+          force dut.tap_t2_reply = 1'b1;
           @(negedge clk);
-          release dut.s_axis_tcp_rx_data_a_tvalid;
-          release dut.s_axis_tcp_rx_data_a_tlast;
+          release dut.tap_t2_reply;
           repeat (2) @(negedge clk);
           axi_read(A_SMPREADY, v);
           `chk("sampleReady set when the loop closes", v === 32'd1);
@@ -374,11 +372,9 @@ module tb_probe_ctrl;
                               // обновился, а trigger_r ещё держит старое --
                               // это и есть тот единственный такт.
                               if (dut.triggerGo_reg !== prev) begin
-                                   force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
-                                   force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
+                                   force dut.tap_t2_reply = 1'b1;
                                    @(posedge clk);
-                                   release dut.s_axis_tcp_rx_data_a_tvalid;
-                                   release dut.s_axis_tcp_rx_data_a_tlast;
+                                   release dut.tap_t2_reply;
                                    hit = 1'b1;
                               end
                          end
@@ -411,55 +407,29 @@ module tb_probe_ctrl;
           // tlast обязателен: для 64 байт это одно слово, но при свипе до 1500
           // (24 слова) без него точка уехала бы на длину сообщения.
           $display("\n[6] timestamp latch: each bus event hits its own register");
-          force dut.m_axis_tcp_tx_data_a_tvalid = 1'b1;
-          force dut.m_axis_tcp_tx_data_a_tready = 1'b1;
-          force dut.m_axis_tcp_tx_data_a_tlast  = 1'b1;
-          @(negedge clk);
-          release dut.m_axis_tcp_tx_data_a_tvalid;
-          release dut.m_axis_tcp_tx_data_a_tready;
-          release dut.m_axis_tcp_tx_data_a_tlast;
-          repeat (5) @(negedge clk);
 
-          // tready у s_axis_* НЕ ФОРСИМ: это ВЫХОД обёртки, его драйвит заглушка
-          // ядра (в tb_probe_taps все s_axis_*_TREADY зашиты в 1). Форс на выход
-          // конфликтует с этим драйвером -- в первой версии из-за него t2'
-          // защёлкнулся не в свой такт, а позже, вместе с t2.
-          force dut.s_axis_tcp_rx_data_b_tvalid = 1'b1;
-          force dut.s_axis_tcp_rx_data_b_tlast  = 1'b1;
-          @(negedge clk);
-          release dut.s_axis_tcp_rx_data_b_tvalid;
-          release dut.s_axis_tcp_rx_data_b_tlast;
-          repeat (5) @(negedge clk);
-
-          force dut.m_axis_tcp_tx_data_b_tvalid = 1'b1;
-          force dut.m_axis_tcp_tx_data_b_tready = 1'b1;
-          force dut.m_axis_tcp_tx_data_b_tlast  = 1'b1;
-          @(negedge clk);
-          release dut.m_axis_tcp_tx_data_b_tvalid;
-          release dut.m_axis_tcp_tx_data_b_tready;
-          release dut.m_axis_tcp_tx_data_b_tlast;
-          repeat (5) @(negedge clk);
-
-          force dut.s_axis_tcp_rx_data_a_tvalid = 1'b1;
-          force dut.s_axis_tcp_rx_data_a_tlast  = 1'b1;
-          @(negedge clk);
-          release dut.s_axis_tcp_rx_data_a_tvalid;
-          release dut.s_axis_tcp_rx_data_a_tlast;
-          repeat (5) @(negedge clk);
-
-          // ДИАГНОСТИКА: если проверка ниже упадёт, эти строки скажут, какой из
-          // четырёх tap-сигналов не поднялся и почему -- значения tvalid/tready/
-          // tlast видны прямо. Без них «t2' не тот» превращается в угадывание.
-          $display("     taps now: t1_pre=%b t2_pre=%b t1_echo=%b t2_reply=%b",
-                   dut.tap_t1_pre, dut.tap_t2_pre, dut.tap_t1_echo, dut.tap_t2_reply);
-          $display("     rx_b: tvalid=%b tready=%b tlast=%b",
-                   dut.s_axis_tcp_rx_data_b_tvalid,
-                   dut.s_axis_tcp_rx_data_b_tready,
-                   dut.s_axis_tcp_rx_data_b_tlast);
-          $display("     rx_a: tvalid=%b tready=%b tlast=%b",
-                   dut.s_axis_tcp_rx_data_a_tvalid,
-                   dut.s_axis_tcp_rx_data_a_tready,
-                   dut.s_axis_tcp_rx_data_a_tlast);
+          // ФОРСИМ tap_*, А НЕ ПОРТЫ ОБЁРТКИ, И ЭТО НЕ УПРОЩЕНИЕ.
+          //
+          // AXI-Stream входы обёртки подключены в этом тестбенче к КОНСТАНТАМ
+          // (.s_axis_tcp_rx_data_b_tvalid(1'b0) и т.п. -- см. инстанс выше): здесь
+          // проверяется тракт управления, а не данных. force на порт с
+          // константным драйвером не даёт ожидаемого эффекта, и первая версия
+          // фазы 6 получала t2'=130 вместо 118 -- значение от ЧЕТВЁРТОГО форса,
+          // потому что второй не защёлкивал ничего.
+          //
+          // tap_t1_pre..tap_t2_reply -- это внутренние провода обёртки, ровно те,
+          // по которым штампуются регистры. Форсить их корректно и проверяется
+          // именно то, что нужно: попадает ли каждый строб в СВОЙ регистр и одна
+          // ли у них шкала. Само вычисление tap из tvalid&tready&tlast проверяет
+          // tb_probe_taps на настоящем трафике -- там врезки подключены к шине.
+          force dut.tap_t1_pre = 1'b1;   @(negedge clk);
+          release dut.tap_t1_pre;        repeat (5) @(negedge clk);
+          force dut.tap_t2_pre = 1'b1;   @(negedge clk);
+          release dut.tap_t2_pre;        repeat (5) @(negedge clk);
+          force dut.tap_t1_echo = 1'b1;  @(negedge clk);
+          release dut.tap_t1_echo;       repeat (5) @(negedge clk);
+          force dut.tap_t2_reply = 1'b1; @(negedge clk);
+          release dut.tap_t2_reply;      repeat (5) @(negedge clk);
 
           begin : ts_check
                reg [31:0] t1p, t2p, t1, t2;
