@@ -61,6 +61,15 @@ if [ ! -f "$LISTEN_V" ]; then
      exit 1
 fi
 
+# Стадия инстанцирует регистровые слайсы на своих AXI-Stream портах
+# (regslice_both_m_axis_tcp_listen_port_b_V_data_V_U и т.п.), поэтому один
+# файл стадии не элаборируется:
+#     ERROR: [VRFC 10-2063] Module <..._regslice_both> not found
+# Добавляем ВСЕ .v решения: лишние модули не мешают -- xelab берёт только те,
+# что достижимы от указанного top, а перечислять зависимости вручную значило бы
+# править этот список при каждом изменении портов ядра.
+SRCS_V=( "$SYN_DIR"/*.v )
+
 mkdir -p "$WORK"
 cd "$WORK" || exit 1
 
@@ -98,7 +107,7 @@ run_one () {
      fi
 }
 
-run_one tb_listen_start "$LISTEN_V $TB_DIR/tb_listen_start.sv"
+run_one tb_listen_start "${SRCS_V[*]} $TB_DIR/tb_listen_start.sv"
 
 echo ""
 echo "============================================================"
