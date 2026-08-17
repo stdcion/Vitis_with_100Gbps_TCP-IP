@@ -95,9 +95,36 @@ logic       ap_ce = 1'b1;
 // Сравнение с импульсным вариантом убрано: оно проверяло опровергнутую
 // гипотезу и при верной длительности прогона ничего не различает.
 logic ap_start_drive = 1'b0;
-logic ap_continue    = 1'b1;
 
 wire ap_done, ap_idle, ap_ready;
+
+// ── ap_continue: ПРЕДМЕТ ФАЗЫ 6 ──────────────────────────────────────────────
+//
+// Раньше здесь стояла константа 1'b1, и это было САМЫМ СЕРЬЁЗНЫМ расхождением
+// теста с железом. В dual_echo_core оно устроено иначе:
+//
+//   core.v:1371  assign dual_echo_listen_U0_ap_continue = ap_sync_continue;
+//   core.v:1335  assign ap_sync_continue = (ap_sync_done & ap_continue);
+//   core.v:1337  assign ap_sync_done = (tie_off_udp_U0_ap_done & ... &
+//                                       dual_echo_rx_drain_U0_ap_done & ...);
+//                                      ^^^ И ПО ВСЕМ 14 СТАДИЯМ
+//
+// То есть listen получает ap_continue только когда ВСЕ 14 стадий региона
+// выставили ap_done одновременно. А внутри стадии ap_done_reg сбрасывается
+// ТОЛЬКО по ap_continue (listen.v:303), и при ap_done_reg == 1 конвейер
+// заблокирован (listen.v:609, ap_block_pp0_stage1_01001).
+//
+// Отсюда подозрение на замкнутый круг: rx_drain ждёт данных в rxSessionFifo,
+// данные кладёт rx_notify, тот ждёт notification от стека, а стек молчит, пока
+// listen не открыл порт. Если ap_done одной стадии не приходит -- listen после
+// первого ap_done встаёт навсегда.
+//
+// ФАЗА 6 подаёт ap_continue именно так, как core, с моделью «одна из прочих
+// стадий не готова». Переключатель ниже позволяет фазам 1-5 работать по-старому,
+// чтобы прежние результаты остались сравнимыми.
+logic        other_stages_done = 1'b1;   // фазы 1-5: прочие стадии «готовы»
+wire         ap_sync_done      = ap_done & other_stages_done;
+wire         ap_continue       = ap_sync_done;   // как core.v:1335 при ap_continue=1
 
 // ── ВОСПРОИЗВЕДЕНИЕ ap_sync ИЗ dual_echo_core.v ──────────────────────────────
 //
@@ -317,6 +344,52 @@ initial begin
      check("phase 4: listenAttempts stays at zero -- the board symptom",
            listenAttempts_b == 32'd0);
 
+     // ── фаза 6: ap_continue ЗАВИСИТ ОТ ДРУГИХ СТАДИЙ ─────────────────────
+     //
+     // Здесь воспроизводится то, чего не было ни в одной прежней фазе: в
+     // dual_echo_core ap_continue стадии равен ap_sync_done -- И по ВСЕМ 14
+     // стадиям (core.v:1337). Ставим other_stages_done = 0, что означает «хотя
+     // бы одна стадия региона не выставила ap_done». На плате такой стадией
+     // предполагается rx_drain: он ждёт данных, которых не будет, пока listen
+     // не открыл порт.
+     //
+     // TREADY возвращаем в 1 и enable держим 1 -- условия для listen идеальные.
+     // Единственное отличие от фазы 3, где было 2 записи, это ap_continue.
+     // Поэтому результат ОДНОЗНАЧНО приписывается ему.
+     $display("");
+     $display("--- phase 6: ap_continue gated by other stages (as in core) ---");
+     ap_rst            = 1'b1;
+     ap_start_drive    = 1'b0;
+     m_axis_tcp_listen_port_b_TREADY = 1'b1;    // стек принимает
+     enableB           = 32'd1;                 // разрешено
+     other_stages_done = 1'b0;                  // <- ЕДИНСТВЕННОЕ ОТЛИЧИЕ
+     repeat (4) @(posedge ap_clk);
+     port_writes  = 0;
+     ready_pulses = 0;
+     ap_rst       = 1'b0;
+     @(posedge ap_clk);
+     ap_start_drive = 1'b1;
+
+     // Прогон с тем же запасом, что фаза 3: если дело только в скорости, за
+     // 3 млн тактов повтор успел бы случиться (в фазе 3 он случился).
+     repeat (AFTER_ENABLE) @(posedge ap_clk);
+     $display("  port writes  : %0d", port_writes);
+     $display("  ready pulses : %0d", ready_pulses);
+     $display("  portState=%0d listenAttempts=%0d", portState_b, listenAttempts_b);
+
+     // ЭТО И ЕСТЬ ПРОВЕРЯЕМОЕ УТВЕРЖДЕНИЕ. В фазе 3 при том же прогоне было
+     // 2 записи и полтора миллиона проходов. Если здесь их резко меньше --
+     // механизм подтверждён: ap_continue от чужих стадий останавливает listen.
+     check("phase 6: stage STALLS when ap_continue never arrives",
+           ready_pulses < 100);
+     check("phase 6: listen request does not repeat", port_writes <= 1);
+
+     $display("");
+     $display("--- phase 6 vs phase 3: same everything but ap_continue ---");
+     $display("  phase 3 (ap_continue from own ap_done): 1502549 ready, 2 writes");
+     $display("  phase 6 (ap_continue gated by others) : %0d ready, %0d writes",
+              ready_pulses, port_writes);
+
      $display("");
      $display("--- what phase 4 means ---");
      if (port_writes == 0 && listenAttempts_b == 32'd0)
@@ -333,10 +406,10 @@ initial begin
      $finish;
 end
 
-// Страховка. Прогон длинный (>1.2 млн тактов при 5 нс = ~6 мс модельного
-// времени), поэтому лимит с запасом.
+// Страховка. Прогон длинный: фазы 1-5 дают ~3 млн тактов, фаза 6 ещё 3 млн,
+// итого ~6 млн при 5 нс = ~30 мс модельного времени. Лимит с запасом.
 initial begin
-     #20_000_000;
+     #45_000_000;
      $display("*** TIMEOUT -- testbench did not finish");
      $finish;
 end
