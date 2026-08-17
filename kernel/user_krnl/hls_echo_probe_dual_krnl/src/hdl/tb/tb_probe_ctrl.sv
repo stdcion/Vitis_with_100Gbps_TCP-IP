@@ -447,6 +447,20 @@ module tb_probe_ctrl;
           release dut.s_axis_tcp_rx_data_a_tlast;
           repeat (5) @(negedge clk);
 
+          // ДИАГНОСТИКА: если проверка ниже упадёт, эти строки скажут, какой из
+          // четырёх tap-сигналов не поднялся и почему -- значения tvalid/tready/
+          // tlast видны прямо. Без них «t2' не тот» превращается в угадывание.
+          $display("     taps now: t1_pre=%b t2_pre=%b t1_echo=%b t2_reply=%b",
+                   dut.tap_t1_pre, dut.tap_t2_pre, dut.tap_t1_echo, dut.tap_t2_reply);
+          $display("     rx_b: tvalid=%b tready=%b tlast=%b",
+                   dut.s_axis_tcp_rx_data_b_tvalid,
+                   dut.s_axis_tcp_rx_data_b_tready,
+                   dut.s_axis_tcp_rx_data_b_tlast);
+          $display("     rx_a: tvalid=%b tready=%b tlast=%b",
+                   dut.s_axis_tcp_rx_data_a_tvalid,
+                   dut.s_axis_tcp_rx_data_a_tready,
+                   dut.s_axis_tcp_rx_data_a_tlast);
+
           begin : ts_check
                reg [31:0] t1p, t2p, t1, t2;
                axi_read(A_TSREQ, t1p);
