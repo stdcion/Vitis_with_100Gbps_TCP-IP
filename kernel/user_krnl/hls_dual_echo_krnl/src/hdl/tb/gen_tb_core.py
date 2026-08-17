@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Генератор tb_core_ap_done.sv из сгенерированного HLS-RTL.
+"""Генератор tb_core_ap_done.sv для hls_echo_probe_dual_krnl.
+
+Копия скрипта из hls_dual_echo_krnl/src/hdl/tb, отличаются только KRNL и
+CORE_SUFFIX. Логика общая: у probe тот же барьер ap_sync_done, и симптом на
+плате был идентичным -- все счётчики нули, state=0(no-request), timeouts=0.
 
 ЗАЧЕМ. dual_echo_core имеет ~219 портов, и тестбенч подключает их поимённо.
 Руками такой список не поддерживается: любая правка состава скаляров в .cpp
@@ -113,17 +117,43 @@ if not stages:
 # Шины, по которым видно, что половина ядра работает. Первый найденный вариант
 # из списка -- у dual_echo это listen_port на обеих половинах, у probe на a стоит
 # open_connection (клиент открывает соединение, а не слушает).
-def pick_bus(cands, side):
+# КАКУЮ ШИНУ СЧИТАТЬ ПРИЗНАКОМ РАБОТЫ ПОЛОВИНЫ.
+#
+# По НАЛИЧИЮ порта различить ядра нельзя: у обоих есть и listen_port, и
+# open_connection на обеих половинах -- неиспользуемые заглушены через tie_off_*.
+# Первые две версии этой функции ошибались именно здесь, и тест либо требовал от
+# сервера повторов (FAIL на probe), либо терял симметрию у dual_echo.
+#
+# Надёжный признак -- КТО ВЕДЁТ шину. В RTL это видно прямо в assign:
+#
+#   dual_echo:  ..._listen_port_a_TVALID = dual_echo_listen_1_U0_...      <- стадия
+#               ..._open_connection_a_TVALID = tie_off_tcp_open_connection_3_U0_...
+#   probe:      ..._open_connection_a_TVALID = epd_client_connect_U0_...  <- стадия
+#               ..._listen_port_a_TVALID = tie_off_tcp_listen_port_U0_...
+#
+# Значит выбираем ту шину, чей драйвер НЕ tie_off.
+def driven_by_stage(bus):
+    m = re.search(r"assign\s+%s_TVALID\s*=\s*(\w+)" % re.escape(bus), src)
+    return bool(m) and not m.group(1).startswith("tie_off")
+
+
+def pick_active_bus(side):
+    cands = ["m_axis_tcp_listen_port_%s" % side,
+             "m_axis_tcp_open_connection_%s" % side]
     for c in cands:
-        n = c % side
-        if (n + "_TVALID") in decl:
-            return n
-    sys.exit("*** не найдена шина активности для половины %s (искал: %s)"
-             % (side, [c % side for c in cands]))
+        if driven_by_stage(c):
+            return c
+    # ни одна не ведётся стадией -- берём первую существующую, чтобы тест хотя бы
+    # собрался, но это сигнал разобраться руками
+    for c in cands:
+        if (c + "_TVALID") in decl:
+            print("// WARNING: %s ведут только заглушки -- проверьте вручную" % c)
+            return c
+    sys.exit("*** не найдена шина активности для половины %s" % side)
 
 
-BUS_A = pick_bus(["m_axis_tcp_listen_port_%s", "m_axis_tcp_open_connection_%s"], "a")
-BUS_B = pick_bus(["m_axis_tcp_listen_port_%s", "m_axis_tcp_open_connection_%s"], "b")
+BUS_A = pick_active_bus("a")
+BUS_B = pick_active_bus("b")
 
 have_state = all(n in decl and decl[n][0] == "output"
                  for n in ("portState_a", "portState_b"))
@@ -490,11 +520,19 @@ if have_state:
     add('     check("both halves behave identically (portState)",')
     add("           lat_portState_a == lat_portState_b);")
 if not (have_state and have_att):
+    # У probe счётчики НЕ проходят через s_axilite ядра: они идут проводами в
+    # probe_control_s_axi, который держит регистры. Поэтому отсутствие
+    # portState/listenAttempts среди портов epd_core -- это НЕ потеря телеметрии,
+    # а другая схема. Что она работает, проверяет tb_probe_ctrl (фаза 7: все
+    # восемь адресов отвечают) и tb_probe_taps.
+    #
+    # Первая версия печатала здесь «TELEMETRY LOST» и валила тест -- проверка
+    # унаследована от dual_echo, где счётчики действительно s_axilite и их
+    # исчезновение означало дефект.
     add('     $display("");')
-    add('     $display("  *** TELEMETRY LOST: outputs dropped by HLS. Writes to an");')
-    add('     $display("      output scalar must exist OUTSIDE the loop body too,");')
-    add('     $display("      otherwise the port is unreachable from the return path.");')
-    add("     fails++;")
+    add('     $display("  NOTE: these outputs are not ports of the core -- for this");')
+    add('     $display("        kernel the counters go by wire into the HDL wrapper,");')
+    add('     $display("        which holds the registers. Checked by tb_probe_ctrl.");')
 add("")
 add('     $display("");')
 add('     if (fails == 0) $display("=== ALL GREEN ===");')

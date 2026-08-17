@@ -117,17 +117,43 @@ if not stages:
 # Шины, по которым видно, что половина ядра работает. Первый найденный вариант
 # из списка -- у dual_echo это listen_port на обеих половинах, у probe на a стоит
 # open_connection (клиент открывает соединение, а не слушает).
-def pick_bus(cands, side):
+# КАКУЮ ШИНУ СЧИТАТЬ ПРИЗНАКОМ РАБОТЫ ПОЛОВИНЫ.
+#
+# По НАЛИЧИЮ порта различить ядра нельзя: у обоих есть и listen_port, и
+# open_connection на обеих половинах -- неиспользуемые заглушены через tie_off_*.
+# Первые две версии этой функции ошибались именно здесь, и тест либо требовал от
+# сервера повторов (FAIL на probe), либо терял симметрию у dual_echo.
+#
+# Надёжный признак -- КТО ВЕДЁТ шину. В RTL это видно прямо в assign:
+#
+#   dual_echo:  ..._listen_port_a_TVALID = dual_echo_listen_1_U0_...      <- стадия
+#               ..._open_connection_a_TVALID = tie_off_tcp_open_connection_3_U0_...
+#   probe:      ..._open_connection_a_TVALID = epd_client_connect_U0_...  <- стадия
+#               ..._listen_port_a_TVALID = tie_off_tcp_listen_port_U0_...
+#
+# Значит выбираем ту шину, чей драйвер НЕ tie_off.
+def driven_by_stage(bus):
+    m = re.search(r"assign\s+%s_TVALID\s*=\s*(\w+)" % re.escape(bus), src)
+    return bool(m) and not m.group(1).startswith("tie_off")
+
+
+def pick_active_bus(side):
+    cands = ["m_axis_tcp_listen_port_%s" % side,
+             "m_axis_tcp_open_connection_%s" % side]
     for c in cands:
-        n = c % side
-        if (n + "_TVALID") in decl:
-            return n
-    sys.exit("*** не найдена шина активности для половины %s (искал: %s)"
-             % (side, [c % side for c in cands]))
+        if driven_by_stage(c):
+            return c
+    # ни одна не ведётся стадией -- берём первую существующую, чтобы тест хотя бы
+    # собрался, но это сигнал разобраться руками
+    for c in cands:
+        if (c + "_TVALID") in decl:
+            print("// WARNING: %s ведут только заглушки -- проверьте вручную" % c)
+            return c
+    sys.exit("*** не найдена шина активности для половины %s" % side)
 
 
-BUS_A = pick_bus(["m_axis_tcp_listen_port_%s", "m_axis_tcp_open_connection_%s"], "a")
-BUS_B = pick_bus(["m_axis_tcp_listen_port_%s", "m_axis_tcp_open_connection_%s"], "b")
+BUS_A = pick_active_bus("a")
+BUS_B = pick_active_bus("b")
 
 have_state = all(n in decl and decl[n][0] == "output"
                  for n in ("portState_a", "portState_b"))
