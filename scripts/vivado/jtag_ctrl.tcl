@@ -1403,6 +1403,281 @@ proc _vio_probes {vio} {
 # ЗАЧЕМ ДВА ЗАМЕРА. Абсолютные значения бесполезны: счётчики копятся с момента
 # сброса, и там уже сотни ARP. Смысл только в РАЗНИЦЕ до и после попытки
 # подключения, поэтому процедура ждёт ввода между замерами.
+# ═══════════════════════════════════════════════════════════════════════════════
+# epd_collect -- ОДИН ЗАПУСК, ВСЁ СРАЗУ
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ЗАЧЕМ ОТДЕЛЬНАЯ КОМАНДА. Доступ к плате -- около 10 минут в день. Цикл
+# «прошил -> посмотрел -> придумал гипотезу -> прошил» при таком доступе не
+# работает: восемь дней ушло на пять гипотез, и все пять оказались неверны.
+#
+# Поэтому плата больше НЕ ОТЛАДОЧНЫЙ СТЕНД, а прибор: она снимает данные, а
+# разбор идёт офлайн, сколько нужно. Задача этой процедуры -- за один запуск
+# собрать ВСЁ, что вообще читаемо, чтобы второго запуска не потребовалось.
+#
+# Что снимается:
+#   1. вся карта регистров ядра СЫРЫМИ словами (не только те, что печатает
+#      epd_status) -- по ним восстанавливается любое производное число офлайн;
+#   2. ДВА замера с паузой -- без разницы счётчики бесполезны, накопленные
+#      значения одинаковы у живого и у замороженного региона;
+#   3. VIO до и после попытки подключения -- разделяет «SYN не дошёл»,
+#      «TOE не ответил», «handshake идёт»;
+#   4. регистры network_krnl обоих каналов, включая указатели DDR;
+#   5. таймстемпы и счётчики врезок -- даже при sample failed их значения
+#      говорят, какая точка тракта сработала, а какая нет.
+#
+# ВЫВОД РАССЧИТАН НА КОПИРОВАНИЕ ЦЕЛИКОМ. Все строки помечены префиксами, чтобы
+# разбор офлайн не зависел от порядка и от того, что попало в буфер терминала.
+#
+# ЗАПУСК (одна команда, ~70 секунд, вмешательство только на шаге с ncat):
+#     epd_collect
+#
+# Аргументы: pause_s -- пауза между замерами (по умолчанию 10 с),
+#            n       -- номер канала.
+
+proc _ec_line {tag args} {
+     # Единый формат строки: «EC <тег> <данные>». Grep по тегу даёт срез, а
+     # префикс EC отделяет собранные данные от прочего вывода Vivado.
+     puts "EC $tag [join $args " "]"
+}
+
+# Все регистры ядра одним проходом, СЫРЫМИ значениями. Имена берём из EPD_OFF_*,
+# то есть карта не дублируется: добавился регистр -- попал в дамп сам.
+proc _ec_dump_user_regs {n} {
+     set base [ouch_base_user $n]
+     foreach v [lsort [info vars ::EPD_OFF_*]] {
+          set nm [string range [namespace tail $v] 8 end]
+          set off [set $v]
+          if {[catch {axi_read32 [expr {$base + $off}]} val]} {
+               _ec_line REG [format "%-14s off=0x%02x READ_FAILED" $nm $off]
+          } else {
+               _ec_line REG [format "%-14s off=0x%02x 0x%08x %u" $nm $off $val $val]
+          }
+     }
+}
+
+proc _ec_dump_net_regs {} {
+     foreach n {1 2} {
+          if {[catch {ouch_base_network $n} base]} { continue }
+          foreach {nm off} [list AP_CTRL $::NET_OFF_AP_CTRL \
+                                 IP_ADDR $::NET_OFF_IP_ADDR \
+                                 MAC_LO  $::NET_OFF_MAC_ADDR \
+                                 ARP     $::NET_OFF_ARP \
+                                 AXI00   $::NET_OFF_AXI00_PTR \
+                                 AXI01   $::NET_OFF_AXI01_PTR] {
+               if {[catch {axi_read32 [expr {$base + $off}]} val]} {
+                    _ec_line NET "ch$n $nm READ_FAILED"
+               } else {
+                    _ec_line NET [format "ch%d %-8s off=0x%03x 0x%08x" $n $nm $off $val]
+               }
+          }
+     }
+}
+
+# Снимок ВСЕХ probe всех VIO. Не только трёх счётчиков: stream_down, icmp_*,
+# arp_* и mac_* нужны, чтобы отличить проблему физики от проблемы протокола, а
+# второго запуска не будет.
+proc _ec_dump_vio {label} {
+     set vios [get_hw_vios]
+     if {[llength $vios] == 0} {
+          _ec_line VIO "$label NO_VIOS"
+          return
+     }
+     refresh_hw_vio $vios
+     foreach vio $vios {
+          set vname [get_property NAME $vio]
+          foreach pr [_vio_probes $vio] {
+               set short [get_property NAME.SHORT $pr]
+               set nm $short
+               if {[regexp {probe_in(\d+)$} $short -> i]} {
+                    set alias [lindex $::VIO_PROBE_NAMES $i]
+                    if {$alias ne ""} { set nm $alias }
+               }
+               _ec_line VIO [format "%-6s %-12s %-12s %s" \
+                                 $label $vname $nm [get_property INPUT_VALUE $pr]]
+          }
+     }
+}
+
+# То же для dual_echo. Отдельная процедура, а не флаг: карта регистров у ядер
+# РАЗНАЯ (DE_OFF_* против EPD_OFF_*), и попытка обслужить обе одним кодом уже
+# один раз дала чтение чужих смещений.
+proc de_collect {{pause_s 10} {n 1}} {
+     puts ""
+     puts "=============================================================="
+     puts " de_collect -- полный дамп dual_echo. СКОПИРУЙТЕ ВЫВОД ЦЕЛИКОМ."
+     puts "=============================================================="
+     _ec_line META "kernel=dual_echo channel=$n pause_s=$pause_s"
+     _ec_line META "base_user=0x[format %x [ouch_base_user $n]]"
+
+     set base [ouch_base_user $n]
+
+     puts ""
+     puts "--- 1/5: регистры ядра, замер A ---"
+     _ec_line PHASE "A_user_regs"
+     _de_dump_regs $n
+
+     puts ""
+     puts "--- 2/5: регистры network_krnl (оба канала) ---"
+     _ec_line PHASE "net_regs"
+     _ec_dump_net_regs
+
+     puts ""
+     puts "--- 3/5: VIO, замер A ---"
+     _ec_line PHASE "A_vio"
+     _ec_dump_vio A
+
+     puts ""
+     puts "--- 4/5: пауза $pause_s с (НИЧЕГО не делайте), затем замер B ---"
+     after [expr {$pause_s * 1000}]
+     _ec_line PHASE "B_user_regs"
+     _de_dump_regs $n
+     _ec_line PHASE "B_vio"
+     _ec_dump_vio B
+
+     puts ""
+     puts "--- 5/5: ТЕПЕРЬ ПОДКЛЮЧИТЕСЬ К ОБОИМ ПОРТАМ ---"
+     set pa [axi_read32 [expr {$base + $::DE_OFF_LISTEN_PORT_A}]]
+     set pb [axi_read32 [expr {$base + $::DE_OFF_LISTEN_PORT_B}]]
+     puts ""
+     puts "      ncat <ip канала 1> $pa"
+     puts "      ncat <ip канала 2> $pb"
+     puts ""
+     puts "    Обе половины -- смысл проверки: нужно видеть, что работают ОБА QSFP."
+     puts -nonewline "    Enter когда готово: "
+     flush stdout
+     gets stdin
+
+     _ec_line PHASE "C_user_regs"
+     _de_dump_regs $n
+     _ec_line PHASE "C_vio"
+     _ec_dump_vio C
+
+     puts ""
+     puts "=============================================================="
+     puts " СБОР ЗАВЕРШЁН. Скопируйте ВСЁ выше (строки 'EC ...')."
+     puts "=============================================================="
+     return 1
+}
+
+# ОГОВОРКА ПРО *_CTRL. Регистры ap_vld у HLS -- clear-on-read: само чтение
+# сбрасывает флаг «значение обновилось». Дамп их читает, то есть ПОТРЕБЛЯЕТ, и
+# следующий читатель увидит 0. Для сбора данных это безвредно (нас интересуют
+# сами счётчики в *_DATA), но означает, что epd_measure/dual_echo_status ПОСЛЕ
+# дампа могут не увидеть готовности. Порядок: сначала дамп, потом всё остальное.
+proc _de_dump_regs {n} {
+     set base [ouch_base_user $n]
+     foreach v [lsort [info vars ::DE_OFF_*]] {
+          set nm [string range [namespace tail $v] 7 end]
+          set off [set $v]
+          if {[catch {axi_read32 [expr {$base + $off}]} val]} {
+               _ec_line REG [format "%-16s off=0x%02x READ_FAILED" $nm $off]
+          } else {
+               _ec_line REG [format "%-16s off=0x%02x 0x%08x %u" $nm $off $val $val]
+          }
+     }
+}
+
+proc epd_collect {{pause_s 10} {n 1}} {
+     puts ""
+     puts "=============================================================="
+     puts " epd_collect -- полный дамп. СКОПИРУЙТЕ ВЫВОД ЦЕЛИКОМ."
+     puts "=============================================================="
+     _ec_line META "kernel=probe channel=$n pause_s=$pause_s"
+     if {[catch {clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"} ts]} {
+          set ts "unknown"
+     }
+     _ec_line META "time=$ts"
+     _ec_line META "base_user=0x[format %x [ouch_base_user $n]]"
+
+     # ── 1. состояние ДО любых действий ─────────────────────────────────────
+     puts ""
+     puts "--- 1/6: регистры ядра, замер A ---"
+     _ec_line PHASE "A_user_regs"
+     _ec_dump_user_regs $n
+
+     puts ""
+     puts "--- 2/6: регистры network_krnl (оба канала) ---"
+     _ec_line PHASE "net_regs"
+     _ec_dump_net_regs
+
+     puts ""
+     puts "--- 3/6: VIO, замер A ---"
+     _ec_line PHASE "A_vio"
+     _ec_dump_vio A
+
+     # ── 2. ПАУЗА: растут ли счётчики сами по себе ──────────────────────────
+     #
+     # Это отделяет «регион идёт» от «регион встал». Без разницы значения
+     # бесполезны: накопленные счётчики выглядят одинаково в обоих случаях.
+     puts ""
+     puts "--- 4/6: пауза $pause_s с (НИЧЕГО не делайте), затем замер B ---"
+     after [expr {$pause_s * 1000}]
+     _ec_line PHASE "B_user_regs"
+     _ec_dump_user_regs $n
+     _ec_line PHASE "B_vio"
+     _ec_dump_vio B
+
+     # ── 3. попытка подключения: единственный шаг с участием человека ───────
+     puts ""
+     puts "--- 5/6: ТЕПЕРЬ ЗАПУСТИТЕ НА ХОСТЕ ПОДКЛЮЧЕНИЕ ---"
+     puts ""
+     set ip_hex [format %08x [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_SERVER_IP}]]]
+     set lp [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_LISTEN_PORT}]]
+     set a1 [expr {("0x$ip_hex" >> 24) & 0xff}]
+     set a2 [expr {("0x$ip_hex" >> 16) & 0xff}]
+     set a3 [expr {("0x$ip_hex" >> 8) & 0xff}]
+     set a4 [expr {"0x$ip_hex" & 0xff}]
+     puts "      ncat $a1.$a2.$a3.$a4 $lp        (порт из LISTEN_PORT ядра)"
+     puts ""
+     puts "    Дайте ему 5-10 секунд поретрансмитить SYN, потом Enter."
+     puts -nonewline "    Enter когда готово: "
+     flush stdout
+     gets stdin
+
+     _ec_line PHASE "C_user_regs"
+     _ec_dump_user_regs $n
+     _ec_line PHASE "C_vio"
+     _ec_dump_vio C
+
+     # ── 4. триггер измерения: даже неудачный говорит, где встало ───────────
+     puts ""
+     puts "--- 6/6: триггер замера (даже неудачный информативен) ---"
+     _ec_line PHASE "D_trigger"
+     if {[catch {
+          axi_write32 [expr {[ouch_base_user $n] + $::EPD_OFF_TRIGGER_GO}] 1
+          after 200
+          axi_write32 [expr {[ouch_base_user $n] + $::EPD_OFF_TRIGGER_GO}] 0
+     } err]} {
+          _ec_line TRIG "write_failed: $err"
+     } else {
+          _ec_line TRIG "triggerGo pulsed 1->0"
+     }
+     after 500
+     _ec_line PHASE "D_user_regs"
+     _ec_dump_user_regs $n
+
+     puts ""
+     puts "=============================================================="
+     puts " СБОР ЗАВЕРШЁН. Скопируйте ВСЁ выше (строки 'EC ...') и"
+     puts " приложите к обсуждению -- разбор идёт офлайн, плата свободна."
+     puts "=============================================================="
+     puts ""
+
+     # Короткая сводка -- чтобы не улетать от платы вслепую, но решения по ней
+     # НЕ ПРИНИМАТЬ: полный разбор офлайн, здесь только явные обрывы.
+     set base [ouch_base_user $n]
+     set pst [axi_read32 [expr {$base + $::EPD_OFF_PORT_STATE}]]
+     set ctl [axi_read32 [expr {$base + $::EPD_OFF_AP_CTRL}]]
+     puts "быстрая сводка (не диагноз):"
+     puts [format "  ap_ctrl=0x%02x  ap_idle=%d   portState=%s" \
+               $ctl [expr {($ctl >> 2) & 1}] [_epd_state $pst]]
+     if {($ctl >> 2) & 1} {
+          puts "  ВНИМАНИЕ: ap_idle=1 -- ядро не запущено. Был ли epd_enable?"
+     }
+     return 1
+}
+
 proc why_no_syn_reply {{n 1}} {
      puts "Замер 1 из 2. Клиента НЕ подключать."
      set before [_vio_counters $n]
