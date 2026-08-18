@@ -1715,6 +1715,58 @@ proc dual_echo_status {{n 1}} {
      return [list $att_a $st_a $nt_a $att_b $st_b $nt_b]
 }
 
+# ── ИДЁТ ЛИ РЕГИОН ВООБЩЕ ───────────────────────────────────────────────────
+#
+# Первый вопрос после «portState=2, а SYN без ответа»: регион работает или стоит?
+# Одиночный dual_echo_status на это не отвечает -- он показывает НАКОПЛЕННЫЕ
+# значения, а они одинаковы и у живого региона (который просто ничего не принял),
+# и у замороженного после одного прохода.
+#
+# Отвечает только РАЗНИЦА. listenAttempts растёт, пока порт не открыт, и
+# перестаёт после открытия -- это нормально, поэтому смотрим на него ТОЛЬКО при
+# state<2. При state=2 живость региона по нему не проверить: стадия исправно
+# доходит до конца, но счётчик не меняет.
+#
+# ВАЖНО про вложенный DATAFLOW (см. docs/kernel_scheme_handoff.md, 18.08): тест
+# tb_core_ap_done подавал ap_start прямо в dual_echo_core, минуя внешний регион,
+# поэтому «writes 10/10» НЕ доказывает, что импульс доходит до стадий на плате.
+# Эта процедура мерит на железе, где обход невозможен.
+proc dual_echo_alive {{pause_s 10} {n 1}} {
+     puts "замер 1:"
+     set a [dual_echo_status $n]
+     puts ""
+     puts "ждём $pause_s с..."
+     after [expr {$pause_s * 1000}]
+     puts ""
+     puts "замер 2:"
+     set b [dual_echo_status $n]
+
+     puts ""
+     puts "=== прирост за $pause_s с ==="
+     foreach {idx nm} {0 listenAttempts_a 2 notifications_a 3 listenAttempts_b 5 notifications_b} {
+          set d [expr {[lindex $b $idx] - [lindex $a $idx]}]
+          puts [format "  %-18s +%d" $nm $d]
+     }
+
+     set st_a [lindex $b 1]
+     set d_att_a [expr {[lindex $b 0] - [lindex $a 0]}]
+     puts ""
+     if {$st_a < 2 && $d_att_a == 0} {
+          puts "  -> РЕГИОН СТОИТ. Порт не открыт, а попыток больше не делается --"
+          puts "     стадия не перезапускается. Смотрите вложенный DATAFLOW:"
+          puts "     чем управляется dual_echo_core_U0_ap_start в сгенерированном"
+          puts "     hls_dual_echo_krnl.v -- импульсом ap_start или ap_sync_continue."
+     } elseif {$st_a == 2} {
+          puts "  -> порт открыт, счётчики по listen стоять и должны."
+          puts "     Живость отсюда НЕ видна. Дальше: why_no_syn_reply, и если"
+          puts "     tcp_rx растёт, а notifications нет -- дефект в rx_notify"
+          puts "     (там два early return, апстрим так не делает)."
+     } else {
+          puts "  -> регион идёт (listenAttempts растёт), стек не подтверждает порт."
+     }
+     return [list $a $b]
+}
+
 proc _de_state {v} {
      switch -- $v {
           0 { return "0(not-requested)" }
