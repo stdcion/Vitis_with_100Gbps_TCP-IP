@@ -56,7 +56,7 @@ WHICH="${1:-all}"
 
 # Сгенерированный RTL: тестбенч симулирует то железо, которое уходит в битстрим.
 SYN_DIR=""
-if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ]; then
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ] || [ "$WHICH" = "top" ]; then
      # Путь задаётся export_hls_ip.tcl: проект <ядро>_ip_proj, решение sol1.
      # Глоб по решению -- чтобы не ломаться при смене его имени.
      SYN_DIRS=( $(ls -d "$KRNL_DIR/src/hls/${KRNL}_ip_proj"/*/syn/verilog 2>/dev/null) )
@@ -182,6 +182,23 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ]; then
      fi
 fi
 
+# tb_top_start -- ВЕРХНИЙ модуль. Предмет: доходит ли импульс ap_start до epd_core.
+#
+# tb_core_ap_done подаёт ap_start ПРЯМО в epd_core и потому не видит путь снаружи
+# внутрь. Плата 18.08 показала, что дефект именно там: ap_ctrl=0x83 (ap_done=1),
+# connAttempts=1 вместо ~4700 за 10 с, timeouts=0.
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "top" ]; then
+     TOP_TB="$TB_DIR/tb_top_start.sv"
+     if [ ! -f "$TOP_TB" ]; then
+          echo ""
+          echo "*** нет $TOP_TB -- сначала сгенерируйте:"
+          echo "      cd $TB_DIR && python3 gen_tb_top_start.py > tb_top_start.sv"
+          fails=$((fails+1))
+     else
+          run_one tb_top_start "${SRCS_V[*]} $TOP_TB"
+     fi
+fi
+
 
 echo ""
 echo "============================================================"
@@ -196,8 +213,8 @@ if [ "$ran" -eq 0 ]; then
      echo "  ИТОГ: НЕ ЗАПУЩЕНО НИ ОДНОГО ТЕСТБЕНЧА"
      echo ""
      echo "  Аргумент '$WHICH' не совпал ни с одним режимом. Допустимые:"
-     echo "      listen   стадия dual_echo_listen на сгенерированном RTL"
-     echo "      core     весь dual_echo_core, все 14 стадий"
+     echo "      core     весь epd_core: кто из стадий не выдаёт ap_done"
+     echo "      top      ВЕРХНИЙ модуль: доходит ли ap_start до epd_core"
      echo "      all      всё перечисленное (значение по умолчанию)"
      echo "============================================================"
      exit 1

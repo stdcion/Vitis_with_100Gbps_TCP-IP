@@ -16,7 +16,10 @@
 #                                              стадия: механизм отказа
 #   ./run_sim.sh core     tb_core_ap_done    -- ВЕСЬ dual_echo_core, 14 стадий:
 #                                              КТО не выдаёт ap_done
-#   ./run_sim.sh          (то же, что all)   -- оба
+#   ./run_sim.sh top      tb_top_start       -- ВЕРХНИЙ модуль: доходит ли
+#                                              импульс ap_start до *_core, или
+#                                              внешний DATAFLOW его съедает
+#   ./run_sim.sh          (то же, что all)   -- все
 #
 # РЕЖИМ ctrl УДАЛЁН вместе с HDL-обёрткой. Он проверял путь enable от AXI-Lite до
 # порта ядра -- у ядра больше нет ни обёртки, ни enable: регистры генерирует HLS
@@ -57,7 +60,8 @@ WHICH="${1:-all}"
 # Сгенерированный RTL нужен обоим тестбенчам: они симулируют то железо, которое
 # уходит в битстрим.
 SYN_DIR=""
-if [ "$WHICH" = "all" ] || [ "$WHICH" = "listen" ] || [ "$WHICH" = "core" ]; then
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "listen" ] || [ "$WHICH" = "core" ] \
+     || [ "$WHICH" = "top" ]; then
      # Путь задаётся export_hls_ip.tcl: проект <ядро>_ip_proj, решение sol1.
      # Глоб по решению -- чтобы не ломаться при смене его имени.
      SYN_DIRS=( $(ls -d "$KRNL_DIR/src/hls/${KRNL}_ip_proj"/*/syn/verilog 2>/dev/null) )
@@ -196,6 +200,28 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ]; then
      fi
 fi
 
+# tb_top_start -- ВЕРХНИЙ модуль. Предмет: доходит ли импульс ap_start до
+# внутреннего *_core, или внешний DATAFLOW-регион съедает его.
+#
+# Отдельный тестбенч, а не фаза в core, потому что предмет ДРУГОЙ: core проверяет
+# внутренний регион, получив ap_start напрямую, и по построению не может увидеть
+# путь снаружи внутрь. Именно этот слепой участок и дал ложную уверенность 17.08.
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "top" ]; then
+     TOP_TB="$TB_DIR/tb_top_start.sv"
+     if [ ! -f "$TOP_TB" ]; then
+          echo ""
+          echo "*** нет $TOP_TB -- сначала сгенерируйте:"
+          echo "      cd $TB_DIR && python3 gen_tb_top_start.py > tb_top_start.sv"
+          fails=$((fails+1))
+     else
+          # Тестбенч ссылается на инстанс core ИЕРАРХИЧЕСКИ (dut.<inst>.ap_start).
+          # Если правка .cpp убрала вложенный регион, инстанса не станет, xelab
+          # упадёт с «cannot find» -- и это ОЖИДАЕМЫЙ результат, означающий, что
+          # дефект устранён, а тест больше не нужен. Говорим об этом прямо.
+          run_one tb_top_start "${SRCS_V[*]} $TOP_TB"
+     fi
+fi
+
 
 echo ""
 echo "============================================================"
@@ -212,6 +238,7 @@ if [ "$ran" -eq 0 ]; then
      echo "  Аргумент '$WHICH' не совпал ни с одним режимом. Допустимые:"
      echo "      listen   стадия dual_echo_listen на сгенерированном RTL"
      echo "      core     весь dual_echo_core, все 14 стадий"
+     echo "      top      ВЕРХНИЙ модуль: доходит ли ap_start до core"
      echo "      all      всё перечисленное (значение по умолчанию)"
      echo "============================================================"
      exit 1
