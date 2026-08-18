@@ -167,6 +167,26 @@ if "ap_start" not in core_ports:
 CORE_HAS_DONE = "ap_done" in core_ports
 CORE_HAS_IDLE = "ap_idle" in core_ports
 
+# ── ТАЙМАУТ ПОВТОРА ИЗ .cpp ─────────────────────────────────────────────────
+# Ожидаемое число записей зависит от него линейно, поэтому значение берём из
+# исходника, а не дублируем в тестбенче: разойдясь, они дали бы ложный FAIL.
+def find_retry_delay():
+    cpp = Path(__file__).resolve().parents[2] / "hls" / (KRNL + ".cpp")
+    if not cpp.is_file():
+        return 0
+    txt = cpp.read_text()
+    # retryDelay у probe, LISTEN_TIMEOUT у dual_echo -- разные имена, одна роль.
+    for pat in (r"retryDelay\s*=\s*(\d+)",
+                r"#define\s+LISTEN_TIMEOUT\s+(\d+)",
+                r"LISTEN_TIMEOUT\s*=\s*(\d+)"):
+        mm = re.search(pat, txt)
+        if mm:
+            return int(mm.group(1))
+    return 0
+
+
+RETRY_DELAY = find_retry_delay()
+
 BUS_A = pick_active_bus("a")
 BUS_B = pick_active_bus("b")
 
@@ -204,6 +224,9 @@ add("")
 add("int unsigned writes_a = 0, writes_b = 0;")
 add("int unsigned core_start_seen = 0, core_done_seen = 0, top_done_seen = 0;")
 add("int unsigned fails = 0, checks = 0;")
+add("")
+add("// Таймаут повтора, вычитанный из %s.cpp. 0 = не найден." % KRNL)
+add("localparam int unsigned RETRY_DELAY = %d;" % RETRY_DELAY)
 add("")
 add("// Импульс ap_start: ровно то, что делает control_s_axi при записи 0x81 --")
 add("// поднять на такт и снять. auto_restart потом поднимает его снова сам.")
@@ -382,11 +405,44 @@ add("            $display(\"            impuls prohodit, no redko. Vneshnij regi
 add("            $display(\"            zavershitsja i perezapuskaetsja, a ne techet nepreryvno.\");")
 add("        end")
 add("")
-add("        // ГЛАВНАЯ ПРОВЕРКА. Порог 10 -- заведомо ниже любого разумного числа")
-add("        // проходов за миллион тактов (стадия с II=1..3 успела бы сотни тысяч),")
-add("        // но заведомо выше единицы, которую даёт замороженный регион.")
-add("        check(\"region rabotaet nepreryvno\", (writes_a - wa0) > 10,")
-add("              $sformatf(\"writes_a += %0d za 1M taktov (nado > 10)\", writes_a - wa0));")
+add("        // ── ПОРОГ СЧИТАЕМ ИЗ ТАЙМАУТА, А НЕ ИЗ ГОЛОВЫ ──────────────────────")
+add("        //")
+add("        // Прежняя версия требовала >10 записей за 1M тактов. Это НЕДОСТИЖИМО и")
+add("        // было ошибкой: стадия ждёт RETRY_DELAY ПРОХОДОВ, а проход региона")
+add("        // занимает несколько тактов. При RETRY_DELAY=100000 и проходе 3.5 такта")
+add("        // одна запись приходится на ~350k тактов, то есть за 1M их будет 2-3.")
+add("        // Порог 10 объявлял бы исправное ядро сломанным -- что и произошло")
+add("        // 18.08 на probe (writes += 2 при верной арифметике).")
+add("        //")
+add("        // Это ТРЕТИЙ раз, когда длительность считается в тактах вместо")
+add("        // проходов x II. Поэтому ожидание вычисляется здесь явно и печатается,")
+add("        // чтобы расхождение было видно как расхождение, а не как FAIL.")
+add("        //")
+add("        // ЧТО ПРОВЕРЯЕМ ПО СУТИ: регион не заперт. Признак -- ap_done растёт")
+add("        // (регион проходит цикл за циклом). Записи на шине проверяем ОТДЕЛЬНО")
+add("        // и мягко: их число задаёт таймаут повтора, а не живость региона.")
+add("        begin")
+add("            int unsigned passes = core_done_seen - cd0;")
+add("            real cyc_per_pass = (passes > 0) ? 1000000.0 / passes : 0.0;")
+add("            int unsigned expect_w = (RETRY_DELAY > 0 && cyc_per_pass > 0.0)")
+add("                                  ? $rtoi(1000000.0 / (RETRY_DELAY * cyc_per_pass))")
+add("                                  : 0;")
+add("            $display(\"    ARIFMETIKA: passes=%0d, %0.2f takta na prohod\",")
+add("                     passes, cyc_per_pass);")
+add("            $display(\"    RETRY_DELAY=%0d prohodov -> ozhidaem ~%0d zapisej za 1M taktov\",")
+add("                     RETRY_DELAY, expect_w);")
+add("")
+add("            // Живость: регион обязан проходить цикл многократно.")
+add("            check(\"region ne zapert (ap_done rastet)\", passes > 1000,")
+add("                  $sformatf(\"passes=%0d za 1M taktov\", passes));")
+add("")
+add("            // Записи -- сверка с ОЖИДАНИЕМ, вычисленным из таймаута.")
+add("            // Допуск: не меньше половины ожидаемого и хотя бы одна.")
+add("            check(\"zapisi sootvetstvujut RETRY_DELAY\",")
+add("                  (writes_a - wa0) >= 1 && (writes_a - wa0) * 2 >= expect_w,")
+add("                  $sformatf(\"writes_a += %0d, ozhidali ~%0d\",")
+add("                            writes_a - wa0, expect_w));")
+add("        end")
 add("    end")
 add("")
 
@@ -408,21 +464,19 @@ add("    // Иначе run_sim.sh назвал бы успешную диагн�
 add("    // между \"тест сломался\" и \"дефект подтверждён\" потерялась бы.")
 add("    if (fails != 0) begin")
 add("        $display(\"\");")
-add("        $display(\"VERDICT: VLOZHENNYJ DATAFLOW PODTVERZHDEN.\");")
-add("        $display(\"  Impuls ap_start ne ozhivljaet stadii vnutri %s.\",")
-add("                 \"" + core_inst + "\");")
-add("        $display(\"  Eto vosproizvodit platu: ap_ctrl=0x83, connAttempts=1, timeouts=0.\");")
-add("        $display(\"  PRAVKA: ubrat VNUTRENNIJ #pragma HLS DATAFLOW iz %s.\",")
-add("                 \"" + core_module.replace(KRNL + "_", "") + "\");")
-add("        $display(\"  Posle pravki etot test dolzhen perestat elaborirovatsja\");")
-add("        $display(\"  (instansa vlozhennogo regiona ne stanet) -- eto ozhidaemo.\");")
+add("        $display(\"VERDICT: region NE rabotaet kak dolzhen.\");")
+add("        $display(\"  Sm. ARIFMETIKA i RAZBOR vyshe -- oni govorjat, GDE imenno.\");")
+add("        $display(\"  Ne delajte vyvod o vlozhennom DATAFLOW iz odnogo etogo FAIL:\");")
+add("        $display(\"  proverte show_core_start.sh. Esli tam ap_continue = 1'b1,\");")
+add("        $display(\"  vneshnij region ni pri chem (provereno na probe 18.08).\");")
 add("        $display(\"ALL GREEN\");")
 add("        $finish;")
 add("    end")
 add("    $display(\"\");")
-add("    $display(\"VERDICT: gipoteza o vlozhennosti MERTVA.\");")
-add("    $display(\"  Impuls dohodit i region rabotaet nepreryvno. Prichina v drugom;\");")
-add("    $display(\"  sledujuschij kandidat -- early return v rx_notify (sm. handoff).\");")
+add("    $display(\"VERDICT: region rabotaet, zapisi sootvetstvujut RETRY_DELAY.\");")
+add("    $display(\"  Upravlenie ispravno: impuls dohodit, region prohodit cikly,\");")
+add("    $display(\"  stadii pishut s tem tempom, kotoryj zadan tajmautom povtora.\");")
+add("    $display(\"  Prichinu otkaza na plate iskat VNE etogo trakta.\");")
 add("    $display(\"ALL GREEN\");")
 add("    $finish;")
 add("end")
