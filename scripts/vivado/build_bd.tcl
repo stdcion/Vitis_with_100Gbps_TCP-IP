@@ -787,6 +787,37 @@ proc _addr_user    {n} { return [expr {($n - 1) * 0x20000 + 0x10000}] }
 # Сначала — автоматически всё, что не назначено (память для m0*_axi).
 assign_bd_address -quiet
 
+# ── АДРЕСА ПАМЯТИ: ПЕЧАТАЕМ, А НЕ УГАДЫВАЕМ ─────────────────────────────────
+#
+# network_krnl держит в DDR таблицу сессий TOE и буферы rx/tx. Базовый адрес
+# задаёт хост, записывая axi00_ptr0/axi01_ptr0 (network_set_buffers в
+# jtag_ctrl.tcl), и по умолчанию там стоят 0x00000000/0x40000000.
+#
+# НО РАСКЛАДКУ ВЫШЕ ДЕЛАЕТ assign_bd_address АВТОМАТИЧЕСКИ, и если сегмент DDR
+# начинается НЕ с нуля, то указатели по умолчанию смотрят в пустоту. Симптом на
+# плате ровно такой, какой мы видели: listen-порт открывается (portState=2),
+# стек подтверждает его, но SYN от клиента остаётся без ответа и без RST --
+# записать состояние сессии некуда, а порт формально слушается.
+#
+# Раньше эти адреса не печатались вообще, и сверить их с содержимым
+# network_set_buffers было нельзя -- только читать комментарий «if it is not 0,
+# shift both values» и надеяться. Теперь печатаем, чтобы расхождение было видно
+# сразу после шага bd, а не выяснялось на плате.
+puts ""
+puts "=== адреса ПАМЯТИ (для network_set_buffers в jtag_ctrl.tcl) ==="
+foreach n_ [lsort [get_bd_addr_spaces -quiet]] {
+     if {![regexp {network_krnl_(\d+)/Data_m0(\d)_axi} $n_ -> ch port]} { continue }
+     foreach seg_ [get_bd_addr_segs -quiet -of_objects [get_bd_addr_spaces $n_]] {
+          set off_ [get_property OFFSET $seg_]
+          set rng_ [get_property RANGE  $seg_]
+          puts [format "  network_krnl_%s m0%s_axi -> offset 0x%08x range 0x%08x" \
+                    $ch $port $off_ $rng_]
+     }
+}
+puts "  ВНИМАНИЕ: если offset не 0x00000000, сдвиньте оба указателя в"
+puts "            network_set_buffers на эту величину -- иначе TOE пишет"
+puts "            таблицу сессий в несуществующую память."
+
 puts ""
 puts "=== адреса s_axi_control ==="
 

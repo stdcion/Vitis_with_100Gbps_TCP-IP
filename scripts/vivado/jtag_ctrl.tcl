@@ -1374,6 +1374,95 @@ proc _vio_probes {vio} {
      return $out
 }
 
+# ── ПОЧЕМУ SYN ОСТАЁТСЯ БЕЗ ОТВЕТА ──────────────────────────────────────────
+#
+# Состояние, в котором мы застряли 17.08: portState=2(OPEN), стек подтвердил
+# listen-порт, ICMP ходит, а SYN от клиента остаётся без ответа И БЕЗ RST.
+# Отсутствие RST важно: порт формально слушается, иначе TOE ответил бы отказом
+# (проверено -- на закрытый 7005 RST приходит).
+#
+# Эта процедура разделяет три причины, между которыми иначе не выбрать.
+#
+#   tcp_rx НЕ РАСТЁТ при попытках подключения
+#     -> SYN не доходит до TCP-уровня. Смотреть rx_pkts: если и он стоит, дело
+#        в физике/CMAC (не тот QSFP, нет линка). Если rx_pkts растёт, а tcp_rx
+#        нет -- пакет отбрасывается раньше, на IP.
+#
+#   tcp_rx РАСТЁТ, tcp_tx НЕ РАСТЁТ
+#     -> TOE принял SYN и не ответил. Это память: таблица сессий живёт в DDR по
+#        адресу из axi00_ptr0/axi01_ptr0 (network_set_buffers). Если сегмент DDR
+#        в BD начинается не с нуля, указатели по умолчанию 0x0/0x40000000
+#        смотрят в пустоту -- записать состояние сессии некуда, и handshake
+#        молча не завершается. Шаг bd теперь печатает фактические offset, сверить
+#        с network_set_buffers.
+#
+#   tcp_rx и tcp_tx РАСТУТ ОБА
+#     -> handshake идёт, дело в ядре: notifications=0 значит уведомление о данных
+#        до ядра не доходит (проверить sc= в config_sp), иначе смотреть rx_drain.
+#
+# ЗАЧЕМ ДВА ЗАМЕРА. Абсолютные значения бесполезны: счётчики копятся с момента
+# сброса, и там уже сотни ARP. Смысл только в РАЗНИЦЕ до и после попытки
+# подключения, поэтому процедура ждёт ввода между замерами.
+proc why_no_syn_reply {{n 1}} {
+     puts "Замер 1 из 2. Клиента НЕ подключать."
+     set before [_vio_counters $n]
+     puts ""
+     puts "Теперь запустите на хосте:  ncat <ip> <port>   (или telnet)"
+     puts "и дайте ему 5-10 секунд поретрансмитить SYN."
+     puts -nonewline "Затем нажмите Enter: "
+     flush stdout
+     gets stdin
+     set after [_vio_counters $n]
+
+     puts ""
+     puts "=== прирост за время попытки подключения ==="
+     set d_rx   [expr {[dict get $after rx_pkts] - [dict get $before rx_pkts]}]
+     set d_tcprx [expr {[dict get $after tcp_rx] - [dict get $before tcp_rx]}]
+     set d_tcptx [expr {[dict get $after tcp_tx] - [dict get $before tcp_tx]}]
+     puts "  rx_pkts +$d_rx   tcp_rx +$d_tcprx   tcp_tx +$d_tcptx"
+     puts ""
+
+     if {$d_tcprx == 0} {
+          if {$d_rx == 0} {
+               puts "  -> ДО ПЛАТЫ НЕ ДОХОДИТ НИЧЕГО. Физика: кабель в другом QSFP,"
+               puts "     нет линка, или CMAC этого канала сидит не на своём GT-кваде."
+               puts "     Проверить: report_placement и axis_stream_down_counter."
+          } else {
+               puts "  -> кадры приходят, но до TCP не доезжают: отбрасывает IP-уровень."
+               puts "     Обычно неверный IP платы или маска на хосте."
+          }
+     } elseif {$d_tcptx == 0} {
+          puts "  -> TOE ПРИНЯЛ SYN И НЕ ОТВЕТИЛ. Наиболее вероятная причина --"
+          puts "     таблица сессий в DDR: указатели axi00_ptr0/axi01_ptr0 указывают"
+          puts "     в память, которой там нет."
+          puts "     Сверьте offset из шага bd (=== адреса ПАМЯТИ ===) с значениями"
+          puts "     в network_set_buffers. Если offset не 0, сдвиньте оба."
+     } else {
+          puts "  -> handshake идёт (tcp_tx растёт). Значит дело дальше:"
+          puts "     смотрите notifications в dual_echo_status / epd_status."
+     }
+     return [list $d_rx $d_tcprx $d_tcptx]
+}
+
+# Снимок трёх счётчиков VIO нужного канала. Отдельной процедурой, потому что
+# why_no_syn_reply вызывает её дважды, а vio_dump печатает всё и не возвращает.
+proc _vio_counters {{n 1}} {
+     refresh_hw_vio [lindex [get_hw_vios] [expr {$n - 1}]]
+     set vio [lindex [get_hw_vios] [expr {$n - 1}]]
+     set out [dict create]
+     foreach {key probe} {rx_pkts rx_pkg_counter tcp_rx tcp_rx_pkg_counter \
+                          tcp_tx tcp_tx_pkg_counter} {
+          set p [get_hw_probes -quiet -of_object $vio -filter "NAME =~ *$probe*"]
+          if {[llength $p] == 0} {
+               dict set out $key 0
+          } else {
+               dict set out $key [expr 0x[get_property INPUT_VALUE [lindex $p 0]]]
+          }
+     }
+     puts "  rx_pkts=[dict get $out rx_pkts] tcp_rx=[dict get $out tcp_rx] tcp_tx=[dict get $out tcp_tx]"
+     return $out
+}
+
 proc vio_dump {} {
      set vios [get_hw_vios]
      if {[llength $vios] == 0} {
