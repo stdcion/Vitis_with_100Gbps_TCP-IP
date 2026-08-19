@@ -23,6 +23,28 @@
 # отношения не имеет. Флаги ниже скопированы из фактического лога нашей сборки
 # (cmake_make_ip.txt:3526).
 #
+# ═══ ВАЖНО: RX_DDR_BYPASS=0, А НА ПЛАТЕ 1. ЧТО ЭТО ЗНАЧИТ ═══════════════════
+#
+# Наша сборка использует RX_DDR_BYPASS=1, но апстримный toe_tb.cpp С НИМ НЕ
+# КОМПИЛИРУЕТСЯ: он вызывает toe() со всеми аргументами, включая
+# rxBufferWriteStatus, а при bypass этот аргумент вырезан из сигнатуры
+# (toe.cpp:828-830, #if !(RX_DDR_BYPASS)). В toe_tb.cpp НОЛЬ упоминаний
+# RX_DDR_BYPASS -- он писался под 0 и про флаг не знает.
+#
+# Поэтому здесь 0. СЛЕДСТВИЕ, которое надо помнить при чтении результата:
+#
+#   ЧТО ОБЩЕЕ С ЖЕЛЕЗОМ -- session_lookup_controller, rx_engine до session
+#   lookup, tx_engine, формирование fourTuple. Именно это мы и проверяем.
+#
+#   ЧТО ОТЛИЧАЕТСЯ -- путь приёма ДАННЫХ (через DDR против bypass). Для
+#   handshake он не задействован: SYN-ACK строится из rxSar/txSar в BRAM
+#   (tx_engine.cpp:524-533), к памяти не обращается.
+#
+#   ЧЕГО РЕЗУЛЬТАТ НЕ ДОКАЖЕТ -- если srcIp в сессии окажется ПРАВИЛЬНЫМ, это
+#   НЕ значит, что на нашей конфигурации то же самое: bypass мог бы что-то
+#   менять, и это останется непроверенным. А вот НУЛЕВОЙ srcIp воспроизведёт
+#   дефект и укажет на session lookup.
+#
 # ВЕКТОР io_fin_5.dat уже воспроизводит нашу ситуацию: myIpAddress=0x01010101,
 # а кадр адресован 1.1.1.1 от 10.10.10.10 -- то есть сервер принимает SYN от
 # клиента, ровно как на плате.
@@ -44,7 +66,7 @@ set_top toe
 # Флаги -- ТЕ ЖЕ, что в нашей сборке битстрима. Менять только вместе с
 # CMakeLists.txt, иначе csim и железо разойдутся.
 set OUR_FLAGS "-DFNS_DATA_WIDTH=64 -DTCP_NODELAY=1 -DTCP_MSS=4096 \
--DTCP_STACK_MAX_SESSIONS=1000 -DRX_DDR_BYPASS=1 -DFAST_RETRANSMIT=1 \
+-DTCP_STACK_MAX_SESSIONS=1000 -DRX_DDR_BYPASS=0 -DFAST_RETRANSMIT=1 \
 -DWINDOW_SCALE=1 -DFNS_ROCE_STACK_MAX_QPS=500 -Wno-unknown-pragmas"
 
 foreach f {../axi_utils.cpp
@@ -65,7 +87,6 @@ foreach f {../axi_utils.cpp
            tx_engine/tx_engine.cpp
            tx_sar_table/tx_sar_table.cpp
            tx_app_interface/tx_app_interface.cpp
-           dummy_memory.cpp
            toe.cpp} {
      add_files $f -cflags $OUR_FLAGS
 }
