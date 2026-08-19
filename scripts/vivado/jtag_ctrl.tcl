@@ -1282,7 +1282,7 @@ proc recv_start {{basePort 5001} {useConn 1} {rxBytes 1000000} {n 1}} {
      set rd_port [axi_read32 [expr {$base + $::RECV_OFF_BASEPORT}]]
      puts "recv\[$n\]: useConn=$rd_conn basePort=$rd_port rxBytes=$rxBytes"
      if {$rd_conn != $useConn || $rd_port != $basePort} {
-          puts "  *** WRITE NOT CONFIRMED -- проверь ouch_base_user $n и битстрим"
+          puts "  *** WRITE NOT CONFIRMED -- check ouch_base_user $n and the bitstream"
           return 0
      }
      puts "  write confirmed"
@@ -1302,9 +1302,9 @@ proc recv_status {{n 1}} {
                $n $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}] \
                [expr {($ctrl >> 2) & 1}] [expr {($ctrl >> 7) & 1}]]
      if {($ctrl & 1) == 0} {
-          puts "  -> ap_start снят: ядро завершилось и не перезапустилось."
-          puts "     Для контрольного опыта это уже ответ: значит ap_ctrl_hs"
-          puts "     отрабатывает, но auto_restart не удержал ядро запущенным."
+          puts "  -> ap_start cleared: kernel finished and did not restart."
+          puts "     For the control experiment that is already an answer: ap_ctrl_hs"
+          puts "     works, but auto_restart did not keep the kernel running."
      }
      return $ctrl
 }
@@ -1318,11 +1318,11 @@ proc recv_bringup {ip_str mac_str {basePort 5001} {n 1}} {
      puts ""
      recv_start $basePort 1 1000000 $n
      puts ""
-     puts "Теперь с PC:  ncat [_de_dotted $ip_str] $basePort"
-     puts "  соединение установилось -> listen РАБОТАЕТ (штатная схема исправна)"
-     puts "  отказ в соединении      -> listen не открылся"
+     puts "Now from the PC:  ncat [_de_dotted $ip_str] $basePort"
+     puts "  connection established -> listen WORKS (standard scheme is fine)"
+     puts "  connection refused      -> listen did not open"
      puts ""
-     puts "Если ncat недоступен:  telnet [_de_dotted $ip_str] $basePort"
+     puts "If ncat is unavailable:  telnet [_de_dotted $ip_str] $basePort"
 }
 
 # =============================================================================
@@ -1513,7 +1513,7 @@ proc _ec_dump_vio {label} {
 proc de_collect {{pause_s 10} {n 1}} {
      puts ""
      puts "=============================================================="
-     puts " de_collect -- полный дамп dual_echo. СКОПИРУЙТЕ ВЫВОД ЦЕЛИКОМ."
+     puts " de_collect -- full dump of dual_echo. COPY THE WHOLE OUTPUT."
      puts "=============================================================="
      _ec_line META "kernel=dual_echo channel=$n pause_s=$pause_s"
      _ec_line META "base_user=0x[format %x [ouch_base_user $n]]"
@@ -1521,22 +1521,22 @@ proc de_collect {{pause_s 10} {n 1}} {
      set base [ouch_base_user $n]
 
      puts ""
-     puts "--- 1/5: регистры ядра, замер A ---"
+     puts "--- 1/5: kernel registers, snapshot A ---"
      _ec_line PHASE "A_user_regs"
      _de_dump_regs $n
 
      puts ""
-     puts "--- 2/5: регистры network_krnl (оба канала) ---"
+     puts "--- 2/5: network_krnl registers (both channels) ---"
      _ec_line PHASE "net_regs"
      _ec_dump_net_regs
 
      puts ""
-     puts "--- 3/5: VIO, замер A ---"
+     puts "--- 3/5: VIO, snapshot A ---"
      _ec_line PHASE "A_vio"
      _ec_dump_vio A
 
      puts ""
-     puts "--- 4/5: пауза $pause_s с (НИЧЕГО не делайте), затем замер B ---"
+     puts "--- 4/5: pause $pause_s s (DO NOTHING), then snapshot B ---"
      after [expr {$pause_s * 1000}]
      _ec_line PHASE "B_user_regs"
      _de_dump_regs $n
@@ -1544,15 +1544,15 @@ proc de_collect {{pause_s 10} {n 1}} {
      _ec_dump_vio B
 
      puts ""
-     puts "--- 5/5: ТЕПЕРЬ ПОДКЛЮЧИТЕСЬ К ОБОИМ ПОРТАМ ---"
+     puts "--- 5/5: NOW CONNECT TO BOTH PORTS ---"
      set pa [axi_read32 [expr {$base + $::DE_OFF_LISTEN_PORT_A}]]
      set pb [axi_read32 [expr {$base + $::DE_OFF_LISTEN_PORT_B}]]
      puts ""
-     puts "      ncat <ip канала 1> $pa"
-     puts "      ncat <ip канала 2> $pb"
+     puts "      ncat <ip of channel 1> $pa"
+     puts "      ncat <ip of channel 2> $pb"
      puts ""
-     puts "    Обе половины -- смысл проверки: нужно видеть, что работают ОБА QSFP."
-     puts -nonewline "    Enter когда готово: "
+     puts "    Both halves -- that is the point: BOTH QSFP must be seen working."
+     puts -nonewline "    Press Enter when done: "
      flush stdout
      gets stdin
 
@@ -1563,7 +1563,7 @@ proc de_collect {{pause_s 10} {n 1}} {
 
      puts ""
      puts "=============================================================="
-     puts " СБОР ЗАВЕРШЁН. Скопируйте ВСЁ выше (строки 'EC ...')."
+     puts " DUMP COMPLETE. Copy EVERYTHING above (the 'EC ...' lines)."
      puts "=============================================================="
      return 1
 }
@@ -1589,7 +1589,7 @@ proc _de_dump_regs {n} {
 proc epd_dump {{pause_s 10} {n 1}} {
      puts ""
      puts "=============================================================="
-     puts " epd_dump -- полный дамп. СКОПИРУЙТЕ ВЫВОД ЦЕЛИКОМ."
+     puts " epd_dump -- full dump. COPY THE WHOLE OUTPUT."
      puts "=============================================================="
      _ec_line META "kernel=probe channel=$n pause_s=$pause_s"
      if {[catch {clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"} ts]} {
@@ -1600,12 +1600,12 @@ proc epd_dump {{pause_s 10} {n 1}} {
 
      # ── 1. состояние ДО любых действий ─────────────────────────────────────
      puts ""
-     puts "--- 1/6: регистры ядра, замер A ---"
+     puts "--- 1/6: kernel registers, snapshot A ---"
      _ec_line PHASE "A_user_regs"
      _ec_dump_user_regs $n
 
      puts ""
-     puts "--- 2/6: регистры network_krnl (оба канала) ---"
+     puts "--- 2/6: network_krnl registers (both channels) ---"
      _ec_line PHASE "net_regs"
      _ec_dump_net_regs
 
@@ -1630,22 +1630,22 @@ proc epd_dump {{pause_s 10} {n 1}} {
           _ec_line LOOP [format "serverIp=0x%08x ch1_ip=0x%08x ch2_ip=0x%08x" \
                              $srv_ip $ip_ch1 $ip_ch2]
           if {$srv_ip == $ip_ch2} {
-               _ec_line LOOP "MATCH ch2 -- клиент a стучится в канал 2, верно для петли"
+               _ec_line LOOP "MATCH ch2 -- client a targets channel 2, correct for the loop"
           } elseif {$srv_ip == $ip_ch1} {
-               _ec_line LOOP "*** serverIp == IP СВОЕГО канала 1 -- клиент стучится САМ В СЕБЯ"
-               puts "  *** serverIp совпадает с IP канала 1, а не 2: клиент адресует"
-               puts "      свой же канал. В петле пакет уйдёт в кабель и вернётся"
-               puts "      не туда, куда ждут."
+               _ec_line LOOP "*** serverIp == IP of OWN channel 1 -- client targets ITSELF"
+               puts "  *** serverIp equals the IP of channel 1, not 2: the client addresses"
+               puts "      its own channel. In the loop the packet goes out and comes back"
+               puts "      to the wrong side."
           } else {
-               _ec_line LOOP "*** serverIp НЕ СОВПАЛ НИ С ОДНИМ каналом"
-               puts "  *** serverIp не равен ни IP канала 1, ни канала 2."
-               puts "      Клиент стучится по адресу, которого на плате нет --"
-               puts "      SYN уходит в пустоту. Это объясняет тишину целиком."
+               _ec_line LOOP "*** serverIp MATCHED NEITHER channel"
+               puts "  *** serverIp equals neither channel 1 nor channel 2 IP."
+               puts "      The client targets an address that does not exist on the board --"
+               puts "      SYN goes nowhere. That alone explains the silence."
           }
      }
 
      puts ""
-     puts "--- 3/6: VIO, замер A ---"
+     puts "--- 3/6: VIO, snapshot A ---"
      _ec_line PHASE "A_vio"
      _ec_dump_vio A
 
@@ -1654,7 +1654,7 @@ proc epd_dump {{pause_s 10} {n 1}} {
      # Это отделяет «регион идёт» от «регион встал». Без разницы значения
      # бесполезны: накопленные счётчики выглядят одинаково в обоих случаях.
      puts ""
-     puts "--- 4/6: пауза $pause_s с (НИЧЕГО не делайте), затем замер B ---"
+     puts "--- 4/6: pause $pause_s s (DO NOTHING), then snapshot B ---"
      after [expr {$pause_s * 1000}]
      _ec_line PHASE "B_user_regs"
      _ec_dump_user_regs $n
@@ -1677,10 +1677,10 @@ proc epd_dump {{pause_s 10} {n 1}} {
      # подключения извне просто ЖДЁМ: клиент повторяет попытки сам, и прирост
      # счётчиков за это время и есть измерение.
      puts ""
-     puts "--- 5/6: трафик в ПЕТЛЕ (хост не нужен) ---"
+     puts "--- 5/6: traffic in the LOOP (no host needed) ---"
      puts ""
-     puts "    probe соединяется САМ: половина a (клиент) -> кабель QSFP1-QSFP2"
-     puts "    -> половина b (сервер). Подключаться с хоста некуда и незачем."
+     puts "    probe connects BY ITSELF: half a (client) -> QSFP1-QSFP2 cable"
+     puts "    -> half b (server). There is nowhere and no need to connect from the host."
      puts ""
      set ip_hex [format %08x [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_SERVER_IP}]]]
      set lp [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_SERVER_PORT}]]
@@ -1688,11 +1688,11 @@ proc epd_dump {{pause_s 10} {n 1}} {
      set a2 [expr {("0x$ip_hex" >> 16) & 0xff}]
      set a3 [expr {("0x$ip_hex" >> 8) & 0xff}]
      set a4 [expr {"0x$ip_hex" & 0xff}]
-     puts "    цель клиента: $a1.$a2.$a3.$a4:$lp -- это IP ВТОРОГО канала платы."
-     puts "    Если он не совпадает с IP, заданным в echo_bringup_dual для канала 2,"
-     puts "    клиент стучится в пустоту, и это объясняет всё без прочих гипотез."
+     puts "    client target: $a1.$a2.$a3.$a4:$lp -- this is the SECOND channel IP."
+     puts "    If it differs from the IP given to channel 2 in echo_bringup_dual,"
+     puts "    the client targets nothing, which explains everything by itself."
      puts ""
-     puts "    Ждём 15 с, пока ядро повторяет попытки само..."
+     puts "    Waiting 15 s while the kernel retries on its own..."
      after 15000
 
      _ec_line PHASE "C_user_regs"
@@ -1702,7 +1702,7 @@ proc epd_dump {{pause_s 10} {n 1}} {
 
      # ── 4. триггер измерения: даже неудачный говорит, где встало ───────────
      puts ""
-     puts "--- 6/6: триггер замера (даже неудачный информативен) ---"
+     puts "--- 6/6: measurement trigger (informative even if it fails) ---"
      _ec_line PHASE "D_trigger"
      if {[catch {
           axi_write32 [expr {[ouch_base_user $n] + $::EPD_OFF_TRIGGER_GO}] 1
@@ -1719,8 +1719,8 @@ proc epd_dump {{pause_s 10} {n 1}} {
 
      puts ""
      puts "=============================================================="
-     puts " СБОР ЗАВЕРШЁН. Скопируйте ВСЁ выше (строки 'EC ...') и"
-     puts " приложите к обсуждению -- разбор идёт офлайн, плата свободна."
+     puts " DUMP COMPLETE. Copy EVERYTHING above (the 'EC ...' lines) and"
+     puts " attach it to the discussion -- analysis is offline, the board is free."
      puts "=============================================================="
      puts ""
 
@@ -1729,28 +1729,28 @@ proc epd_dump {{pause_s 10} {n 1}} {
      set base [ouch_base_user $n]
      set pst [axi_read32 [expr {$base + $::EPD_OFF_PORT_STATE}]]
      set ctl [axi_read32 [expr {$base + $::EPD_OFF_AP_CTRL}]]
-     puts "быстрая сводка (не диагноз):"
+     puts "quick summary (NOT a diagnosis):"
      puts [format "  ap_ctrl=0x%02x  ap_idle=%d   portState=%s" \
                $ctl [expr {($ctl >> 2) & 1}] [_epd_state $pst]]
      if {($ctl >> 2) & 1} {
-          puts "  ВНИМАНИЕ: ap_idle=1 -- ядро не запущено. Был ли epd_enable?"
+          puts "  WARNING: ap_idle=1 -- kernel not started. Was epd_enable called?"
      }
      return 1
 }
 
 proc why_no_syn_reply {{n 1}} {
-     puts "Замер 1 из 2. Клиента НЕ подключать."
+     puts "Snapshot 1 of 2. Do NOT connect the client yet."
      set before [_vio_counters $n]
      puts ""
-     puts "Теперь запустите на хосте:  ncat <ip> <port>   (или telnet)"
-     puts "и дайте ему 5-10 секунд поретрансмитить SYN."
-     puts -nonewline "Затем нажмите Enter: "
+     puts "Now run on the host:  ncat <ip> <port>   (or telnet)"
+     puts "and give it 5-10 seconds to retransmit SYN."
+     puts -nonewline "Then press Enter: "
      flush stdout
      gets stdin
      set after [_vio_counters $n]
 
      puts ""
-     puts "=== прирост за время попытки подключения ==="
+     puts "=== delta over the connection attempt ==="
      set d_rx   [expr {[dict get $after rx_pkts] - [dict get $before rx_pkts]}]
      set d_tcprx [expr {[dict get $after tcp_rx] - [dict get $before tcp_rx]}]
      set d_tcptx [expr {[dict get $after tcp_tx] - [dict get $before tcp_tx]}]
@@ -1759,22 +1759,22 @@ proc why_no_syn_reply {{n 1}} {
 
      if {$d_tcprx == 0} {
           if {$d_rx == 0} {
-               puts "  -> ДО ПЛАТЫ НЕ ДОХОДИТ НИЧЕГО. Физика: кабель в другом QSFP,"
-               puts "     нет линка, или CMAC этого канала сидит не на своём GT-кваде."
-               puts "     Проверить: report_placement и axis_stream_down_counter."
+               puts "  -> NOTHING REACHES THE BOARD. Physical: cable in the other QSFP,"
+               puts "     no link, or this channel CMAC sits on the wrong GT quad."
+               puts "     Check: report_placement and axis_stream_down_counter."
           } else {
-               puts "  -> кадры приходят, но до TCP не доезжают: отбрасывает IP-уровень."
-               puts "     Обычно неверный IP платы или маска на хосте."
+               puts "  -> frames arrive but never reach TCP: dropped at the IP layer."
+               puts "     Usually a wrong board IP or host netmask."
           }
      } elseif {$d_tcptx == 0} {
-          puts "  -> TOE ПРИНЯЛ SYN И НЕ ОТВЕТИЛ. Наиболее вероятная причина --"
-          puts "     таблица сессий в DDR: указатели axi00_ptr0/axi01_ptr0 указывают"
-          puts "     в память, которой там нет."
-          puts "     Сверьте offset из шага bd (=== адреса ПАМЯТИ ===) с значениями"
-          puts "     в network_set_buffers. Если offset не 0, сдвиньте оба."
+          puts "  -> TOE ACCEPTED SYN AND DID NOT REPLY. Most likely cause --"
+          puts "     session table in DDR: axi00_ptr0/axi01_ptr0 point at memory"
+          puts "     that is not there."
+          puts "     Compare the offset printed by the bd step with the values"
+          puts "     in network_set_buffers. If the offset is not 0, shift both."
      } else {
-          puts "  -> handshake идёт (tcp_tx растёт). Значит дело дальше:"
-          puts "     смотрите notifications в dual_echo_status / epd_status."
+          puts "  -> handshake is progressing (tcp_tx grows). So look further:"
+          puts "     check notifications in dual_echo_status / epd_status."
      }
      return [list $d_rx $d_tcprx $d_tcptx]
 }
@@ -2067,17 +2067,17 @@ proc dual_echo_status {{n 1}} {
 # поэтому «writes 10/10» НЕ доказывает, что импульс доходит до стадий на плате.
 # Эта процедура мерит на железе, где обход невозможен.
 proc dual_echo_alive {{pause_s 10} {n 1}} {
-     puts "замер 1:"
+     puts "snapshot 1:"
      set a [dual_echo_status $n]
      puts ""
-     puts "ждём $pause_s с..."
+     puts "waiting $pause_s s..."
      after [expr {$pause_s * 1000}]
      puts ""
-     puts "замер 2:"
+     puts "snapshot 2:"
      set b [dual_echo_status $n]
 
      puts ""
-     puts "=== прирост за $pause_s с ==="
+     puts "=== delta over $pause_s s ==="
      foreach {idx nm} {0 listenAttempts_a 2 notifications_a 3 listenAttempts_b 5 notifications_b} {
           set d [expr {[lindex $b $idx] - [lindex $a $idx]}]
           puts [format "  %-18s +%d" $nm $d]
@@ -2087,17 +2087,17 @@ proc dual_echo_alive {{pause_s 10} {n 1}} {
      set d_att_a [expr {[lindex $b 0] - [lindex $a 0]}]
      puts ""
      if {$st_a < 2 && $d_att_a == 0} {
-          puts "  -> РЕГИОН СТОИТ. Порт не открыт, а попыток больше не делается --"
-          puts "     стадия не перезапускается. Смотрите вложенный DATAFLOW:"
-          puts "     чем управляется dual_echo_core_U0_ap_start в сгенерированном"
-          puts "     hls_dual_echo_krnl.v -- импульсом ap_start или ap_sync_continue."
+          puts "  -> REGION IS STALLED. Port not open and no further attempts --"
+          puts "     the stage does not restart. Check the nested DATAFLOW:"
+          puts "     what drives dual_echo_core_U0_ap_start in the generated"
+          puts "     hls_dual_echo_krnl.v -- an ap_start pulse or ap_sync_continue."
      } elseif {$st_a == 2} {
-          puts "  -> порт открыт, счётчики по listen стоять и должны."
-          puts "     Живость отсюда НЕ видна. Дальше: why_no_syn_reply, и если"
-          puts "     tcp_rx растёт, а notifications нет -- дефект в rx_notify"
-          puts "     (там два early return, апстрим так не делает)."
+          puts "  -> port is open, the listen counters are expected to stand still."
+          puts "     Liveness is NOT visible here. Next: why_no_syn_reply, and if"
+          puts "     tcp_rx grows but notifications do not -- defect in rx_notify"
+          puts "     (two early returns there; upstream does not do that)."
      } else {
-          puts "  -> регион идёт (listenAttempts растёт), стек не подтверждает порт."
+          puts "  -> region runs (listenAttempts grows), the stack does not confirm the port."
      }
      return [list $a $b]
 }
