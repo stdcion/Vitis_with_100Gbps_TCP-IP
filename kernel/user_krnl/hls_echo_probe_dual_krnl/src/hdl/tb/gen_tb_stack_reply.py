@@ -38,6 +38,7 @@
 #   phase 2  отвечает open_status УСПЕХ   -- путь, которого не было НИКОГДА
 #   phase 3  отвечает open_status ОТКАЗ   -- ветка RETRY_WAIT, тоже не проверялась
 #   phase 4  TREADY=0 на open_connection  -- блокирующая запись под нагрузкой
+#   phase 4b ответ ПОСЛЕ таймаута        -- как реальный TOE (микросекунды)
 #   phase 5  port_status УСПЕХ серверу    -- воспроизводит portState=2 с платы
 #
 # ПРЕДСКАЗАНИЯ, записанные ДО прогона (иначе тест можно подогнать):
@@ -49,6 +50,11 @@
 #   phase 4: если стадия ВСТАЁТ на блокирующей записи -- ap_done стадии перестаёт
 #            тикать. Если она живёт -- ap_done тикает, а writes стоят. РАЗЛИЧИЕ
 #            МЕЖДУ ЭТИМИ ДВУМЯ И ЕСТЬ ГЛАВНЫЙ РЕЗУЛЬТАТ ТЕСТА.
+#   phase 4b: клиент должен ПОДХВАТИТЬ ответ, пришедший позже таймаута. Если
+#            writes продолжают расти -- слово потеряно, потому что шина читается
+#            только в WAIT_STATUS. Сравнение с iperf_client (РАБОТАЕТ на этом
+#            железе) показало: у него openStatus_handler -- ОТДЕЛЬНАЯ стадия,
+#            опустошающая шину каждый проход в свой FIFO, независимо от FSM.
 #   phase 5: portState должен стать 2 -- то же, что на плате. Если не станет,
 #            расхождение с железом здесь, и дальше искать в HLS, а не в стеке.
 #
@@ -517,6 +523,69 @@ add("    %s_TREADY = 1'b1;" % OPEN_BUS)
 add("")
 
 # ── phase 5: port_status серверу ────────────────────────────────────────────
+add("    // ── phase 4b: ОТВЕТ С ЗАДЕРЖКОЙ -- ГЛАВНОЕ ОТЛИЧИЕ ОТ ПЛАТЫ ─────────────")
+add("    //")
+add("    // ВСЕ прежние фазы отвечали МГНОВЕННО, и это скрывало целый класс")
+add("    // дефектов. На плате TOE отвечает через микросекунды, за которые автомат")
+add("    // успевает уйти из WAIT_STATUS -- в RETRY_WAIT по таймауту или в DONE.")
+add("    //")
+add("    // ПОЧЕМУ ЭТО ПОДОЗРИТЕЛЬНО ИМЕННО ЗДЕСЬ. Сравнение с iperf_client, который")
+add("    // РАБОТАЕТ на этом железе, показало структурное различие:")
+add("    //")
+add("    //   iperf: openStatus_handler -- ОТДЕЛЬНАЯ стадия, опустошает шину КАЖДЫЙ")
+add("    //          проход в свой FIFO; FSM читает из FIFO, шину не трогает")
+add("    //   probe: epd_client_connect читает шину САМ и ТОЛЬКО в WAIT_STATUS")
+add("    //")
+add("    // Если слово придёт, когда автомат не в WAIT_STATUS, у iperf оно всё равно")
+add("    // будет прочитано, а у нас останется в шине.")
+add("    //")
+add("    // ПРЕДСКАЗАНИЕ: клиент должен ПОДХВАТИТЬ ответ, пришедший позже таймаута --")
+add("    // либо в этом проходе, либо на следующей попытке. Если writes встанут")
+add("    // навсегда, а слово останется непрочитанным -- дефект найден.")
+add("    $display(\"\");")
+add("    $display(\"-- phase 4b: otvet POSLE tajmauta (kak real'nyj TOE) --\");")
+add("    ap_rst = 1'b1;")
+add("    repeat (20) @(posedge ap_clk);")
+add("    ap_rst = 1'b0;")
+add("    repeat (100) @(posedge ap_clk);")
+add("    begin : delayed_reply")
+add("        int unsigned w_before, d_before, w_after;")
+add("        // Ждём, пока автомат ГАРАНТИРОВАННО уйдёт из WAIT_STATUS: таймаут")
+add("        // RETRY_DELAY проходов, проход ~2.33 такта -> с запасом x1.5.")
+add("        int unsigned settle = (RETRY_DELAY > 0) ? RETRY_DELAY * 4 : 400000;")
+add("        repeat (settle) @(posedge ap_clk);")
+add("        w_before = open_writes; d_before = client_done;")
+add("        $display(\"    posle %0d taktov ozhidanija: open_writes=%0d\",")
+add("                 settle, open_writes);")
+add("")
+add("        // ТЕПЕРЬ отвечаем -- заведомо не в тот момент, когда автомат ждал.")
+add("        reply_open_status(1'b1, 9);")
+add("        repeat (200000) @(posedge ap_clk);")
+add("        w_after = open_writes;")
+add("        $display(\"    posle pozdnego otveta: open_writes += %0d, ap_done += %0d\",")
+add("                 w_after - w_before, client_done - d_before);")
+add("")
+add("        // Слово принято? TREADY поднимался -- это видно по тому, что")
+add("        // reply_open_status не напечатал предупреждение о непринятом слове.")
+add("        check(\"stadija zhiva posle pozdnego otveta\",")
+add("              (client_done - d_before) > 1000,")
+add("              $sformatf(\"ap_done += %0d\", client_done - d_before));")
+add("")
+add("        // ГЛАВНОЕ: если ответ ПОДХВАЧЕН, клиент уходит в DONE и перестаёт")
+add("        // писать. Если ответ ПОТЕРЯН, он продолжает повторять по таймауту.")
+add("        // Оба исхода допустимы логически -- важно РАЗЛИЧИТЬ их и напечатать.")
+add("        if ((w_after - w_before) == 0) begin")
+add("            $display(\"    RAZBOR: zapisi ostanovilis -> otvet PODHVACHEN\");")
+add("            $display(\"            Pozdnij otvet obrabotan verno, defekt ne zdes.\");")
+add("        end else begin")
+add("            $display(\"    RAZBOR: zapisi PRODOLZHAJUTSJA (+%0d) -> otvet POTERJAN.\",")
+add("                     w_after - w_before);")
+add("            $display(\"            Slovo prishlo vne WAIT_STATUS i nikto ego ne vzjal.\");")
+add("            $display(\"            Lechenie -- otdelnaja stadija-handler, kak u iperf:\");")
+add("            $display(\"            opustoshaet shinu kazhdyj prohod v svoj FIFO.\");")
+add("        end")
+add("    end")
+add("")
 add("    // ── phase 5: port_status УСПЕХ -- воспроизводим portState=2 s platy. ───")
 add("    //")
 add("    // СНИМОК СЧЁТЧИКА -- ДО СНЯТИЯ СБРОСА, А НЕ ПОСЛЕ.")
@@ -581,7 +650,7 @@ add("    $finish;")
 add("end")
 add("")
 add("initial begin")
-add("    repeat (12000000) @(posedge ap_clk);")
+add("    repeat (16000000) @(posedge ap_clk);")   // +фаза 4b: 400k+200k
 add("    $display(\"*** TIMEOUT\");")
 add("    $fatal(1);")
 add("end")
