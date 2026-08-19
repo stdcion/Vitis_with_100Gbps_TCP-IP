@@ -1701,6 +1701,62 @@ proc epd_dump {{pause_s 10} {n 1}} {
      _ec_dump_vio C
 
      # ── 4. триггер измерения: даже неудачный говорит, где встало ───────────
+     # ── ap_ctrl ПОДРОБНО: ЧАСТОТА ФИНИШЕЙ ВМЕСТО ILA ───────────────────────
+     #
+     # ILA НЕДОСТУПЕН: отладка идёт удалённо, через конференцию, 10 минут, и
+     # интерактивный Hardware Manager с волнами исключён. Значит на вопрос
+     # "работает ли регион" надо отвечать РЕГИСТРАМИ.
+     #
+     # И это возможно, потому что ap_done -- ЛИПКИЙ БИТ С ОЧИСТКОЙ ПО ЧТЕНИЮ:
+     #     if (ap_done) int_ap_done <= 1'b1;
+     #     else if (ar_hs && raddr == ADDR_AP_CTRL) int_ap_done <= 1'b0;
+     # (probe_control_s_axi.v:515-521)
+     #
+     # Значит ap_done=1 означает "регион финишировал ХОТЯ БЫ РАЗ с прошлого
+     # чтения", а НЕ "залип в done". Это ПРИЗНАК ЖИЗНИ, и 0x83 в логе 18.08
+     # читался неверно -- он говорил, что регион работает.
+     #
+     # ОТСЮДА ИЗМЕРЕНИЕ: читаем ap_ctrl подряд несколько раз. Каждое чтение
+     # сбрасывает бит, поэтому единица в СЛЕДУЮЩЕМ чтении означает новый финиш
+     # между двумя чтениями. Доля единиц -- частота финишей в единицах "за время
+     # одной JTAG-транзакции" (~10 мс).
+     #
+     #   почти все чтения дают ap_done=1  -> регион финиширует часто, живой
+     #   первое 1, дальше 0               -> финишировал один раз и встал
+     #   все 0                            -> не финиширует вовсе
+     #
+     # ap_ready (бит 3) читается тем же словом и показывает, готов ли регион
+     # принять новый старт.
+     puts ""
+     puts "--- 5b/6: ap_ctrl bit detail (replaces ILA) ---"
+     _ec_line PHASE "C_apctrl_series"
+     set n_done 0
+     set n_ready 0
+     set n_reads 20
+     for {set k 0} {$k < $n_reads} {incr k} {
+          set c [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_AP_CTRL}]]
+          _ec_line APCTRL [format "read%-3d 0x%02x start=%d done=%d idle=%d ready=%d restart=%d" \
+                               $k $c [expr {$c & 1}] [expr {($c >> 1) & 1}] \
+                               [expr {($c >> 2) & 1}] [expr {($c >> 3) & 1}] \
+                               [expr {($c >> 7) & 1}]]
+          if {($c >> 1) & 1} { incr n_done }
+          if {($c >> 3) & 1} { incr n_ready }
+     }
+     _ec_line APCTRL "summary done=$n_done/$n_reads ready=$n_ready/$n_reads"
+     puts "    ap_done set in $n_done of $n_reads reads, ap_ready in $n_ready"
+     if {$n_done >= [expr {$n_reads - 2}]} {
+          puts "    -> region FINISHES CONSTANTLY: it is running, not stuck."
+          puts "       ap_done is a sticky bit cleared on read, so this is the"
+          puts "       signature of a live region, NOT of a hang."
+     } elseif {$n_done <= 1} {
+          puts "    -> region does NOT finish: after the first read the bit never"
+          puts "       comes back. THIS is the real 'stuck' signature."
+     } else {
+          puts "    -> region finishes occasionally ($n_done of $n_reads)."
+          puts "       Compare with the counters: if they do not grow while"
+          puts "       ap_done does, the stages run but produce nothing."
+     }
+
      puts ""
      puts "--- 6/6: measurement trigger (informative even if it fails) ---"
      _ec_line PHASE "D_trigger"
