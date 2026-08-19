@@ -36,12 +36,20 @@
 #ifndef TOE_CSIM_SHIM_HPP
 #define TOE_CSIM_SHIM_HPP
 
+#include <utility>   // std::forward
 #include "toe.hpp"
 
+// Args&&... -- forwarding reference, НЕ Args&. Причина: 29-й аргумент вызова --
+// литерал 0x01010101 (myIpAddress, toe_tb.cpp:825), то есть rvalue, а под Args&
+// он не подставляется:
+//     "not viable: expects an lvalue for 29th argument"
+// Forwarding reference принимает и lvalue (потоки), и rvalue (литерал), а
+// std::forward передаёт каждый аргумент с исходной категорией -- потоки остаются
+// ссылками, литерал уходит по значению в ap_uint<32>.
 template <typename... Args>
-void toe(Args&... args)
+void toe(Args&&... args)
 {
-     toe_core<DATA_WIDTH>(args...);
+     toe_core<DATA_WIDTH>(std::forward<Args>(args)...);
 }
 
 #endif
