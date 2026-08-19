@@ -49,6 +49,17 @@
 # несовпадению адреса (ip_handler.cpp:155). "RX_SYN" без последующего
 # "TX_SYN_ACK" -- сессия не создалась. Оба случая объясняют 0.0.0.0.
 
+# ── АБСОЛЮТНЫЙ ПУТЬ К ШИМУ ──────────────────────────────────────────────────
+# Относительный путь в -include НЕ РАБОТАЕТ: clang запускается из
+# <project>/<solution>/csim/build, а не из каталога, где лежит скрипт. Ровно та
+# же ловушка, что с путями к тестовым векторам (там ../../../../), но там она
+# была видна из штатного скрипта, а здесь я её повторил.
+#
+# [info script] даёт путь к этому .tcl, куда бы его ни положили -- надёжнее,
+# чем считать уровни вложенности руками.
+set SHIM [file normalize [file join [file dirname [info script]] toe_csim_shim.hpp]]
+puts "shim: $SHIM"
+
 open_project toe_csim_prj
 
 # ── ПОЧЕМУ toe_core, А НЕ toe ────────────────────────────────────────────────
@@ -94,8 +105,8 @@ foreach f {../axi_utils.cpp
 # переброс в toe_core<DATA_WIDTH>. Подробности и две провалившиеся попытки
 # (-Dtoe=..., отдельный .cpp) -- в шапке scripts/hls/toe_csim_shim.hpp.
 # -include вставляет шим перед первой строкой toe_tb.cpp, апстримный файл не
-# тронут. Путь -- от каталога запуска (fpga-network-stack/hls/toe).
-add_files -tb toe_tb.cpp -cflags "$OUR_FLAGS -include ../../../scripts/hls/toe_csim_shim.hpp"
+# тронут. Путь АБСОЛЮТНЫЙ (см. set SHIM выше).
+add_files -tb toe_tb.cpp -cflags "$OUR_FLAGS -include $SHIM"
 
 open_solution "sol_csim"
 # Часть и клок для csim не важны (RTL не генерируется), но нужны для solution.
