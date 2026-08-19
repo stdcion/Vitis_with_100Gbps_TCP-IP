@@ -113,6 +113,14 @@ def width(w):
     return int(mm.group(1)) - int(mm.group(2)) + 1 if mm else 1
 
 
+# ── ВХОДЫ БЛОЧНОГО ПРОТОКОЛА: ЗАДАЮТСЯ ЯВНО, А НЕ ПО ОСТАТОЧНОМУ ПРИНЦИПУ ───
+# Значения -- те, что подаёт настоящий верхний модуль. ap_continue=1 критичен:
+# ноль на нём запирает регион (см. пояснение в генерации сигналов ниже).
+BLOCK_PROTO_IN = {
+    "ap_continue": "1'b1",
+    "ap_ce":       "1'b1",
+}
+
 core_v = find_core_v(sys.argv[1] if len(sys.argv) > 1 else None)
 src = core_v.read_text()
 
@@ -129,6 +137,19 @@ for mm in re.finditer(r"^(input|output)\s*(\[[^\]]+\])?\s*(\w+)\s*;", src, re.M)
 missing = [n for n in names if n not in decl]
 if missing:
     sys.exit("*** нет объявлений для портов: %s" % missing)
+
+# Любой вход вида ap_* обязан быть либо в таблице, либо известным (clk/rst/start).
+# Иначе он получит 0 по остаточному принципу -- ровно та ошибка, что дала
+# ложный FAIL в первой версии этого теста.
+KNOWN_AP_IN = {"ap_clk", "ap_rst", "ap_rst_n", "ap_start"} | set(BLOCK_PROTO_IN)
+unknown_ap = [n for n in names
+              if n.startswith("ap_") and decl[n][0] == "input"
+              and n not in KNOWN_AP_IN]
+if unknown_ap:
+    sys.exit("*** входы блочного протокола не описаны: %s\n"
+             "    Добавьте их в BLOCK_PROTO_IN с ПРАВИЛЬНЫМ значением: по остаточному\n"
+             "    принципу они получат 0, а нуль на ap_continue запирает регион."
+             % ", ".join(unknown_ap))
 
 # Инстансы стадий -- нужны для иерархического чтения ap_done: без него нельзя
 # отличить «стадия встала на блокирующей записи» от «стадия жива, шина закрыта».
@@ -264,6 +285,18 @@ for n in names:
     if d == "input":
         if n in SCAL_IN:
             init = " = %s" % SCAL_IN[n]
+        elif n in BLOCK_PROTO_IN:
+            # ── ПОЧЕМУ ЭТО ОТДЕЛЬНОЙ ВЕТКОЙ ────────────────────────────────
+            # ap_continue попал бы в общий else и получил 0 -- а нуль на нём
+            # ДЕРЖИТ ap_done_reg каждой стадии поднятым, то есть намертво
+            # запирает регион. Первая версия теста так и сделала: ap_done
+            # «тикал» 1000000 раз за 1M тактов (то есть стоял в единице), шина
+            # молчала во ВСЕХ фазах, включая базис, и тест обвинил ядро в том,
+            # чего оно не делает -- при том что tb_top_start на том же RTL
+            # давал writes += 2.
+            # В настоящем дизайне верхний модуль подаёт 1'b1 (проверено:
+            # hls_echo_probe_dual_krnl.v:823 assign ..._ap_continue = 1'b1).
+            init = " = %s" % BLOCK_PROTO_IN[n]
         elif n.endswith("TVALID"):
             init = " = 1'b0"
         elif n.endswith("TREADY"):
