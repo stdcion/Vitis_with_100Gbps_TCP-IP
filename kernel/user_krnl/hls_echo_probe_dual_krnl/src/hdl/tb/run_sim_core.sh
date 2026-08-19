@@ -56,7 +56,8 @@ WHICH="${1:-all}"
 
 # Сгенерированный RTL: тестбенч симулирует то железо, которое уходит в битстрим.
 SYN_DIR=""
-if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ] || [ "$WHICH" = "top" ]; then
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "core" ] || [ "$WHICH" = "top" ] \
+     || [ "$WHICH" = "stack" ]; then
      # Путь задаётся export_hls_ip.tcl: проект <ядро>_ip_proj, решение sol1.
      # Глоб по решению -- чтобы не ломаться при смене его имени.
      SYN_DIRS=( $(ls -d "$KRNL_DIR/src/hls/${KRNL}_ip_proj"/*/syn/verilog 2>/dev/null) )
@@ -199,6 +200,22 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "top" ]; then
      fi
 fi
 
+# tb_stack_reply -- СТЕК ОТВЕЧАЕТ. Закрывает дыру всех прежних тестбенчей: ни один
+# из пяти не поднимал TVALID на входах от стека, то есть всё измеренное описывало
+# поведение при МОЛЧАЩЕМ стеке. На плате стек отвечает -- portState=2 получен из
+# настоящего port_status.
+if [ "$WHICH" = "all" ] || [ "$WHICH" = "stack" ]; then
+     ST_TB="$TB_DIR/tb_stack_reply.sv"
+     if [ ! -f "$ST_TB" ]; then
+          echo ""
+          echo "*** нет $ST_TB -- сначала сгенерируйте:"
+          echo "      cd $TB_DIR && python3 gen_tb_stack_reply.py > tb_stack_reply.sv"
+          fails=$((fails+1))
+     else
+          run_one tb_stack_reply "${SRCS_V[*]} $ST_TB"
+     fi
+fi
+
 
 echo ""
 echo "============================================================"
@@ -215,6 +232,7 @@ if [ "$ran" -eq 0 ]; then
      echo "  Аргумент '$WHICH' не совпал ни с одним режимом. Допустимые:"
      echo "      core     весь epd_core: кто из стадий не выдаёт ap_done"
      echo "      top      ВЕРХНИЙ модуль: доходит ли ap_start до epd_core"
+     echo "      stack    СТЕК ОТВЕЧАЕТ: open_status, port_status, TREADY=0"
      echo "      all      всё перечисленное (значение по умолчанию)"
      echo "============================================================"
      exit 1
