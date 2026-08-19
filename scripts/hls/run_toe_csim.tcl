@@ -58,7 +58,17 @@
 # [info script] даёт путь к этому .tcl, куда бы его ни положили -- надёжнее,
 # чем считать уровни вложенности руками.
 set SHIM [file normalize [file join [file dirname [info script]] toe_csim_shim.hpp]]
-puts "shim: $SHIM"
+
+# Каталог с toe.hpp -- для -I, чтобы шим нашёл заголовок. Считаем от корня
+# репозитория (два уровня вверх от scripts/hls), а не от текущего каталога:
+# скрипт запускают из fpga-network-stack/hls/toe, но полагаться на это не надо.
+set REPO [file normalize [file join [file dirname [info script]] .. ..]]
+set TOE_DIR [file join $REPO fpga-network-stack hls toe]
+puts "shim:    $SHIM"
+puts "toe dir: $TOE_DIR"
+if {![file exists [file join $TOE_DIR toe.hpp]]} {
+     error "не найден toe.hpp в $TOE_DIR -- проверьте структуру дерева"
+}
 
 open_project toe_csim_prj
 
@@ -106,7 +116,7 @@ foreach f {../axi_utils.cpp
 # (-Dtoe=..., отдельный .cpp) -- в шапке scripts/hls/toe_csim_shim.hpp.
 # -include вставляет шим перед первой строкой toe_tb.cpp, апстримный файл не
 # тронут. Путь АБСОЛЮТНЫЙ (см. set SHIM выше).
-add_files -tb toe_tb.cpp -cflags "$OUR_FLAGS -include $SHIM"
+add_files -tb toe_tb.cpp -cflags "$OUR_FLAGS -I$TOE_DIR -include $SHIM"
 
 open_solution "sol_csim"
 # Часть и клок для csim не важны (RTL не генерируется), но нужны для solution.
