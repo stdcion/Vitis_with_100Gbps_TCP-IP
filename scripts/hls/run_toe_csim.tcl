@@ -66,14 +66,7 @@ set_top toe_core
 # CMakeLists.txt, иначе csim и железо разойдутся.
 set OUR_FLAGS "-DFNS_DATA_WIDTH=64 -DTCP_NODELAY=1 -DTCP_MSS=4096 \
 -DTCP_STACK_MAX_SESSIONS=1000 -DRX_DDR_BYPASS=1 -DFAST_RETRANSMIT=1 \
--DWINDOW_SCALE=1 -DFNS_ROCE_STACK_MAX_QPS=500 -Wno-unknown-pragmas \
--Dtoe=toe_core<DATA_WIDTH>"
-
-# -Dtoe=toe_core<DATA_WIDTH> -- ПОДМЕНА ИМЕНИ ПРЕПРОЦЕССОРОМ, чтобы не править
-# апстримный toe_tb.cpp. Вызов toe(...) на строке 820 становится
-# toe_core<DATA_WIDTH>(...), то есть тем, что объявлено в заголовке.
-# Явный <DATA_WIDTH> нужен: toe_core -- шаблон, а из аргументов WIDTH не
-# выводится однозначно (часть параметров не зависит от WIDTH).
+-DWINDOW_SCALE=1 -DFNS_ROCE_STACK_MAX_QPS=500 -Wno-unknown-pragmas"
 
 foreach f {../axi_utils.cpp
            ack_delay/ack_delay.cpp
@@ -96,7 +89,13 @@ foreach f {../axi_utils.cpp
            toe.cpp} {
      add_files $f -cflags $OUR_FLAGS
 }
-add_files -tb toe_tb.cpp -cflags $OUR_FLAGS
+# ── ШИМ ВМЕСТО ПРАВКИ АПСТРИМНОГО ТЕСТБЕНЧА ─────────────────────────────────
+# toe_tb.cpp зовёт toe(), которой нет в заголовке. Шим даёт ей определение --
+# переброс в toe_core<DATA_WIDTH>. Подробности и две провалившиеся попытки
+# (-Dtoe=..., отдельный .cpp) -- в шапке scripts/hls/toe_csim_shim.hpp.
+# -include вставляет шим перед первой строкой toe_tb.cpp, апстримный файл не
+# тронут. Путь -- от каталога запуска (fpga-network-stack/hls/toe).
+add_files -tb toe_tb.cpp -cflags "$OUR_FLAGS -include ../../../scripts/hls/toe_csim_shim.hpp"
 
 open_solution "sol_csim"
 # Часть и клок для csim не важны (RTL не генерируется), но нужны для solution.
