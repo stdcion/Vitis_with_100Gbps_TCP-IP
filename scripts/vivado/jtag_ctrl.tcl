@@ -1601,6 +1601,41 @@ proc epd_collect {{pause_s 10} {n 1}} {
      _ec_line PHASE "net_regs"
      _ec_dump_net_regs
 
+     # ── СВЕРКА АДРЕСОВ ПЕТЛИ: САМАЯ ДЕШЁВАЯ ИЗ ВОЗМОЖНЫХ ПРИЧИН ────────────
+     #
+     # В петле клиент половины a стучится по serverIp, и это должен быть IP,
+     # который network_krnl КАНАЛА 2 защёлкнул при bringup. Если они разошлись --
+     # SYN уходит в пустоту, и наблюдаемое (connAttempts не растёт после первой
+     # попытки, тишина, никакого RST) объясняется этим целиком, без всяких гипотез
+     # про барьеры и DATAFLOW.
+     #
+     # Проверить это стоит ноль, а не проверяли ни разу: в логе 18.08
+     # epd_configure получил 0a01d499, и канал 2 при bringup получил 0a01d499 --
+     # совпало. Но сверка была ГЛАЗАМИ по двум разным строкам лога, а такое
+     # сравнение и пропускает опечатки. Теперь считает машина.
+     _ec_line PHASE "loop_addr_check"
+     if {![catch {
+          set srv_ip [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_SERVER_IP}]]
+          set ip_ch2 [axi_read32 [expr {[ouch_base_network 2] + $::NET_OFF_IP_ADDR}]]
+          set ip_ch1 [axi_read32 [expr {[ouch_base_network 1] + $::NET_OFF_IP_ADDR}]]
+     }] } {
+          _ec_line LOOP [format "serverIp=0x%08x ch1_ip=0x%08x ch2_ip=0x%08x" \
+                             $srv_ip $ip_ch1 $ip_ch2]
+          if {$srv_ip == $ip_ch2} {
+               _ec_line LOOP "MATCH ch2 -- клиент a стучится в канал 2, верно для петли"
+          } elseif {$srv_ip == $ip_ch1} {
+               _ec_line LOOP "*** serverIp == IP СВОЕГО канала 1 -- клиент стучится САМ В СЕБЯ"
+               puts "  *** serverIp совпадает с IP канала 1, а не 2: клиент адресует"
+               puts "      свой же канал. В петле пакет уйдёт в кабель и вернётся"
+               puts "      не туда, куда ждут."
+          } else {
+               _ec_line LOOP "*** serverIp НЕ СОВПАЛ НИ С ОДНИМ каналом"
+               puts "  *** serverIp не равен ни IP канала 1, ни канала 2."
+               puts "      Клиент стучится по адресу, которого на плате нет --"
+               puts "      SYN уходит в пустоту. Это объясняет тишину целиком."
+          }
+     }
+
      puts ""
      puts "--- 3/6: VIO, замер A ---"
      _ec_line PHASE "A_vio"
@@ -1619,21 +1654,38 @@ proc epd_collect {{pause_s 10} {n 1}} {
      _ec_dump_vio B
 
      # ── 3. попытка подключения: единственный шаг с участием человека ───────
+     # ── 3. ТРАФИК: У probe ЕГО ДЕЛАЕТ САМА ПЛАТА, А НЕ ХОСТ ────────────────
+     #
+     # ВАЖНОЕ ОТЛИЧИЕ ОТ dual_echo. probe работает В ПЕТЛЕ: клиент (половина a) и
+     # сервер (половина b) -- две половины ОДНОГО ядра, соединённые кабелем между
+     # QSFP1 и QSFP2. Хост в тракте не участвует, поэтому:
+     #
+     #   * ncat с хоста подключиться НЕ МОЖЕТ -- ему некуда;
+     #   * Wireshark на хосте НИЧЕГО НЕ УВИДИТ -- трафик не проходит через него;
+     #   * соединение инициирует ядро само, повторяя open_connection по таймауту.
+     #
+     # Первая версия этой процедуры требовала ncat -- это была ошибка, перенесённая
+     # из dual_echo, где оба QSFP действительно смотрят в хост. Здесь вместо
+     # подключения извне просто ЖДЁМ: клиент повторяет попытки сам, и прирост
+     # счётчиков за это время и есть измерение.
      puts ""
-     puts "--- 5/6: ТЕПЕРЬ ЗАПУСТИТЕ НА ХОСТЕ ПОДКЛЮЧЕНИЕ ---"
+     puts "--- 5/6: трафик в ПЕТЛЕ (хост не нужен) ---"
+     puts ""
+     puts "    probe соединяется САМ: половина a (клиент) -> кабель QSFP1-QSFP2"
+     puts "    -> половина b (сервер). Подключаться с хоста некуда и незачем."
      puts ""
      set ip_hex [format %08x [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_SERVER_IP}]]]
-     set lp [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_LISTEN_PORT}]]
+     set lp [axi_read32 [expr {[ouch_base_user $n] + $::EPD_OFF_SERVER_PORT}]]
      set a1 [expr {("0x$ip_hex" >> 24) & 0xff}]
      set a2 [expr {("0x$ip_hex" >> 16) & 0xff}]
      set a3 [expr {("0x$ip_hex" >> 8) & 0xff}]
      set a4 [expr {"0x$ip_hex" & 0xff}]
-     puts "      ncat $a1.$a2.$a3.$a4 $lp        (порт из LISTEN_PORT ядра)"
+     puts "    цель клиента: $a1.$a2.$a3.$a4:$lp -- это IP ВТОРОГО канала платы."
+     puts "    Если он не совпадает с IP, заданным в echo_bringup_dual для канала 2,"
+     puts "    клиент стучится в пустоту, и это объясняет всё без прочих гипотез."
      puts ""
-     puts "    Дайте ему 5-10 секунд поретрансмитить SYN, потом Enter."
-     puts -nonewline "    Enter когда готово: "
-     flush stdout
-     gets stdin
+     puts "    Ждём 15 с, пока ядро повторяет попытки само..."
+     after 15000
 
      _ec_line PHASE "C_user_regs"
      _ec_dump_user_regs $n
