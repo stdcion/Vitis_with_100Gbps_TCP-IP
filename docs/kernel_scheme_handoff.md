@@ -7,6 +7,18 @@
 [latency_session_handoff.md](latency_session_handoff.md), он верен во всём, что
 касается врезок и методики.
 
+> **ЧАСТИЧНО УСТАРЕЛО (20.08).** Захват Wireshark сравнил ДВА ЯДРА на одной
+> плате и локализовал дефект точнее всего, что здесь есть: `recv` даёт SYN-ACK
+> за 69 мкс на 7001 и RST за 64-66 мкс на закрытых портах, `dual_echo` на том же
+> 7001 — ТИШИНУ. Тишина вместо RST означает, что порт зарегистрирован, а SYN
+> роняется в `rx_engine` при промахе lookup (`:914`, авторский TODO на `:926`).
+>
+> Опровергнуты и не подлежат перепроверке: `0.0.0.0`, DDR (таблица сессий —
+> BRAM), `myIpAddress` у ARP, барьер `ap_sync_done`, доставка `ap_start`,
+> `static` при `auto_restart`, гонка инициализации.
+>
+> Текущий опыт — [recv_dual_control_experiment.md](recv_dual_control_experiment.md).
+
 ## Причина
 
 `ap_continue` стадии в dataflow-регионе — это `ap_sync_done`, логическое **И по
