@@ -1325,6 +1325,104 @@ proc recv_bringup {ip_str mac_str {basePort 5001} {n 1}} {
      puts "If ncat is unavailable:  telnet [_de_dotted $ip_str] $basePort"
 }
 
+# -----------------------------------------------------------------------------
+# hls_recv_dual_krnl -- the control experiment that splits SCHEME from LOGIC
+# -----------------------------------------------------------------------------
+#
+# The kernel is upstream recv (listenPorts + recvData, proven on this board:
+# Wireshark 20.08 gave SYN-ACK in 69 us on 7001 and a complete connection) with
+# a SECOND set of 16 AXI-Stream ports bolted on, every one of them tied off.
+# Channel b has no logic at all -- it does not listen, receive, or answer.
+#
+# So a failure here cannot be blamed on stage shape: the only thing that changed
+# versus the working kernel is the SCHEME (one HLS instance wired to two
+# network_krnl, two CMACs, the extra congestion in the SLR).
+#
+#   handshake on the port -> SCHEME IS FINE, the defect is dual_echo's logic
+#   silence               -> the scheme itself breaks it, stage shape is innocent
+#
+# TWO network_krnl, ONE user kernel -- do not conflate them:
+#
+#   network_krnl_1, network_krnl_2   TWO instances, one TCP stack per QSFP.
+#                                    Each needs its own IP/MAC and its own
+#                                    network_start -> echo_bringup is called
+#                                    once per channel, n=1 and n=2.
+#   hls_recv_dual_krnl_1             ONE instance, wired to BOTH stacks.
+#                                    Started once, at ouch_base_user 1.
+#
+# build_bd.tcl:358-360 loops NUM_QSFP times creating network_krnl_$n; :369
+# creates a SINGLE ${USER_KRNL}_1, and :373 wires both stacks to it from the
+# _dual config (ports without suffix -> network_krnl_1, _b -> network_krnl_2).
+#
+# Consequence for the host: recv_start is issued ONCE. There is no second user
+# kernel at ouch_base_user 2 -- that address decodes to nothing and reads back
+# as DECERR. The per-channel calls are the network ones.
+
+# Phase 1: channel a only. Channel b exists in the BD but is left dark --
+# no IP, no MAC, network_krnl_2 not started, no cable in QSFP1. This isolates
+# "does the extra hardware alone break it" with the least board time spent.
+proc recv_dual_phase1 {{ip_str c0a80a0a} {mac_str 02aa00000001} {basePort 7001}} {
+     puts "=== phase 1: channel a live, channel b dark ==="
+     recv_bringup $ip_str $mac_str $basePort 1
+}
+
+# Phase 2: channel b is brought UP -- cable, IP/MAC, network_krnl_2 started --
+# but still nobody listens on it (the kernel side stays tied off).
+#
+# WHAT PHASE 2 ADDS OVER PHASE 1. Phase 1 leaves network_krnl_2 in reset, so
+# its CMAC never brings the link up and the second GT quad stays quiet. Phase 2
+# makes the second stack actually run: two CMACs clocking, two stacks issuing
+# ARP, both sharing the DDR and the SLR crossings. If channel a survives that,
+# the "one instance on two QSFP" scheme is clean under real load.
+#
+# The kernel is NOT restarted here -- it is already running from phase 1, and
+# there is only one of it. Only the second network stack is added.
+#
+# ip_str_b / mac_str_b must differ from channel a in the bytes the VIO shows:
+# mac_addr is 48 bits but the probes are 32, so the top bytes are invisible
+# (network_stack.sv:1048-1064). 02aa..01 vs 02bb..02 differ in visible bits.
+proc recv_dual_phase2 {{ip_str_a c0a80a0a} {mac_str_a 02aa00000001} \
+                       {ip_str_b c0a80a14} {mac_str_b 02bb00000002} \
+                       {basePort 7001}} {
+     puts "=== phase 2: both stacks up, only channel a listens ==="
+     puts ""
+     recv_bringup $ip_str_a $mac_str_a $basePort 1
+     puts ""
+     puts "--- channel b: stack up, kernel side stays tied off ---"
+     echo_bringup $ip_str_b $mac_str_b 2
+     puts ""
+     puts "The kernel was NOT restarted: dual mode has ONE instance and it is"
+     puts "already running from the call above."
+     puts ""
+     puts "Expected on channel a:  ncat [_de_dotted $ip_str_a] $basePort connects"
+     puts "Expected on channel b:  nothing listens -> RST, which is CORRECT."
+     puts "  ncat [_de_dotted $ip_str_b] $basePort  should be REFUSED, not silent."
+     puts ""
+     puts "  a connects, b refuses -> scheme is clean, go to step 3"
+     puts "  a goes SILENT         -> the second live stack broke it:"
+     puts "                           compare with phase 1, which had b dark"
+     puts "  b is SILENT not refused -> channel b never got its IP; check vio_dump 2"
+}
+
+# Stack counters for BOTH channels -- the quickest way to see whether channel b
+# actually came up in phase 2.
+#
+# vio_dump takes NO argument on purpose: it walks every VIO in the design and
+# prints each one under its own name, so both channels come out of a single
+# call. Passing it a channel number is an error (wrong # args).
+#
+# What to read in phase 2, per channel:
+#   ip_toe / ip_arp  -- the IP each stack actually latched, BYTE-SWAPPED
+#                       (network_stack.sv:631-634). Host writes c0a80a14,
+#                       the VIO shows 140aa8c0. Compare after reversing.
+#   stream_down      -- 0 means the link is up; nonzero on channel b means the
+#                       cable/CMAC, not our kernel.
+#   arp_tx / arp_rx  -- both stacks should answer ARP once addressed.
+proc recv_dual_vio {} {
+     puts "=== all VIOs (both channels) ==="
+     vio_dump
+}
+
 # =============================================================================
 # vio_dump -- TCP stack counters from the VIO
 # =============================================================================
