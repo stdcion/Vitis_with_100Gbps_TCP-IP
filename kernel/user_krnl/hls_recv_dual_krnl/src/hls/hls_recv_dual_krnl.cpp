@@ -25,24 +25,40 @@
  * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 /************************************************
-ШАГ 1 ЛЕСТНИЦЫ: recv + ВТОРОЙ НАБОР ПОРТОВ, ЦЕЛИКОМ НА ЗАГЛУШКАХ.
+ШАГ 3 ЛЕСТНИЦЫ: listenPorts + recvData НА ОБЕИХ ПОЛОВИНАХ.
 
-Отличие от hls_recv_krnl -- РОВНО ОДНО: добавлены 16 AXI-Stream портов
-канала b, и все они закрыты tie_off_*. Ни одной строки логики на канале b
-нет: он не слушает, не принимает, не отвечает. Логика канала a не тронута
-вообще -- те же listenPorts() и recvData() из communication.hpp, что
-работают на плате (Wireshark 20.08: SYN-ACK за 69 мкс на 7001).
+Отличие от шага 1 -- РОВНО ОДНО: шесть заглушек канала b заменены на те же
+listenPorts() и recvData() из communication.hpp, что стоят на канале a.
+Портов столько же (32), схема та же, BD тот же. Меняется только то, ЧТО
+подключено к портам канала b: вместо tie_off_* -- рабочая логика эталона.
 
-ЧТО ЭТОТ ШАГ ПРОВЕРЯЕТ. Ровно схему "один HLS-инстанс на два network_krnl":
-32 порта на инстанс, второй CMAC и второй network_krnl в BD, разводка и
-congestion в SLR. Логика при этом заведомо исправна, потому что это
-дословно логика эталона.
+ЭТО ЦЕЛЬ ВСЕЙ ЛЕСТНИЦЫ: dual-QSFP ядро БЕЗ ЕДИНОЙ СВОЕЙ СТАДИИ. Если оно
+работает, значит два QSFP на upstream-логике достижимы, и остаётся выяснить,
+какая из пяти своих стадий dual_echo ломает дело (шаг 4).
 
-  handshake на 7001 проходит -> СХЕМА ИСПРАВНА, виновата логика dual_echo;
-  тишина на 7001            -> СХЕМА ЛОМАЕТ, форма стадий ни при чём.
+ПОЧЕМУ ДВА ВЫЗОВА ОДНИХ И ТЕХ ЖЕ ФУНКЦИЙ БЕЗОПАСНЫ. Проверено по коду, а не
+предположено: ни в listen_port_handler, ни в port_status_handler, ни в
+recvData_handshake, ни в recvData_consumeData НЕТ ни одной static-переменной.
+Единственный static в listenPorts закомментирован (communication.hpp:728),
+живой success_open_port -- обычный int. FIFO nextRxPacketLength внутри
+recvData объявлен БЕЗ static, то есть на каждый вызов создаётся свой.
 
-Второй исход объяснил бы то, что до сих пор без объяснения: почему probe и
-dual_echo больны одинаково при совершенно разной логике.
+Это важно: static в функции, вызванной дважды в DATAFLOW, дал бы
+HLS 200-471 feedback dependence -- ровно то, на чём мы спотыкались в
+dual_echo_publish. Здесь этого нет по построению.
+
+ПОРТЫ И ПАРАМЕТРЫ. basePort/useConn/expectedRxByteCnt -- ОБЩИЕ на оба
+канала, отдельных регистров для b не добавлено. Значит обе половины слушают
+ОДИН И ТОТ ЖЕ порт basePort, но на РАЗНЫХ network_krnl, то есть на разных
+IP -- конфликта нет, это две независимые сессии.
+
+  оба канала соединяются  -> dual-QSFP на upstream РАБОТАЕТ, идём на шаг 4
+  a работает, b молчит    -> дефект в самом факте двух слушающих половин,
+                             а не в нашей логике: сравнить с шагом 1, где
+                             b был на заглушках и a работал
+  оба молчат              -> регион с 12 живыми стадиями встал; сверить
+                             ap_sync_done: если в списке есть recvData_U0,
+                             барьер мёртв и причина в другом
 
 ВТОРОЙ network_krnl В BD СТАВИТСЯ, НО НЕ СТАРТУЕТ, и кабель в QSFP1 не
 втыкается (ресурс перетыканий ограничен, см. ограничения стенда). Для
@@ -186,27 +202,32 @@ static hls::stream<ap_uint<512> >    s_data_out;
     
           tie_off_tcp_close_con(m_axis_tcp_close_connection);
 
-          // ── канал b: все шесть заглушек, ни одной строки логики ──
+          // ── канал b: ТЕ ЖЕ стадии, что на канале a ─────────────────
           //
-          // tie_off_tcp_listen_port и tie_off_tcp_rx нужны именно потому, что
-          // на этом канале мы НЕ слушаем: listen_port никогда не пишется,
-          // port_status и notification вычитываются и выбрасываются. Без них
-          // порты остались бы неподключёнными и сборка hw упала бы.
+          // Заглушек здесь больше нет у listen/rx: канал b теперь слушает и
+          // принимает сам. Остались только те tie_off_*, что и на канале a --
+          // open_connection, tx и close_con: recv никогда не подключается сам
+          // и ничего не отправляет, это чистый приёмник.
+          //
+          // Аргументы -- порты с суффиксом _b, всё остальное дословно как
+          // выше. Никаких "b-специфичных" параметров нет намеренно: чем
+          // меньше различий между половинами, тем однозначнее результат.
+          listenPorts (basePort, useConn, m_axis_tcp_listen_port_b,
+               s_axis_tcp_port_status_b);
+
+          recvData(expectedRxByteCnt,
+               s_axis_tcp_notification_b,
+               m_axis_tcp_read_pkg_b,
+               s_axis_tcp_rx_meta_b,
+               s_axis_tcp_rx_data_b);
+
           tie_off_udp(s_axis_udp_rx_b, 
                m_axis_udp_tx_b, 
                s_axis_udp_rx_meta_b, 
                m_axis_udp_tx_meta_b);
 
-          tie_off_tcp_listen_port(m_axis_tcp_listen_port_b, 
-               s_axis_tcp_port_status_b);
-
           tie_off_tcp_open_connection(m_axis_tcp_open_connection_b, 
                s_axis_tcp_open_status_b);
-
-          tie_off_tcp_rx(s_axis_tcp_notification_b, 
-               m_axis_tcp_read_pkg_b, 
-               s_axis_tcp_rx_meta_b, 
-               s_axis_tcp_rx_data_b);
 
           tie_off_tcp_tx(m_axis_tcp_tx_meta_b, 
                m_axis_tcp_tx_data_b, 
