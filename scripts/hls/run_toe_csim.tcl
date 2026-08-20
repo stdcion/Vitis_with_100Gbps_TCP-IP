@@ -97,7 +97,17 @@ if {![file exists [file join $TOE_DIR toe.hpp]]} {
      error "не найден toe.hpp в $TOE_DIR -- проверьте структуру дерева"
 }
 
-open_project toe_csim_prj
+# Ширину можно задать при запуске: vitis_hls -f run_toe_csim.tcl -tclargs 8
+# По умолчанию 64 байта = 512 бит, как в нашей сборке. Значение 8 (64 бита) --
+# для сверки: векторы в testVectors/ написаны 64-битными словами, и тестбенч
+# конвертирует их в DATA_WIDTH через convertPacketWidth (toe_tb.cpp:759).
+# Если поведение при 8 и 64 РАЗЛИЧАЕТСЯ, значит 512-битный путь ведёт себя иначе,
+# и это объясняло бы расхождение csim с платой.
+set FNS_W 64
+if {$::argc >= 1} { set FNS_W [lindex $::argv 0] }
+puts "FNS_DATA_WIDTH: $FNS_W байт = [expr {$FNS_W * 8}] бит"
+
+open_project toe_csim_prj_w$FNS_W
 
 # ── ПОЧЕМУ toe_core, А НЕ toe ────────────────────────────────────────────────
 # Штатный run_hls.csim.tcl ставит `set_top toe`, и это НЕ РАБОТАЕТ:
@@ -112,7 +122,7 @@ set_top toe_core
 
 # Флаги -- ТЕ ЖЕ, что в нашей сборке битстрима. Менять только вместе с
 # CMakeLists.txt, иначе csim и железо разойдутся.
-set OUR_FLAGS "-DFNS_DATA_WIDTH=64 -DTCP_NODELAY=1 -DTCP_MSS=4096 \
+set OUR_FLAGS "-DFNS_DATA_WIDTH=$FNS_W -DTCP_NODELAY=1 -DTCP_MSS=4096 \
 -DTCP_STACK_MAX_SESSIONS=1000 -DRX_DDR_BYPASS=0 -DFAST_RETRANSMIT=1 \
 -DWINDOW_SCALE=1 -DFNS_ROCE_STACK_MAX_QPS=500 -Wno-unknown-pragmas"
 
