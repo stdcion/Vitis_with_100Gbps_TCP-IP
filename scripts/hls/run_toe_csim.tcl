@@ -104,7 +104,23 @@ if {![file exists [file join $TOE_DIR toe.hpp]]} {
 # Если поведение при 8 и 64 РАЗЛИЧАЕТСЯ, значит 512-битный путь ведёт себя иначе,
 # и это объясняло бы расхождение csim с платой.
 set FNS_W 64
-if {$::argc >= 1} { set FNS_W [lindex $::argv 0] }
+
+# РАЗБОР -tclargs: берём ПОСЛЕДНИЙ ЧИСЛОВОЙ элемент argv, а не argv[0].
+#
+# Почему не [lindex $::argv 0]: в vitis_hls argv содержит не только то, что после
+# -tclargs -- туда попадает и путь к самому скрипту. Первая версия делала
+# expr {$FNS_W * 8} над строкой пути и падала:
+#     can't use non-numeric string as operand of "*"
+#
+# Мой локальный макет этого не поймал, потому что я задавал argv вручную --
+# проверял СВОЮ модель, а не поведение vitis_hls. Отсюда правило: разбирать argv
+# так, чтобы лишние элементы не мешали.
+foreach a $::argv {
+     if {[string is integer -strict $a]} { set FNS_W $a }
+}
+if {$FNS_W != 8 && $FNS_W != 64} {
+     error "FNS_DATA_WIDTH=$FNS_W не поддержан: допустимы 8 (64 бита) или 64 (512 бит)"
+}
 puts "FNS_DATA_WIDTH: $FNS_W байт = [expr {$FNS_W * 8}] бит"
 
 open_project toe_csim_prj_w$FNS_W
