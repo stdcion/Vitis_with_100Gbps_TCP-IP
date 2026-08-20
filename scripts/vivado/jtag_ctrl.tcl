@@ -1418,6 +1418,54 @@ proc recv_dual_phase2 {{ip_str_a c0a80a0a} {mac_str_a 02aa00000001} \
 #   stream_down      -- 0 means the link is up; nonzero on channel b means the
 #                       cable/CMAC, not our kernel.
 #   arp_tx / arp_rx  -- both stacks should answer ARP once addressed.
+# Phase 3: BOTH halves listen -- the goal of the whole ladder.
+#
+# WHY A SEPARATE PROC AND NOT recv_dual_phase2. The bringup sequence is
+# IDENTICAL: both stacks up, one recv_start (there is a single kernel instance).
+# What differs is the BITSTREAM -- step 3 replaced the six tie_off_* stubs on
+# channel b with real listenPorts + recvData.
+#
+# So the commands would work, but every message phase2 prints would LIE: it says
+# "nobody listens on b" and "b should be REFUSED, not silent". On a step-3
+# bitstream b DOES listen, and a refusal there would mean FAILURE, not success.
+# Reading a correct result as a defect is the expensive kind of mistake, so the
+# messages get their own proc.
+#
+# THIS PHASE NEEDS A CABLE IN BOTH QSFP, unlike phases 1 and 2: the whole point
+# is receiving on the second half, and that cannot be checked over channel a.
+proc recv_dual_phase3 {{ip_str_a c0a80a0a} {mac_str_a 02aa00000001} \
+                       {ip_str_b c0a80a14} {mac_str_b 02bb00000002} \
+                       {basePort 7001}} {
+     puts "=== phase 3: BOTH halves listen (upstream logic on both) ==="
+     puts ""
+     puts "REQUIRES a step-3 bitstream: channel b must have listenPorts+recvData,"
+     puts "not tie_off_*. On a step-1 bitstream this phase is identical to phase 2"
+     puts "and its expectations below would be wrong."
+     puts ""
+     recv_bringup $ip_str_a $mac_str_a $basePort 1
+     puts ""
+     puts "--- channel b: stack up, kernel side LISTENS too ---"
+     echo_bringup $ip_str_b $mac_str_b 2
+     puts ""
+     puts "The kernel was NOT restarted: dual mode has ONE instance, already"
+     puts "running, and its basePort/useConn apply to BOTH halves."
+     puts ""
+     puts "Both halves listen on port $basePort -- no conflict: different stacks,"
+     puts "different IPs, two independent sessions."
+     puts ""
+     puts "Check BOTH from the PC:"
+     puts "  ncat [_de_dotted $ip_str_a] $basePort"
+     puts "  ncat [_de_dotted $ip_str_b] $basePort"
+     puts ""
+     puts "  both connect     -> DUAL-QSFP ON UPSTREAM WORKS -> step 4"
+     puts "  a ok, b silent   -> two listening halves is the problem, not our"
+     puts "                      logic: on step 1 b was tied off and a worked"
+     puts "  a ok, b REFUSED  -> listen on b did not open; check recv_start output"
+     puts "                      and recv_dual_vio for channel 2"
+     puts "  both silent      -> the 12-stage region stalled; check whether"
+     puts "                      recvData_U0_ap_done is in ap_sync_done"
+}
+
 proc recv_dual_vio {} {
      puts "=== all VIOs (both channels) ==="
      vio_dump
