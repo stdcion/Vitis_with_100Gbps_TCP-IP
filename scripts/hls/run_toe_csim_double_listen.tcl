@@ -1,0 +1,210 @@
+# =============================================================================
+# run_toe_csim_double_listen.tcl -- ПОВТОРНЫЙ listen того же порта
+# =============================================================================
+#
+# ОТЛИЧИЕ ОТ run_toe_csim.tcl -- РОВНО ОДНО: вместо апстримного toe_tb.cpp берётся
+# scripts/hls/toe_tb_double_listen.cpp, где порт 0x57 запрашивается ДВАЖДЫ.
+# Всё остальное -- флаги, шим, top, вектор -- то же самое.
+#
+# ЗАЧЕМ. Единственное, чем dual_echo_listen отличается от апстримного
+# listenPorts: при таймауте он ПОВТОРЯЕТ запрос listen. Захват Wireshark 20.08
+# показал, что порт при этом зарегистрирован (RST не приходит), а SYN роняется в
+# LOOKUP при !hit. Проверяем, не повтор ли listen приводит к этому состоянию.
+#
+# Проект отдельный (toe_csim_prj_dbl), чтобы не перетереть результаты прогонов
+# w64/w8 -- их можно будет сравнить.
+#
+# ЧТО ИСКАТЬ:
+#   grep -E "LISTEN REQ|LISTEN RSP|RX_SYN|TX_SYN_ACK" ~/toe_csim_dbl.log
+#
+#   есть TX_SYN_ACK -> повтор listen НЕ ломает lookup, гипотеза мертва
+#   нет TX_SYN_ACK  -> ВОСПРОИЗВЕДЕНО, причина в нашей стадии listen
+#
+# =============================================================================
+# Ниже -- копия run_toe_csim.tcl. Все пояснения к флагам, шиму и путям там.
+# =============================================================================
+#
+# ЗАЧЕМ. Дамп с платы 19.08 показал: сервер отправляет SYN-ACK на 0.0.0.0
+# (наблюдение пользователя в Wireshark на dual_echo, подтверждено числами
+# probe -- ARP уходит на несуществующий шлюз, потому что dstIp сессии нулевой).
+#
+# Цепочка по коду прослежена до конца:
+#   SYN-ACK dstIp <- reverseLookupTable[sessionID].theirIp  (session_lookup:288)
+#                 <- intQuery.tuple                         (:150, :183)
+#                 <- sessionLookupQuery(tuple, ...)          (rx_engine:905)
+#                 <- tupleBufferIn                           (:866)
+#                 <- fourTuple(header.getSrcAddr(), ...)     (:475, PSEUDO-HEADER)
+#
+# Последнее звено внутри TOE и по коду не проверяется. csim его показывает:
+# rx_engine печатает "RX_SYN: session id:... seqNum:...", tx_engine печатает
+# "TX_SYN_ACK session id:... seqNum:... ackNum:...".
+#
+# ПОЧЕМУ НЕ run_hls.csim.tcl. Тот собирает БЕЗ -cflags, то есть с дефолтами:
+# WINDOW_SCALE не определён (у нас 1, WINDOW_BITS 18 против 16), RX_DDR_BYPASS
+# не определён (у нас 1). Это ДРУГОЙ код, и его результат к нашему битстриму
+# отношения не имеет. Флаги ниже скопированы из фактического лога нашей сборки
+# (cmake_make_ip.txt:3526).
+#
+# ═══ RX_DDR_BYPASS=0, А НА ПЛАТЕ 1 -- ВЫНУЖДЕННО, ДЕФЕКТ UPSTREAM ═══════════
+#
+# При RX_DDR_BYPASS=1 csim НЕ СОБИРАЕТСЯ, и причина не в этом скрипте:
+# toe.hpp РАСХОДИТСЯ с toe.cpp. Определение toe_core (toe.cpp:484-486) при
+# bypass принимает два ДОПОЛНИТЕЛЬНЫХ аргумента:
+#
+#     #if RX_DDR_BYPASS
+#          ap_uint<16>  axis_data_count,
+#          ap_uint<16>  axis_max_data_count,
+#     #endif
+#
+# а в объявлении (toe.hpp:175) их НЕТ ВОВСЕ -- ни под условием, ни без. Тестбенч
+# видит заголовок с 30 аргументами, зовёт toe_core<512> с 30, а определено только
+# с 32 -> "undefined symbol: toe_core<512>(...)" на линковке.
+#
+# Шимом это не лечится: пришлось бы передать два аргумента, которых у тестбенча
+# нет, то есть выписать все 32 типа руками -- 32 шанса молча разойтись, причём
+# ошибка проявилась бы не в компиляции, а в ПОВЕДЕНИИ csim.
+#
+# ЧТО ЭТО ЗНАЧИТ ПРИ ЧТЕНИИ РЕЗУЛЬТАТА:
+#
+#   ОБЩЕЕ С ЖЕЛЕЗОМ -- session_lookup_controller, rx_engine до session lookup,
+#   формирование fourTuple, tx_engine. Ровно тот участок, который проверяем, и
+#   от флага он НЕ ЗАВИСИТ -- проверено построчно, а не на глаз:
+#     session_lookup_controller.cpp -- 0 вхождений RX_DDR_BYPASS
+#     tx_engine.cpp                 -- 0 вхождений
+#     rx_engine.cpp                 -- 12 вхождений, но ВСЕ начиная со :971,
+#        а критичные строки раньше: :475 fourTuple(header.getSrcAddr(), ...),
+#        :866 чтение tuple, :905 sessionLookupQuery -- все ВНЕ любого #if.
+#
+#   ОТЛИЧАЕТСЯ -- путь приёма ДАННЫХ. Для handshake он не задействован: SYN-ACK
+#   строится из rxSar/txSar в BRAM (tx_engine.cpp:524-533), к памяти не идёт.
+#
+#   ЧЕГО РЕЗУЛЬТАТ НЕ ДОКАЖЕТ -- если srcIp в сессии окажется ПРАВИЛЬНЫМ, это НЕ
+#   значит, что на нашей конфигурации то же самое. А НУЛЕВОЙ srcIp воспроизведёт
+#   дефект и укажет на session lookup -- то есть польза асимметрична, и на это
+#   мы и рассчитываем.
+#
+# ВЕКТОР io_fin_5.dat уже воспроизводит нашу ситуацию: myIpAddress=0x01010101,
+# а кадр адресован 1.1.1.1 от 10.10.10.10 -- то есть сервер принимает SYN от
+# клиента, ровно как на плате.
+#
+# Запуск (с сборочной машины, где есть Vitis HLS):
+#     cd fpga-network-stack/hls/toe
+#     vitis_hls -f ../../../scripts/hls/run_toe_csim.tcl 2>&1 | tee ~/toe_csim.log
+#
+# ЧТО ИСКАТЬ В ЛОГЕ:
+#     grep -E "RX_SYN|TX_SYN_ACK|forwarding|dropping" ~/toe_csim.log
+#
+# "dropping packet, ip valid: 0" означает, что ip_handler отбросил кадр по
+# несовпадению адреса (ip_handler.cpp:155). "RX_SYN" без последующего
+# "TX_SYN_ACK" -- сессия не создалась. Оба случая объясняют 0.0.0.0.
+
+# ── АБСОЛЮТНЫЙ ПУТЬ К ШИМУ ──────────────────────────────────────────────────
+# Относительный путь в -include НЕ РАБОТАЕТ: clang запускается из
+# <project>/<solution>/csim/build, а не из каталога, где лежит скрипт. Ровно та
+# же ловушка, что с путями к тестовым векторам (там ../../../../), но там она
+# была видна из штатного скрипта, а здесь я её повторил.
+#
+# [info script] даёт путь к этому .tcl, куда бы его ни положили -- надёжнее,
+# чем считать уровни вложенности руками.
+set SHIM [file normalize [file join [file dirname [info script]] toe_csim_shim.hpp]]
+
+# Каталог с toe.hpp -- для -I, чтобы шим нашёл заголовок. Считаем от корня
+# репозитория (два уровня вверх от scripts/hls), а не от текущего каталога:
+# скрипт запускают из fpga-network-stack/hls/toe, но полагаться на это не надо.
+set REPO [file normalize [file join [file dirname [info script]] .. ..]]
+set TOE_DIR [file join $REPO fpga-network-stack hls toe]
+puts "shim:    $SHIM"
+puts "toe dir: $TOE_DIR"
+if {![file exists [file join $TOE_DIR toe.hpp]]} {
+     error "не найден toe.hpp в $TOE_DIR -- проверьте структуру дерева"
+}
+
+# Ширину можно задать при запуске: vitis_hls -f run_toe_csim.tcl -tclargs 8
+# По умолчанию 64 байта = 512 бит, как в нашей сборке. Значение 8 (64 бита) --
+# для сверки: векторы в testVectors/ написаны 64-битными словами, и тестбенч
+# конвертирует их в DATA_WIDTH через convertPacketWidth (toe_tb.cpp:759).
+# Если поведение при 8 и 64 РАЗЛИЧАЕТСЯ, значит 512-битный путь ведёт себя иначе,
+# и это объясняло бы расхождение csim с платой.
+set FNS_W 64
+
+# РАЗБОР -tclargs: берём ПОСЛЕДНИЙ ЧИСЛОВОЙ элемент argv, а не argv[0].
+#
+# Почему не [lindex $::argv 0]: в vitis_hls argv содержит не только то, что после
+# -tclargs -- туда попадает и путь к самому скрипту. Первая версия делала
+# expr {$FNS_W * 8} над строкой пути и падала:
+#     can't use non-numeric string as operand of "*"
+#
+# Мой локальный макет этого не поймал, потому что я задавал argv вручную --
+# проверял СВОЮ модель, а не поведение vitis_hls. Отсюда правило: разбирать argv
+# так, чтобы лишние элементы не мешали.
+foreach a $::argv {
+     if {[string is integer -strict $a]} { set FNS_W $a }
+}
+if {$FNS_W != 8 && $FNS_W != 64} {
+     error "FNS_DATA_WIDTH=$FNS_W не поддержан: допустимы 8 (64 бита) или 64 (512 бит)"
+}
+puts "FNS_DATA_WIDTH: $FNS_W байт = [expr {$FNS_W * 8}] бит"
+
+open_project toe_csim_prj_dbl
+
+# ── ПОЧЕМУ toe_core, А НЕ toe ────────────────────────────────────────────────
+# Штатный run_hls.csim.tcl ставит `set_top toe`, и это НЕ РАБОТАЕТ:
+#   toe.hpp объявляет ТОЛЬКО toe_core (:175);
+#   toe() определена в toe.cpp (:826), но в заголовок не выведена, поэтому
+#   тестбенч её не видит -- отсюда "use of undeclared identifier 'toe'".
+# Кроме того типы не совпадают: toe() принимает ap_axiu, а тестбенч объявляет
+# ipRxData как stream<net_axis<DATA_WIDTH>> (toe_tb.cpp:575) -- ровно то, что
+# ждёт toe_core. То есть тестбенч написан под toe_core, и штатный скрипт просто
+# устарел вместе с двумя другими своими ошибками (dummy_memory.cpp, RX_DDR_BYPASS).
+set_top toe_core
+
+# Флаги -- ТЕ ЖЕ, что в нашей сборке битстрима. Менять только вместе с
+# CMakeLists.txt, иначе csim и железо разойдутся.
+set OUR_FLAGS "-DFNS_DATA_WIDTH=$FNS_W -DTCP_NODELAY=1 -DTCP_MSS=4096 \
+-DTCP_STACK_MAX_SESSIONS=1000 -DRX_DDR_BYPASS=0 -DFAST_RETRANSMIT=1 \
+-DWINDOW_SCALE=1 -DFNS_ROCE_STACK_MAX_QPS=500 -Wno-unknown-pragmas"
+
+foreach f {../axi_utils.cpp
+           ack_delay/ack_delay.cpp
+           close_timer/close_timer.cpp
+           event_engine/event_engine.cpp
+           port_table/port_table.cpp
+           probe_timer/probe_timer.cpp
+           retransmit_timer/retransmit_timer.cpp
+           rx_app_if/rx_app_if.cpp
+           rx_app_stream_if/rx_app_stream_if.cpp
+           rx_engine/rx_engine.cpp
+           rx_sar_table/rx_sar_table.cpp
+           session_lookup_controller/session_lookup_controller.cpp
+           state_table/state_table.cpp
+           tx_app_if/tx_app_if.cpp
+           tx_app_stream_if/tx_app_stream_if.cpp
+           tx_engine/tx_engine.cpp
+           tx_sar_table/tx_sar_table.cpp
+           tx_app_interface/tx_app_interface.cpp
+           toe.cpp} {
+     add_files $f -cflags $OUR_FLAGS
+}
+# ── ШИМ ВМЕСТО ПРАВКИ АПСТРИМНОГО ТЕСТБЕНЧА ─────────────────────────────────
+# toe_tb.cpp зовёт toe(), которой нет в заголовке. Шим даёт ей определение --
+# переброс в toe_core<DATA_WIDTH>. Подробности и две провалившиеся попытки
+# (-Dtoe=..., отдельный .cpp) -- в шапке scripts/hls/toe_csim_shim.hpp.
+# -include вставляет шим перед первой строкой toe_tb.cpp, апстримный файл не
+# тронут. Путь АБСОЛЮТНЫЙ (см. set SHIM выше).
+add_files -tb $REPO/scripts/hls/toe_tb_double_listen.cpp \
+     -cflags "$OUR_FLAGS -I$TOE_DIR -include $SHIM"
+
+open_solution "sol_csim"
+# Часть и клок для csim не важны (RTL не генерируется), но нужны для solution.
+set_part {xcu200-fsgd2104-2-e}
+create_clock -period 6.06 -name default
+
+# ПУТИ -- ЧЕТЫРЕ УРОВНЯ ВВЕРХ, и это не описка. csim запускает тестбенч из
+# <project>/<solution>/csim/build, поэтому относительные пути к векторам
+# отсчитываются оттуда, а не от каталога проекта. Так же сделано в штатном
+# run_hls.csim.tcl:33 -- сверено с ним, а не угадано.
+#
+# argv: mode(0=rx) input rxOutput txOutput gold
+csim_design -clean -argv {0 ../../../../testVectors/io_fin_5.dat ../../../../testVectors/rxOutput.dat ../../../../testVectors/txOutput.dat ../../../../testVectors/rx_io_fin_5.gold}
+
+exit
