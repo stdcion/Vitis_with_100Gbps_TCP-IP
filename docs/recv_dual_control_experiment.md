@@ -47,6 +47,70 @@ sessionID... For SYN we should time out, for everything else sent RST TODO`.
 
 Значит промах lookup'а роняет SYN беззвучно — ровно наблюдаемый симптом.
 
+## 20.08, csim: ПОВТОР LISTEN НЕ ЛОМАЕТ LOOKUP -- но нашлось другое
+
+Прогон `run_toe_csim_double_listen.tcl` (порт 0x57 запрошен ДВАЖДЫ, как делает
+`dual_echo_listen` при таймауте):
+
+```
+LISTEN REQ #1 port 0x57
+LISTEN REQ #2 port 0x57 (repeat, as dual_echo does)
+LISTEN RSP: 1
+RX_SYN / TX_SYN_ACK / RX_ACK x5 / CSim done with 0 errors
+```
+
+**Гипотеза «повтор listen ломает lookup» -- ОПРОВЕРГНУТА.** Handshake прошёл,
+данные пошли.
+
+### Но появилось предупреждение, которого в прошлом прогоне НЕ БЫЛО
+
+```
+WARNING [HLS SIM]: hls::stream 'listenPortRsp' contains leftover data,
+which may result in RTL simulation hanging.
+```
+
+Два запроса -> **два** ответа от `port_table` (`port_table.cpp:63` на повтор уже
+открытого порта возвращает `true`), а вычитан **один**. Второй остался в шине.
+
+### Почему это важно: наша стадия перестаёт читать шину НАВСЕГДА
+
+`dual_echo_listen` устроена так:
+
+```cpp
+if (!st.portRequested)   { ...запрос... }
+else if (!st.portOpened) { ...читаем port_status... }
+// при portOpened == true НИ ОДНОЙ ВЕТКИ НЕТ
+```
+
+После открытия порта чтения `s_axis_tcp_port_status` **не происходит никогда**.
+Лишний ответ остаётся в шине с `TVALID=1`.
+
+**И вот чем это отличается от безобидного мусора** (`port_table.cpp:45-77`):
+
+```cpp
+#pragma HLS PIPELINE II=1
+if (!rxApp2portTable_listen_req.empty()) {
+     ...
+     portTable2rxApp_listen_rsp.write(true);      // БЛОКИРУЮЩАЯ запись
+}
+else if (!pt_portCheckListening_req_fifo.empty()) {
+     pt_portCheckListening_rsp_fifo.write(...);   // проверка от rx_engine
+}
+```
+
+Одна функция, `if`/`else if`. Если запись ответа блокируется непрочитанной шиной,
+до `else` дело **не доходит** -- и проверка «открыт ли порт», которую делает
+`rx_engine` при приходе SYN, не обслуживается.
+
+Это сходится с захватом дословно: порт зарегистрирован (RST не приходит), а SYN
+роняется, потому что проверка не отвечает.
+
+**НЕ ДОКАЗАНО**, что на плате было именно так: csim с двумя запросами всё равно
+прошёл handshake, потому что тестбенч читает `port_status` иначе, чем наша стадия.
+Проверяется правкой в одну строку -- добавить в `dual_echo_listen` ветку, которая
+вычитывает `port_status` и при `portOpened`. Шаг 4 лестницы даст тот же ответ
+дороже, но надёжнее.
+
 ## Что опровергнуто по дороге (не проверять заново)
 
 | гипотеза | чем закрыта |
