@@ -78,12 +78,23 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-module lat_fifo #(
-     // 512 слов = 128 измерений по четыре метки. Больше не нужно: JTAG
-     // вычитывает порядка сотен слов в секунду, и 128 измерений -- это уже
-     // 512 чтений, единицы секунд.
-     parameter integer DEPTH_LOG2 = 9
-)(
+// ГЛУБИНА -- localparam, НЕ parameter, И ЭТО ВЫНУЖДЕННО.
+//
+// Первая версия писала parameter DEPTH_LOG2 = 9, а из него localparam DEPTH.
+// На шаге pack упаковщик IP выдал
+//
+//   WARNING [IP_Flow 19-587] HDL port or parameter 'mem' has a dependency on
+//           the module local parameter or undefined parameter 'DEPTH'
+//
+// и посчитал lat_fifo кандидатом в top-модуль -- обёртка при этом стала
+// "unreferenced file", ASSOCIATED_BUSIF вышел пустым, и упаковался НЕ ТОТ
+// модуль. Симптом обманчивый: сверка портов до этого прошла (212 против 180),
+// то есть обёртка разобрана, а в IP её не попало.
+//
+// Причина: ipx-парсер не разворачивает выражения над parameter при выводе
+// интерфейсов. localparam он читает как константу и вопросов не задаёт.
+// Параметризация здесь и не нужна -- один инстанс на весь дизайн.
+module lat_fifo (
      input  wire        ap_clk,
      input  wire        ap_rst_n,
 
@@ -112,7 +123,11 @@ module lat_fifo #(
      output wire        empty,
      output wire        full
 );
-     localparam integer DEPTH = 1 << DEPTH_LOG2;
+     // 512 слов = 128 измерений по четыре метки. Больше не нужно: JTAG
+     // вычитывает порядка сотен слов в секунду, и 128 измерений -- это уже
+     // 512 чтений, единицы секунд.
+     localparam integer DEPTH_LOG2 = 9;
+     localparam integer DEPTH      = 512;   // = 1 << DEPTH_LOG2, но литералом
 
      // ФОРМА ВЗЯТА ИЗ РАБОТАЮЩЕГО FIFO, СГЕНЕРИРОВАННОГО HLS.
      //

@@ -317,9 +317,17 @@ set net_bifs {}
 foreach nm $busifs {
      if {[string match "*axis_net_*" $nm]} { lappend net_bifs $nm }
 }
-if {[llength $net_bifs] != 8} {
+# ЧЕТЫРЕ, А НЕ ВОСЕМЬ. У probe врезаны ОБЕ половины, отсюда восемь шин
+# (rx/tx на вход и на выход, дважды). У нас врезана только половина a --
+# кабель один, во второй QSFP измерять нечего:
+#     s_axis_net_rx_a, m_axis_net_rx_a, s_axis_net_tx_a, m_axis_net_tx_a
+#
+# Первый прогон pack упал именно на этой проверке с числом 0 -- но причина
+# была не в пороге, а в том, что упаковался НЕ ТОТ модуль (см. lat_fifo.v,
+# шапка про localparam). Порог тоже был чужой, и это второй дефект.
+if {[llength $net_bifs] != 4} {
      puts ""
-     puts "  Найдено интерфейсов axis_net_*: [llength $net_bifs], ждали 8"
+     puts "  Найдено интерфейсов axis_net_*: [llength $net_bifs], ждали 4"
      foreach nm [lsort $net_bifs] { puts "    $nm" }
      puts ""
      puts "  Vivado выводит шинный интерфейс из имён портов:"
