@@ -486,33 +486,63 @@ localparam logic [11:0] A_CLEAR    = 12'h128;
 wire aw_ours = s_axi_control_awaddr[11:8] != 4'h0;
 wire ar_ours = s_axi_control_araddr[11:8] != 4'h0;
 
-// ── запись ──
-logic        wr_pending;
+// ── запись: автомат из ТРЁХ состояний, как в эталоне ────────────────────────
+//
+// ФОРМА ВЗЯТА ИЗ dual_echo_control_s_axi.v -- обёртки, которая РАБОТАЛА на
+// этой плате (удалена в 9dd815a, когда ядро перешло на s_axilite). Там
+// автомат записи имеет три состояния:
+//
+//     WRIDLE  ждём адрес     AWREADY=1
+//     WRDATA  ждём данные    WREADY=1
+//     WRRESP  отдаём ответ   BVALID=1, новый адрес НЕ принимаем
+//
+// ПЕРВАЯ ВЕРСИЯ ЗДЕСЬ ВИСЛА, И ЭТО НАШЛОСЬ СРАВНЕНИЕМ С ЭТАЛОНОМ. Она
+// поднимала bvalid отдельным регистром, а awready возвращала сразу после
+// приёма данных -- то есть принимала СЛЕДУЮЩУЮ запись, не отдав ответ на
+// предыдущую. Два ответа схлопывались в один, хост ждал второй bvalid вечно.
+//
+// Для pp_raw это было бы фатально: она делает ЧЕТЫРЕ записи POP подряд на
+// каждое измерение, ровно тот сценарий. JTAG-транзакция повисла бы на первом
+// же измерении, и выглядело бы это как "плата не отвечает" -- то есть
+// неотличимо от мёртвого битстрима.
+typedef enum logic [1:0] {WRIDLE, WRDATA, WRRESP} wstate_t;
+wstate_t wstate = WRIDLE;
 logic [11:0] wr_addr;
+
 always_ff @(posedge ap_clk) begin
      if (~ap_rst_n) begin
-          wr_pending <= 1'b0;
-          wr_addr    <= 12'b0;
-          fifo_pop   <= 1'b0;
-          fifo_clear <= 1'b0;
+          wstate      <= WRIDLE;
+          wr_addr     <= 12'b0;
+          fifo_pop    <= 1'b0;
+          fifo_clear  <= 1'b0;
           min_words_r <= 32'd2;
      end else begin
           fifo_pop   <= 1'b0;      // стробы на один такт
           fifo_clear <= 1'b0;
 
-          if (s_axi_control_awvalid && aw_ours && !wr_pending) begin
-               wr_addr    <= s_axi_control_awaddr;
-               wr_pending <= 1'b1;
-          end
-          if (wr_pending && s_axi_control_wvalid) begin
-               wr_pending <= 1'b0;
-               case (wr_addr)
-               A_POP:      fifo_pop    <= 1'b1;
-               A_CLEAR:    fifo_clear  <= 1'b1;
-               A_MINWORDS: min_words_r <= s_axi_control_wdata;
-               default: ;   // запись в R-регистр игнорируется молча
-               endcase
-          end
+          case (wstate)
+          WRIDLE:
+               if (s_axi_control_awvalid && aw_ours) begin
+                    wr_addr <= s_axi_control_awaddr;
+                    wstate  <= WRDATA;
+               end
+
+          WRDATA:
+               if (s_axi_control_wvalid) begin
+                    case (wr_addr)
+                    A_POP:      fifo_pop    <= 1'b1;
+                    A_CLEAR:    fifo_clear  <= 1'b1;
+                    A_MINWORDS: min_words_r <= s_axi_control_wdata;
+                    default: ;   // запись в R-регистр игнорируется молча
+                    endcase
+                    wstate <= WRRESP;
+               end
+
+          WRRESP:
+               // Ответ отдан -- только теперь готовы к новому адресу.
+               if (s_axi_control_bready)
+                    wstate <= WRIDLE;
+          endcase
      end
 end
 
@@ -572,18 +602,13 @@ wire [31:0] k_rdata;
 wire        k_interrupt;
 
 // Ответы мультиплексируем по тому же признаку. Наш путь -- регистры выше.
-assign s_axi_control_awready = aw_ours ? !wr_pending  : k_awready;
-assign s_axi_control_wready  = aw_ours ?  wr_pending  : k_wready;
+assign s_axi_control_awready = aw_ours ? (wstate == WRIDLE) : k_awready;
+assign s_axi_control_wready  = aw_ours ? (wstate == WRDATA) : k_wready;
 assign s_axi_control_arready = ar_ours ? !rd_valid_r  : k_arready;
 
-// bvalid для нашего диапазона: поднимаем на один такт после приёма данных.
-// Без этого запись в наш регистр повисла бы -- хост ждёт ответа по каналу B.
-logic our_bvalid;
-always_ff @(posedge ap_clk) begin
-     if (~ap_rst_n)                          our_bvalid <= 1'b0;
-     else if (wr_pending && s_axi_control_wvalid) our_bvalid <= 1'b1;
-     else if (our_bvalid && s_axi_control_bready)  our_bvalid <= 1'b0;
-end
+// bvalid берётся из состояния автомата, а не отдельного регистра -- так
+// невозможно принять новый адрес, не отдав предыдущий ответ.
+wire our_bvalid = (wstate == WRRESP);
 
 assign s_axi_control_bvalid = our_bvalid | k_bvalid;
 assign s_axi_control_bresp  = our_bvalid ? 2'b00 : k_bresp;
