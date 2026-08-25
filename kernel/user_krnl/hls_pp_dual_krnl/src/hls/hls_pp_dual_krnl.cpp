@@ -90,20 +90,40 @@ static_assert((PP_MAX_WORDS & (PP_MAX_WORDS - 1)) == 0,
 /*
  * Открывает listen-порт, повторяя запрос до подтверждения стека.
  *
- * ДВЕ ПРАВКИ ОТНОСИТЕЛЬНО pp_listen ИЗ hls_pingpong_krnl:
+ * ОДНА ПРАВКА ОТНОСИТЕЛЬНО pp_listen ИЗ hls_pingpong_krnl: portState
+ * наружу. Без него "соединение не устанавливается" не отличить от "порт не
+ * открылся", а это первое, что надо знать с платы.
  *
- * 1. full() перед записью. Было m_axis_tcp_listen_port.write() без
- *    проверки -- блокирующая запись в стадии с PIPELINE II=1. Апстримный
- *    server() в iperf_client.cpp:405 делает так же и работает, так что
- *    риск невысок, но проверка стоит одну строку.
+ * ЗАПИСЬ БЛОКИРУЮЩАЯ, БЕЗ full() -- И ЭТО СОЗНАТЕЛЬНО.
  *
- * 2. portState наружу. Без него "соединение не устанавливается" не
- *    отличить от "порт не открылся", а это первое, что надо знать.
+ * Сначала я поставил здесь проверку full(), считая её бесплатной
+ * страховкой. csynth показал цену: II Violation 200-880, carried
+ * dependence между full() и write() по одному порту, Final II = 2 вместо 1.
+ *
+ * Сравнение с логом csynth РАБОТАЮЩЕГО hls_recv_dual_krnl (25.08, фаза 3
+ * зелёная на плате) показало, что это ЕДИНСТВЕННОЕ расхождение с эталоном:
+ *
+ *   Fmax               259.20 МГц   ==   259.20 МГц
+ *   HLS 200-471        2 issue(s)   ==   2 issue(s)   (оба в апстримных
+ *                                                     sendDataPtr/recvDataPtr,
+ *                                                     которые не вызываются)
+ *   HLS 200-656        есть         ==   есть         (на апстримном
+ *                                                     port_status_handler тоже)
+ *   ap_ctrl            s_axilite+hs ==   s_axilite+hs
+ *   II Violation       НЕТ          !=   1 (pp_listen)   <-- только у нас
+ *
+ * Смешанный II в DATAFLOW-регионе -- ровно то, что убивало регион раньше:
+ * ap_sync_done требует ap_done всех стадий в ОДНОМ такте. Под ap_ctrl_hs
+ * это не должно мешать, но проверять такое на плате при одной попытке в
+ * сутки -- плохая сделка, когда цена устранения три строки.
+ *
+ * Риск блокирующей записи здесь минимальный: pp_listen пишет ОДИН пакет за
+ * всю жизнь ядра, и FIFO listen-порта к этому моменту пуст. Апстримный
+ * server() в iperf_client.cpp:405 пишет так же и работает на этом железе.
  *
  * ФОРМА СТАДИИ -- КАК У АПСТРИМА. iperf_client.cpp:386 server(): тот же
  * автомат, PIPELINE II=1, INLINE off, неблокирующее чтение через empty(),
- * и после открытия порта шина port_status больше не читается. Это ядро
- * работает на боевом железе, значит форма не дефект.
+ * и после открытия порта шина port_status больше не читается.
  */
 void pp_listen(int listenPort,
                ap_uint<32>& portState,
@@ -118,13 +138,10 @@ void pp_listen(int listenPort,
 
      if (!portRequested)
      {
-          if (!m_axis_tcp_listen_port.full())
-          {
-               pkt16 listen_port_pkt;
-               listen_port_pkt.data(15, 0) = listenPort;
-               m_axis_tcp_listen_port.write(listen_port_pkt);
-               portRequested = true;
-          }
+          pkt16 listen_port_pkt;
+          listen_port_pkt.data(15, 0) = listenPort;
+          m_axis_tcp_listen_port.write(listen_port_pkt);
+          portRequested = true;
      }
      else if (!portOpened && !s_axis_tcp_port_status.empty())
      {
