@@ -66,27 +66,27 @@ import (
 const maxMsgBytes = 4096
 
 func main() {
-	host := flag.String("host", "", "IP платы (обязательно)")
-	port := flag.Int("port", 7001, "TCP-порт")
-	msgBytes := flag.Int("bytes", 64, "размер сообщения, 1..4096")
-	count := flag.Int("count", 10000, "сколько сообщений измерять")
-	warmup := flag.Int("warmup", 1000, "прогрев (не входит в статистику)")
-	verifyAll := flag.Bool("verify", false, "сверять КАЖДОЕ эхо (по умолчанию только прогрев)")
-	csvPath := flag.String("csv", "", "файл для сырых сэмплов (пусто = не писать)")
-	timeout := flag.Duration("timeout", 5*time.Second, "таймаут на соединение и чтение")
+	host := flag.String("host", "", "board IP (required)")
+	port := flag.Int("port", 7001, "TCP port")
+	msgBytes := flag.Int("bytes", 64, "message size, 1..4096")
+	count := flag.Int("count", 10000, "messages to measure")
+	warmup := flag.Int("warmup", 1000, "warmup (excluded from stats)")
+	verifyAll := flag.Bool("verify", false, "verify EVERY echo (default: warmup only)")
+	csvPath := flag.String("csv", "", "raw samples file (empty = none)")
+	timeout := flag.Duration("timeout", 5*time.Second, "connect and read timeout")
 	flag.Parse()
 
 	if *host == "" {
-		fmt.Fprintln(os.Stderr, "ОШИБКА: не задан -host")
+		fmt.Fprintln(os.Stderr, "error: -host required")
 		flag.Usage()
 		os.Exit(2)
 	}
 	if *msgBytes < 1 || *msgBytes > maxMsgBytes {
-		fmt.Fprintf(os.Stderr, "ОШИБКА: -bytes должно быть 1..%d (PP_MAX_WORDS*64 в ядре)\n", maxMsgBytes)
+		fmt.Fprintf(os.Stderr, "error: -bytes must be 1..%d (PP_MAX_WORDS*64 in kernel)\n", maxMsgBytes)
 		os.Exit(2)
 	}
 	if *count < 1 {
-		fmt.Fprintln(os.Stderr, "ОШИБКА: -count должно быть > 0")
+		fmt.Fprintln(os.Stderr, "error: -count must be > 0")
 		os.Exit(2)
 	}
 
@@ -98,58 +98,43 @@ func main() {
 
 	zeroFrac, gran, ovh := calibrateClock()
 
-	fmt.Printf("=== Измеритель ===\n")
-	fmt.Printf("платформа      : %s/%s, Go %s\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
-	fmt.Printf("источник времени: %s\n", clockName())
-	fmt.Printf("гранулярность  : %d ns (мин. ненулевая разница двух вызовов)\n", gran)
-	fmt.Printf("оверхед вызова : %d ns (медиана пары вызовов)\n", ovh)
-	if gran > 200 {
-		fmt.Printf("  ВНИМАНИЕ: таймер квантует шагом ~%d ns -- RTT округляется\n", gran)
-		fmt.Printf("  до этой величины. При RTT ~3000 ns это погрешность ~%.1f%%\n",
-			100.0*float64(gran)/3000.0)
-	}
-	// Доля нулевых разниц -- прямой ответ на вопрос "годится ли таймер".
-	// В C-версии на macOS CLOCK_MONOTONIC давал 97% нулей, то есть при RTT
-	// в микросекунды показывал бы мусор. Если здесь близко к 100%, измерять
-	// нечем и надо это видеть до запуска, а не после.
-	fmt.Printf("нулевых разниц : %.1f%% пар вызовов", zeroFrac*100)
+	// Таймер одной строкой. Числа нужны: без них "RTT 3 мкс" не отличить
+	// от "таймер квантует по 1 мкс и мы видим 3 отсчёта". Предупреждения --
+	// только когда есть о чём предупреждать.
+	fmt.Printf("timer: gran %dns, overhead %dns, %.0f%% zero-diffs (%s)\n",
+		gran, ovh, zeroFrac*100, runtime.GOOS)
 	if zeroFrac > 0.9 {
-		fmt.Printf("  <-- ТАЙМЕР СЛИШКОМ ГРУБЫЙ ДЛЯ ЭТИХ ИЗМЕРЕНИЙ")
+		fmt.Println("WARNING: timer too coarse for microsecond RTT")
+	} else if gran > 200 {
+		fmt.Printf("WARNING: %dns quantum = ~%.0f%% error at 3us RTT\n",
+			gran, 100.0*float64(gran)/3000.0)
 	}
-	fmt.Println()
-	fmt.Printf("привязка к CPU : нет (в Go недоступна без cgo -- хвосты p99 будут шумными)\n")
-	fmt.Println()
 
 	addr := net.JoinHostPort(*host, strconv.Itoa(*port))
-	fmt.Printf("подключаюсь к %s ...\n", addr)
 
 	conn, err := net.DialTimeout("tcp", addr, *timeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nСОЕДИНЕНИЕ НЕ УСТАНОВЛЕНО: %v\n\n", err)
-		fmt.Fprintln(os.Stderr, "Что это значит:")
-		fmt.Fprintln(os.Stderr, "  connection refused -> порт на плате НЕ открыт. Проверьте portState")
-		fmt.Fprintln(os.Stderr, "                        через pp_dual_dump: 0 или 1 = listen не удался.")
-		fmt.Fprintln(os.Stderr, "  timeout            -> SYN ушёл, ответа нет. То же молчание, что было")
-		fmt.Fprintln(os.Stderr, "                        у dual_echo. Смотрите portState и ppState.")
-		fmt.Fprintln(os.Stderr, "  no route to host   -> ARP не разрешился, проверьте адреса и линк.")
+		// Одна строка: что случилось и куда смотреть. Расшифровка кодов
+		// ошибок -- в README, она не меняется от прогона к прогону.
+		fmt.Fprintf(os.Stderr, "connect %s: %v\n", addr, err)
+		fmt.Fprintln(os.Stderr, "check portState via pp_dual_dump")
 		os.Exit(1)
 	}
 	defer conn.Close()
 
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "ОШИБКА: соединение не TCP")
+		fmt.Fprintln(os.Stderr, "error: not a TCP connection")
 		os.Exit(1)
 	}
 	// КРИТИЧНО: без этого алгоритм Нейгла придержит мелкие пакеты до
 	// подтверждения предыдущего, и вместо задержки сети мы измерим Нейгла.
 	if err := tcp.SetNoDelay(true); err != nil {
-		fmt.Fprintf(os.Stderr, "ВНИМАНИЕ: TCP_NODELAY не установлен: %v\n", err)
-		fmt.Fprintln(os.Stderr, "  Измерения будут искажены алгоритмом Нейгла.")
+		// Не фатально, но тогда мы измерим Нейгла, а не сеть.
+		fmt.Fprintf(os.Stderr, "WARNING: TCP_NODELAY failed (%v) -- Nagle will skew results\n", err)
 	}
 
-	fmt.Printf("подключено. msg=%d байт, count=%d, warmup=%d\n\n",
-		*msgBytes, *count, *warmup)
+	fmt.Printf("%s: %d bytes x %d (+%d warmup)\n", addr, *msgBytes, *count, *warmup)
 
 	tx := make([]byte, *msgBytes)
 	rx := make([]byte, *msgBytes)
@@ -170,20 +155,18 @@ func main() {
 		t0 := time.Now()
 
 		if _, err := conn.Write(tx); err != nil {
-			fmt.Fprintf(os.Stderr, "\nОШИБКА ОТПРАВКИ после %d сообщений: %v\n", i, err)
+			fmt.Fprintf(os.Stderr, "send failed after %d msgs: %v\n", i, err)
 			break
 		}
 		// ReadFull: TCP может отдать эхо частями, и без дочитывания
 		// RTT получился бы меньше настоящего.
 		if _, err := io.ReadFull(conn, rx); err != nil {
-			fmt.Fprintf(os.Stderr, "\nЭХО НЕ ПРИШЛО после %d сообщений: %v\n", i, err)
+			// Таблица значений ppState была здесь и оказалась шумом: она не
+			// зависит от прогона и живёт в README. Клиент печатает ФАКТ --
+			// сколько сообщений прошло до отказа.
+			fmt.Fprintf(os.Stderr, "no echo after %d msgs: %v\n", i, err)
 			if i == 0 {
-				fmt.Fprintln(os.Stderr, "\nНи одного эха. Соединение установлено, но ядро не отвечает.")
-				fmt.Fprintln(os.Stderr, "Читайте ppState через pp_dual_dump -- он назовёт шаг, где встало:")
-				fmt.Fprintln(os.Stderr, "  0 NOTIFY  уведомление до ядра не дошло")
-				fmt.Fprintln(os.Stderr, "  2 RX      данные идут, но tlast не пришёл")
-				fmt.Fprintln(os.Stderr, "  4 STATUS  стек не ответил на tx_meta -- TX-путь достигнут")
-				fmt.Fprintln(os.Stderr, "  5 TX      слова не принимаются, backpressure")
+				fmt.Fprintln(os.Stderr, "connected but silent -- read ppState via pp_dual_dump")
 			}
 			break
 		}
@@ -205,17 +188,17 @@ func main() {
 	}
 
 	if len(samples) == 0 {
-		fmt.Fprintln(os.Stderr, "\nНи одного сэмпла не собрано.")
+		fmt.Fprintln(os.Stderr, "no samples collected")
 		os.Exit(1)
 	}
 
-	report(samples, *msgBytes, mismatches, *verifyAll, gran)
+	report(samples, *msgBytes, mismatches, *verifyAll)
 
 	if *csvPath != "" {
 		if err := writeCSV(*csvPath, samples); err != nil {
-			fmt.Fprintf(os.Stderr, "не удалось записать %s: %v\n", *csvPath, err)
+			fmt.Fprintf(os.Stderr, "csv write failed: %v\n", err)
 		} else {
-			fmt.Printf("\nсырые сэмплы: %s (%d строк)\n", *csvPath, len(samples))
+			fmt.Printf("csv        : %s\n", *csvPath)
 		}
 	}
 }
@@ -232,19 +215,6 @@ func equalBytes(a, b []byte) bool {
 		}
 	}
 	return true
-}
-
-func clockName() string {
-	switch runtime.GOOS {
-	case "linux":
-		return "clock_gettime(CLOCK_MONOTONIC), разрешение ~1 ns"
-	case "darwin":
-		return "mach_absolute_time, разрешение ~40 ns"
-	case "windows":
-		return "QueryPerformanceCounter, разрешение ~100 ns (QPC обычно 10 MHz)"
-	default:
-		return "монотонные часы платформы"
-	}
 }
 
 // calibrateClock меряет собственную погрешность измерителя.
@@ -305,7 +275,7 @@ func percentile(sorted []int64, p float64) float64 {
 	return float64(sorted[lo])*(1-frac) + float64(sorted[hi])*frac
 }
 
-func report(samples []int64, msgBytes, mismatches int, verifyAll bool, gran int64) {
+func report(samples []int64, msgBytes, mismatches int, verifyAll bool) {
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 
 	var sum float64
@@ -339,18 +309,14 @@ func report(samples []int64, msgBytes, mismatches int, verifyAll bool, gran int6
 		fmt.Printf("%-11s: %9.0f ns  (%7.3f us)\n", label, ns, ns/1000.0)
 	}
 
-	fmt.Printf("=== RTT приложение-приложение ===\n")
-	fmt.Printf("сэмплов    : %d\n", len(samples))
-	fmt.Printf("размер msg : %d байт\n", msgBytes)
-	if verifyAll {
-		fmt.Printf("сверка     : все сообщения\n")
-	} else {
-		fmt.Printf("сверка     : только прогрев\n")
-	}
 	if mismatches > 0 {
-		fmt.Printf("РАСХОЖДЕНИЙ: %d -- ЭХО ОТЛИЧАЕТСЯ ОТ ОТПРАВЛЕННОГО!\n", mismatches)
-		fmt.Printf("  Это дефект ядра, не измерителя. Смотрите pp_echo:\n")
-		fmt.Printf("  keep последнего слова, границы payload[], txLength.\n")
+		// Единственное, что стоит крика: эхо не совпало с отправленным.
+		// Это дефект ядра, и он делает измерение бессмысленным.
+		fmt.Printf("*** %d MISMATCHES -- echo differs from sent data\n", mismatches)
+	}
+	fmt.Printf("\n%d samples, %d bytes", len(samples), msgBytes)
+	if verifyAll {
+		fmt.Printf(", all verified")
 	}
 	fmt.Println()
 	line("min", float64(samples[0]))
@@ -361,17 +327,9 @@ func report(samples []int64, msgBytes, mismatches int, verifyAll bool, gran int6
 	line("max", float64(samples[len(samples)-1]))
 	line("mean", mean)
 	line("stddev", sd)
-	fmt.Printf("выбросы    : %d (%.2f%%, > 2x p50)\n",
+	fmt.Printf("outliers   : %d (%.2f%%, >2x p50)\n",
 		outliers, 100.0*float64(outliers)/float64(len(samples)))
-	fmt.Println()
-	fmt.Printf("Односторонняя задержка ~ p50/2 = %.3f us (если путь симметричен)\n", p50/2000.0)
-	fmt.Printf("Погрешность измерителя ~ %d ns (гранулярность таймера)\n", gran)
-	fmt.Println()
-	fmt.Printf("ЧТО ВХОДИТ В ЭТО ЧИСЛО, а что нет:\n")
-	fmt.Printf("  входит : сисколлы Write/Read, драйвер NIC, сама NIC, провод,\n")
-	fmt.Printf("           CMAC, стек TOE в обе стороны, ядро pp_echo\n")
-	fmt.Printf("  НЕ видно: сколько из этого ядро, а сколько стек. Для разбивки\n")
-	fmt.Printf("           нужна врезка времени на axis_net (отдельный заход).\n")
+	fmt.Printf("one-way    ~ %.3f us (p50/2, if symmetric)\n", p50/2000.0)
 }
 
 func writeCSV(path string, samples []int64) error {
