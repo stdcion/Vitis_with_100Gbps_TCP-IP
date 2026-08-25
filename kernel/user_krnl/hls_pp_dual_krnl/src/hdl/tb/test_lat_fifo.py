@@ -34,6 +34,8 @@ class LatFifo:
         self.rd = 0
         self.cnt = 0
         self.ovf = 0
+        self.shift = []
+        self.wr_left = 0
 
     @property
     def empty(self):
@@ -51,43 +53,65 @@ class LatFifo:
         # ovf НЕ сбрасывается -- как в .v: потери прошлого прогона должны
         # пережить чистку данных.
         self.wr = self.rd = self.cnt = 0
+        self.wr_left = 0
+        self.shift = []
 
     @property
     def room4(self):
         return self.cnt <= self.depth - WORDS_PER_SAMPLE
 
+    @property
+    def busy(self):
+        return self.wr_left != 0
+
     def tick(self, wr_en=False, stamps=None, rd_pop=False):
-        """stamps -- четвёрка (T2, t2, t1, T1) или None.
+        """Один такт. stamps -- четвёрка (T2, t2, t1, T1) или None.
 
-        ВСЕ УСЛОВИЯ ВЫЧИСЛЯЮТСЯ ДО ИЗМЕНЕНИЯ СОСТОЯНИЯ. В HDL правая часть
-        неблокирующего присваивания берёт значение регистра ДО такта, поэтому
-        room4 и empty должны быть посчитаны один раз в начале.
+        ВСЕ УСЛОВИЯ ВЫЧИСЛЯЮТСЯ ДО ИЗМЕНЕНИЯ СОСТОЯНИЯ: в HDL правая часть
+        неблокирующего присваивания берёт значение регистра ДО такта.
+        Первая версия читала room4 повторно после изменения cnt и получала
+        новое значение -- тест ловил "потерю", которой в железе нет.
 
-        Первая версия читала self.room4 повторно после self.cnt += 4 --
-        и получала уже новое значение. Тест ловил "потерю" последней записи
-        до края, которой в железе нет. Дефект был в модели, не в .v.
+        ЗАПИСЬ РАСТЯНУТА НА ЧЕТЫРЕ ТАКТА. Измерение принимается в регистр за
+        один такт, потом выгружается в память по слову. Причина -- в .v:
+        четыре порта записи плюс асинхронное чтение это пять портов к одному
+        массиву, а BRAM даёт два.
         """
         room4 = self.room4
+        busy = self.busy
         was_empty = self.empty
 
-        if wr_en and room4:
-            for k in range(WORDS_PER_SAMPLE):
-                self.mem[(self.wr + k) % self.depth] = stamps[k]
-            self.wr = (self.wr + WORDS_PER_SAMPLE) % self.depth
+        accept = wr_en and room4 and not busy
+        reject = wr_en and (not room4 or busy)
 
-        if wr_en and room4 and rd_pop and not was_empty:
-            self.cnt += WORDS_PER_SAMPLE - 1
-        elif wr_en and room4:
-            self.cnt += WORDS_PER_SAMPLE
+        if accept:
+            self.shift = list(stamps)      # младшее вперёд
+            self.wr_left = 4
+
+        if busy:
+            self.mem[self.wr] = self.shift.pop(0)
+            self.wr = (self.wr + 1) % self.depth
+            self.wr_left -= 1
+
+        if busy and rd_pop and not was_empty:
+            pass                            # +1 -1
+        elif busy:
+            self.cnt += 1
         elif rd_pop and not was_empty:
             self.cnt -= 1
 
         if rd_pop and not was_empty:
             self.rd = (self.rd + 1) % self.depth
 
-        # Потеря засчитывается ВСЕГДА, когда строб был, а места не было.
-        if wr_en and not room4:
+        if reject:
             self.ovf += 1
+
+    def push(self, stamps):
+        """Подать измерение и дать выгрузке завершиться -- как это происходит
+        на плате, где между пакетами сотни тактов."""
+        self.tick(wr_en=True, stamps=stamps)
+        for _ in range(4):
+            self.tick()
 
 
 fails = 0
@@ -134,7 +158,7 @@ check(f.ovf == 0, "overflow ноль")
 # ---------------------------------------------------------------------------
 print("\n[2] одно измерение: четыре слова, порядок T2,t2,t1,T1")
 f = LatFifo()
-f.tick(wr_en=True, stamps=sample(1000))
+f.push(sample(1000))
 check(f.cnt == 4, "легло РОВНО четыре слова")
 got = drain(f)
 check(len(got) == 1, "вычитана одна четвёрка")
@@ -149,7 +173,7 @@ print("\n[3] СОГЛАСОВАННОСТЬ: суммa интервалов ра
 # Тот же приём в epd_raw: колонка status с флагом TORN.
 f = LatFifo()
 for i in range(10):
-    f.tick(wr_en=True, stamps=sample(5000 + i * 200))
+    f.push(sample(5000 + i * 200))
 bad = 0
 for (T2, t2, t1, T1) in drain(f):
     if (t2 - T2) + (t1 - t2) + (T1 - t1) != (T1 - T2):
@@ -160,7 +184,7 @@ check(bad == 0, "все 10 четвёрок согласованы")
 print("\n[4] порядок измерений сохраняется")
 f = LatFifo()
 for i in range(20):
-    f.tick(wr_en=True, stamps=sample(i * 1000))
+    f.push(sample(i * 1000))
 got = drain(f)
 check([g[0] for g in got] == [i * 1000 for i in range(20)],
       "измерения вышли в порядке записи")
@@ -169,7 +193,7 @@ check([g[0] for g in got] == [i * 1000 for i in range(20)],
 print("\n[5] заполнение до края: ровно DEPTH/4 измерений")
 f = LatFifo()
 for i in range(DEPTH // 4):
-    f.tick(wr_en=True, stamps=sample(i * 100))
+    f.push(sample(i * 100))
 check(f.cnt == DEPTH and f.full, "%d слов, full поднят" % DEPTH)
 check(f.ovf == 0, "ни одной потери до края")
 
@@ -183,7 +207,7 @@ print("\n[6] ПЕРЕПОЛНЕНИЕ: старое цело, новое отб�
 f = LatFifo()
 total = DEPTH // 4 + 37
 for i in range(total):
-    f.tick(wr_en=True, stamps=sample(i * 100))
+    f.push(sample(i * 100))
 check(f.ovf == 37, "потеряно ровно 37 ИЗМЕРЕНИЙ (не слов)")
 check(f.cnt == DEPTH, "в FIFO по-прежнему полно")
 got = drain(f)
@@ -202,7 +226,7 @@ print("\n[7] места на ТРИ слова недостаточно -- за�
 # правдоподобную четвёрку из двух разных измерений.
 f = LatFifo()
 for i in range(DEPTH // 4 - 1):
-    f.tick(wr_en=True, stamps=sample(i * 100))
+    f.push(sample(i * 100))
 # освобождаем ровно три слова
 for _ in range(1):
     f.tick(rd_pop=True)
@@ -211,31 +235,50 @@ f.tick(rd_pop=True)
 free = DEPTH - f.cnt
 check(free == 7, "свободно 7 слов (4 хвост + 3 освобождённых)")
 # теперь забиваем так, чтобы осталось ровно 3
-f.tick(wr_en=True, stamps=sample(90000))
+f.push(sample(90000))
 free = DEPTH - f.cnt
 check(free == 3, "осталось ровно 3 свободных слова")
 ovf_was = f.ovf
-f.tick(wr_en=True, stamps=sample(99999))
+f.push(sample(99999))
 check(f.ovf == ovf_was + 1, "запись при 3 свободных ОТБРОШЕНА и засчитана")
 check(DEPTH - f.cnt == 3, "частичной записи не произошло: свободно всё те же 3")
 
 # ---------------------------------------------------------------------------
-print("\n[8] одновременные запись и чтение")
+print("\n[8] чтение хостом, пока идёт выгрузка измерения")
+#
+# Реальная ситуация: хост читает FIFO, а в это время приходит пакет. Выгрузка
+# занимает четыре такта, и чтение может попасть в любой из них.
+#
+# Проверка не "cnt += 4 за такт" (так было в первой версии, когда все четыре
+# слова писались одновременно), а что за полный цикл счёт сходится: четыре
+# слова вошли, одно вышло.
 f = LatFifo()
 for i in range(10):
-    f.tick(wr_en=True, stamps=sample(i * 100))
+    f.push(sample(i * 100))
 before = f.cnt
 first = f.rd_data()
+
+# подаём измерение и читаем ОДНОВРЕМЕННО с выгрузкой
 f.tick(wr_en=True, stamps=sample(77000), rd_pop=True)
-check(f.cnt == before + 3, "cnt: +4 за запись, -1 за чтение")
+for _ in range(4):
+    f.tick(rd_pop=True)
+
+check(f.cnt == before + 4 - 5, "счёт сошёлся: 4 слова вошли, 5 вышли")
 check(first == 0, "прочитано первое слово старейшего измерения")
-check(f.ovf == 0, "потерь нет")
+check(f.ovf == 0, "потерь нет -- место было, выгрузка не была занята")
+
+# И отдельно: приём ВО ВРЕМЯ выгрузки отбрасывается и считается.
+f2 = LatFifo()
+f2.tick(wr_en=True, stamps=sample(1000))      # начали выгрузку
+ovf_was = f2.ovf
+f2.tick(wr_en=True, stamps=sample(2000))      # второе измерение в тот же момент
+check(f2.ovf == ovf_was + 1, "приём во время выгрузки отброшен И засчитан")
 
 # ---------------------------------------------------------------------------
 print("\n[9] clear чистит данные, но НЕ счётчик потерь")
 f = LatFifo()
 for i in range(DEPTH // 4 + 5):
-    f.tick(wr_en=True, stamps=sample(i * 100))
+    f.push(sample(i * 100))
 ovf_was = f.ovf
 f.clear()
 check(f.cnt == 0 and f.empty, "после clear данных нет")
@@ -247,7 +290,7 @@ f = LatFifo()
 for _ in range(5):
     f.tick(rd_pop=True)
 check(f.cnt == 0 and f.rd == 0, "указатель не поехал")
-f.tick(wr_en=True, stamps=sample(4242))
+f.push(sample(4242))
 check(f.rd_data() == 4242, "запись после лишних pop читается верно")
 
 # ---------------------------------------------------------------------------
@@ -257,7 +300,7 @@ print("\n[11] реальный сценарий: 100 измерений, пот�
 # FIFO целиком в файл.
 f = LatFifo()
 for i in range(100):
-    f.tick(wr_en=True, stamps=sample(10000 + i * 500))
+    f.push(sample(10000 + i * 500))
 check(f.cnt == 400, "100 измерений = 400 слов")
 check(f.ovf == 0, "ни одной потери: 100 < %d" % (DEPTH // 4))
 got = drain(f)
