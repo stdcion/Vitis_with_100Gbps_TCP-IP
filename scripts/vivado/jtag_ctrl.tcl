@@ -2347,3 +2347,257 @@ proc _de_dotted {ip_str} {
                  [expr {($ip >> 24) & 0xff}] [expr {($ip >> 16) & 0xff}] \
                  [expr {($ip >> 8) & 0xff}]  [expr {$ip & 0xff}]]
 }
+
+# =============================================================================
+# hls_pp_dual_krnl -- TCP echo on half a, receiver on half b
+# =============================================================================
+#
+# THE FIRST KERNEL ON THIS BOARD THAT SENDS DATA BACK.
+#
+# Phases 1-3 of the recv_dual ladder went green, but every one of them had
+# tie_off_tcp_tx on both halves: the stack's TX path was never exercised. This
+# kernel is phase 3 with pp_echo replacing recvData on half a -- nothing else
+# changed, so a failure points at TX and at pp_echo, not at the scheme.
+#
+# WHAT RUNS WHERE
+#
+#   half a (QSFP0, cable IS connected)     pp_listen + pp_echo
+#   half b (QSFP1, cable NOT connected)    listenPorts + recvData, as in phase 3
+#
+# Half b is kept only to stay one step away from the green phase: remove it and
+# a failure would need a separate run to rule it out.
+#
+# THREE TELEMETRY SCALARS, AND WHY EXACTLY THREE
+#
+# dual_echo cost a week because it went silent and there was no way to see
+# WHERE it stopped. ppState fixes that -- it is not a hypothesis, it is the
+# FSM's own state read straight out:
+#
+#   0 NOTIFY   no notification arrived -> the stack never told us about data
+#   1 META     read request sent, rx_meta never came
+#   2 RX       reading words, last never arrived
+#   3 REQ      tx_meta written this pass (transient, rarely seen)
+#   4 STATUS   waiting for tx_status -- the stack did not answer tx_meta
+#   5 TX       pushing words out
+#
+# A kernel doing its job cycles NOTIFY->...->TX and parks in NOTIFY between
+# messages. Parked anywhere else = that step is where it stopped.
+#
+# REGISTER OFFSETS ARE NOT GUESSED.
+#
+# The scalar order in the .cpp signature decides them, and HLS emits the map
+# into xhls_pp_dual_krnl_hw.h. pp_dual_offsets reads that file. Hardcoding
+# them from the recv_dual map would be wrong: this kernel has three extra
+# scalars, so everything after expectedRxByteCnt shifts.
+# -----------------------------------------------------------------------------
+
+# Offsets of useConn/basePort/expectedRxByteCnt match recv_dual: same first
+# three scalars, in the same order. Verified against the recv_dual map.
+set ::PP_OFF_AP_CTRL   0x00
+set ::PP_OFF_USECONN   0x10
+set ::PP_OFF_BASEPORT  0x18
+set ::PP_OFF_RXBYTES   0x20
+
+# Telemetry offsets: filled by pp_dual_offsets from the generated header.
+# Deliberately left as -1 so a forgotten call fails loudly instead of reading
+# a plausible-looking wrong register.
+set ::PP_OFF_PORTSTATE  -1
+set ::PP_OFF_PPSTATE    -1
+set ::PP_OFF_NOTIFY     -1
+
+# Reads the HLS-generated register map. Run once per session before dumping
+# telemetry; bringup calls it itself.
+proc pp_dual_offsets {} {
+     set root [file normalize [file join [file dirname [info script]] .. ..]]
+     set pat "$root/kernel/user_krnl/hls_pp_dual_krnl/src/hls/hls_pp_dual_krnl_ip_proj/*/syn/verilog/../../*_hw.h"
+     set hits [glob -nocomplain $pat]
+     if {[llength $hits] == 0} {
+          # second place Vitis puts it
+          set hits [glob -nocomplain \
+               "$root/kernel/user_krnl/hls_pp_dual_krnl/src/hls/hls_pp_dual_krnl_ip_proj/*/impl/ip/drivers/*/src/*_hw.h"]
+     }
+     if {[llength $hits] == 0} {
+          puts "*** xhls_pp_dual_krnl_hw.h not found."
+          puts "    Telemetry offsets stay unset; portState/ppState/notifyCount"
+          puts "    cannot be read. Find the file and pass offsets by hand:"
+          puts "      set ::PP_OFF_PORTSTATE 0x28   (example)"
+          puts "    Looked under kernel/user_krnl/hls_pp_dual_krnl/src/hls/"
+          return 0
+     }
+     set hdr [lindex $hits 0]
+     puts "register map: [file tail $hdr]"
+     set fh [open $hdr r]
+     set txt [read $fh]
+     close $fh
+     set found 0
+     foreach {name var} {portState PP_OFF_PORTSTATE ppState PP_OFF_PPSTATE \
+                         notifyCount PP_OFF_NOTIFY} {
+          # matches lines like: #define XHLS_PP_DUAL_KRNL_CONTROL_ADDR_PORTSTATE_DATA 0x28
+          set up [string toupper $name]
+          if {[regexp -line "ADDR_${up}_DATA\\s+(0x\[0-9a-fA-F\]+)" $txt -> off]} {
+               set ::$var $off
+               puts [format "  %-12s %s" $name $off]
+               incr found
+          } else {
+               puts "  $name  NOT FOUND in header"
+          }
+     }
+     return $found
+}
+
+# One scalar, or a clear marker when its offset is unknown.
+proc _pp_read {label var {n 1}} {
+     set off [set ::$var]
+     if {$off == -1} {
+          puts [format "  %-12s -- offset unknown (run pp_dual_offsets)" $label]
+          return -1
+     }
+     set v [axi_read32 [expr {[ouch_base_user $n] + $off}]]
+     puts [format "  %-12s %d" $label $v]
+     return $v
+}
+
+proc _pp_state_name {v} {
+     switch -- $v {
+          0 {return "NOTIFY  (no notification arrived)"}
+          1 {return "META    (read request sent, rx_meta missing)"}
+          2 {return "RX      (reading words, last missing)"}
+          3 {return "REQ     (writing tx_meta)"}
+          4 {return "STATUS  (waiting for tx_status)"}
+          5 {return "TX      (pushing words out)"}
+          default {return "?? unexpected value"}
+     }
+}
+
+# -----------------------------------------------------------------------------
+# pp_dual_bringup -- everything the board needs, one command
+# -----------------------------------------------------------------------------
+#
+# Half a gets the cable, half b does not. Both stacks are started anyway: the
+# kernel is ONE instance wired to both, and an unstarted stack backpressures
+# its half of the region.
+proc pp_dual_bringup {{ip_str_a 0a01d499} {mac_str_a 02aa00000001} \
+                      {ip_str_b c0a80a14} {mac_str_b 02bb00000002} \
+                      {basePort 7001}} {
+     puts "=== hls_pp_dual_krnl bringup: ECHO on half a (QSFP0) ==="
+     puts ""
+     pp_dual_offsets
+     puts ""
+     puts "--- channel 1 (QSFP0, CABLE HERE): stack up ---"
+     echo_bringup $ip_str_a $mac_str_a 1
+     puts ""
+     puts "--- channel 2 (QSFP1, no cable): stack up as in phase 3 ---"
+     echo_bringup $ip_str_b $mac_str_b 2
+     puts ""
+     puts "--- kernel: ONE instance, both halves ---"
+     set base [ouch_base_user 1]
+     axi_write32 [expr {$base + $::PP_OFF_USECONN}]  1
+     axi_write32 [expr {$base + $::PP_OFF_BASEPORT}] $basePort
+     axi_write32 [expr {$base + $::PP_OFF_RXBYTES}]  1000000
+     set rd_conn [axi_read32 [expr {$base + $::PP_OFF_USECONN}]]
+     set rd_port [axi_read32 [expr {$base + $::PP_OFF_BASEPORT}]]
+     puts "pp_dual: useConn=$rd_conn basePort=$rd_port"
+     if {$rd_conn != 1 || $rd_port != $basePort} {
+          puts "  *** WRITE NOT CONFIRMED -- wrong base address or bitstream"
+          return 0
+     }
+     puts "  write confirmed"
+     axi_write32 [expr {$base + $::PP_OFF_AP_CTRL}] 0x81
+     puts ""
+     pp_dual_status
+     puts ""
+     puts "=== NEXT, FROM THE PC ==="
+     puts ""
+     puts "  1. start the capture BEFORE sending -- it is the only source of"
+     puts "     truth that does not depend on our own telemetry:"
+     puts "       sudo tcpdump -i <iface> -ttt -w pp.pcap 'tcp port $basePort'"
+     puts ""
+     puts "  2. send something small and recognisable:"
+     puts "       ncat [_de_dotted $ip_str_a] $basePort"
+     puts "     then type a line and press enter -- it must come back echoed."
+     puts ""
+     puts "  3. read the counters back here:"
+     puts "       pp_dual_dump"
+     puts ""
+     puts "WHAT THE OUTCOMES MEAN"
+     puts "  line echoes back      -> ECHO WORKS. The stack's TX path works and"
+     puts "                           a latency probe is worth building."
+     puts "  connects, no echo     -> read ppState: it names the exact step"
+     puts "  connection refused    -> listen never opened; portState says which"
+     puts "  no SYN-ACK at all     -> same silence as dual_echo, and now with"
+     puts "                           portState/ppState to tell them apart"
+     return 1
+}
+
+proc pp_dual_status {{n 1}} {
+     set ctrl [axi_read32 [expr {[ouch_base_user $n] + $::PP_OFF_AP_CTRL}]]
+     puts [format "pp_dual: ap_ctrl=0x%02x (ap_start=%d ap_done=%d ap_idle=%d auto_restart=%d)" \
+               $ctrl [expr {$ctrl & 1}] [expr {($ctrl >> 1) & 1}] \
+               [expr {($ctrl >> 2) & 1}] [expr {($ctrl >> 7) & 1}]]
+     if {($ctrl & 1) == 0} {
+          puts "  -> ap_start cleared: the kernel finished and did not restart."
+     }
+     return $ctrl
+}
+
+# -----------------------------------------------------------------------------
+# pp_dual_dump -- read everything, then say what it means
+# -----------------------------------------------------------------------------
+proc pp_dual_dump {{n 1}} {
+     if {$::PP_OFF_PPSTATE == -1} { pp_dual_offsets ; puts "" }
+     puts "=== pp_dual telemetry ==="
+     pp_dual_status $n
+     puts ""
+     set ps [_pp_read portState   PP_OFF_PORTSTATE $n]
+     set st [_pp_read ppState     PP_OFF_PPSTATE   $n]
+     set nc [_pp_read notifyCount PP_OFF_NOTIFY    $n]
+     puts ""
+     if {$ps != -1} {
+          switch -- $ps {
+               0 {puts "portState 0: listen was never requested. The stage is not"
+                  puts "  running at all -- look at ap_ctrl, not at the stack."}
+               1 {puts "portState 1: request sent, the stack never confirmed."
+                  puts "  Compare with recv_dual: there it reached 2."}
+               2 {puts "portState 2: PORT IS OPEN. Silence on SYN is not a listen"
+                  puts "  problem."}
+               default {puts "portState $ps: unexpected -- the register map may be wrong"}
+          }
+     }
+     puts ""
+     if {$st != -1} {
+          puts "ppState $st = [_pp_state_name $st]"
+          puts ""
+          switch -- $st {
+               0 {puts "  Parked in NOTIFY. Either nothing was sent, or the stack"
+                  puts "  never raised a notification. notifyCount = $nc tells which:"
+                  puts "    0     -> no data ever reached the kernel"
+                  puts "    >0    -> data DID arrive and a full cycle completed;"
+                  puts "             NOTIFY is the correct resting state."}
+               1 {puts "  Stuck in META: read request went out, rx_meta never came."
+                  puts "  That is the stack owing us a response -- the same shape of"
+                  puts "  failure as a lookup miss."}
+               2 {puts "  Stuck in RX: words are coming but tlast never arrived, or"
+                  puts "  the stream dried up mid-message."}
+               3 {puts "  Sitting in REQ. It should pass through in one cycle, so"
+                  puts "  seeing it means tx_meta cannot be written -- the stream is"
+                  puts "  full and nobody drains it."}
+               4 {puts "  STUCK IN STATUS -- the stack did not answer tx_meta."
+                  puts "  This is the interesting one: it means the TX path was"
+                  puts "  reached and did not respond. tasi_metaLoader answers EVERY"
+                  puts "  tx_meta, so silence here points at the session state, not"
+                  puts "  at our code."}
+               5 {puts "  Stuck in TX: words are not being accepted. tx_data has"
+                  puts "  backpressure that never lifts."}
+          }
+     }
+     puts ""
+     if {$nc == -1} {
+          puts "notifyCount unreadable -- offsets unknown, see above."
+     } elseif {$nc == 0} {
+          puts "notifyCount 0: no data ever reached the kernel. Check the capture"
+          puts "  first -- the packet may not have left the PC at all."
+     } else {
+          puts "notifyCount $nc: that many notifications reached the kernel, so"
+          puts "  data did arrive and the RX side of the stack works."
+     }
+}
