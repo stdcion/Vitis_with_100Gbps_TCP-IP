@@ -27,4 +27,4 @@ ls -lh bin/
 echo
 echo "Копировать на машину у платы: bin/ppclient.exe"
 echo "Запуск (Windows, cmd или powershell):"
-echo "  ppclient.exe -host 10.1.212.153 -port 7001 -bytes 64 -count 100000 -csv rtt.csv"
+echo "  ppclient.exe -host 192.168.10.10 -port 7001 -bytes 64 -count 100000 -csv rtt.csv"
