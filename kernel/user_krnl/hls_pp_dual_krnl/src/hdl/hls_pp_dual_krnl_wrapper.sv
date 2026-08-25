@@ -448,174 +448,142 @@ lat_fifo u_fifo (
      .empty(fifo_empty), .full(fifo_full)
 );
 
-// ── AXI-Lite: наши регистры поверх регистров ядра ───────────────────────────
+// ── AXI-Lite: ОДИН автомат, разделение ПОСЛЕ рукопожатия ────────────────────
 //
-// РАЗДЕЛЕНИЕ ПО АДРЕСУ. Ядро (HLS) занимает 0x00..0x5F -- см.
-// xhls_pp_dual_krnl_hw.h. Наши регистры ставим с 0x100, с запасом: если у
-// ядра появятся новые скаляры, карта не наедет.
+// ТРИ ДЕФЕКТА ПЕРВОЙ ВЕРСИИ, И ВСЕ ОТ ОДНОЙ ОШИБКИ -- решать, кому адрес,
+// ДО того как адрес захвачен:
 //
-//   0x100  R   fifo_rd_data   текущее слово FIFO (чтение НЕ сдвигает)
-//   0x104  W   fifo_pop       запись любого значения -- сдвинуть указатель
-//   0x108  R   fifo_count     слов в FIFO (измерений = /4)
-//   0x10c  R   fifo_overflow  потеряно измерений из-за полного FIFO
-//   0x110  RW  min_words      порог длины кадра для фильтра
-//   0x114  R   nf_cnt_rx      кадров прошло фильтр на RX
-//   0x118  R   nf_drp_rx      отсеяно на RX
-//   0x11c  R   nf_cnt_tx      прошло на TX
-//   0x120  R   nf_drp_tx      отсеяно на TX
-//   0x124  R   meas_dropped   измерений порвалось на полпути
-//   0x128  W   fifo_clear     запись -- очистить FIFO (overflow не трогает)
+//   1. awready зависел от awaddr, а тот действителен ТОЛЬКО при awvalid.
+//      До рукопожатия на шине мусор, и awready дребезжал между нашим
+//      состоянием и k_awready ядра. Мастер мог увидеть готовность, подать
+//      адрес -- и адрес уйти не туда. Правило нарушено прямо: zipcpu,
+//      "The most common AXI mistake" -- условия приёма не должны зависеть
+//      ни от чего, кроме VALID и READY.
 //
-// ПОЧЕМУ ЧТЕНИЕ НЕ СДВИГАЕТ УКАЗАТЕЛЬ. Read-to-pop экономил бы одну
-// транзакцию на слово, но делал бы чтение разрушающим: любой повторный
-// доступ (а Vivado при отладке читает регистры сам) съедал бы данные. Явный
-// pop дороже, зато не теряет.
-localparam logic [11:0] A_RD       = 12'h100;
-localparam logic [11:0] A_POP      = 12'h104;
-localparam logic [11:0] A_COUNT    = 12'h108;
-localparam logic [11:0] A_OVF      = 12'h10c;
-localparam logic [11:0] A_MINWORDS = 12'h110;
-localparam logic [11:0] A_CNT_RX   = 12'h114;
-localparam logic [11:0] A_DRP_RX   = 12'h118;
-localparam logic [11:0] A_CNT_TX   = 12'h11c;
-localparam logic [11:0] A_DRP_TX   = 12'h120;
-localparam logic [11:0] A_MEAS_DRP = 12'h124;
-localparam logic [11:0] A_CLEAR    = 12'h128;
+//   2. awready поднимался сразу после приёма данных, не дожидаясь bready.
+//      pp_raw делает четыре записи POP подряд -- два ответа схлопывались,
+//      хост ждал bvalid вечно, JTAG висел. Спецификация: слейв НЕ готов
+//      принимать новый адрес, пока BVALID высокий и BREADY низкий.
+//
+//   3. К ядру шли awaddr[5:0] -- шесть бит, а карта ядра доходит до 0x50.
+//      Регистры с 0x40 читались бы как 0x00: ppState вернул бы ap_ctrl.
+//      Самый тихий из трёх: всё отвечает, числа неверные.
+//
+// РЕШЕНИЕ: рукопожатие делает ОДИН автомат, ничего не зная про адрес.
+// Адрес защёлкивается по aw_hs, и только потом решается, кому данные --
+// нам или ядру. Форма автомата -- как в network_control_s_axi.sv, который
+// работает на этой плате (ADDR_BITS=7, три состояния записи, два чтения).
 
-// Наш диапазон -- всё, что от 0x100. Ниже отдаём ядру.
-wire aw_ours = s_axi_control_awaddr[11:8] != 4'h0;
-wire ar_ours = s_axi_control_araddr[11:8] != 4'h0;
+// ── регистры управления, доступные хосту ────────────────────────────────────
+logic [31:0] min_words_r = 32'd2;   // порог фильтра, по умолчанию 2 слова
+logic        fifo_clear;
+logic        fifo_pop;
 
-// ── запись: автомат из ТРЁХ состояний, как в эталоне ────────────────────────
-//
-// ФОРМА ВЗЯТА ИЗ dual_echo_control_s_axi.v -- обёртки, которая РАБОТАЛА на
-// этой плате (удалена в 9dd815a, когда ядро перешло на s_axilite). Там
-// автомат записи имеет три состояния:
-//
-//     WRIDLE  ждём адрес     AWREADY=1
-//     WRDATA  ждём данные    WREADY=1
-//     WRRESP  отдаём ответ   BVALID=1, новый адрес НЕ принимаем
-//
-// ПЕРВАЯ ВЕРСИЯ ЗДЕСЬ ВИСЛА, И ЭТО НАШЛОСЬ СРАВНЕНИЕМ С ЭТАЛОНОМ. Она
-// поднимала bvalid отдельным регистром, а awready возвращала сразу после
-// приёма данных -- то есть принимала СЛЕДУЮЩУЮ запись, не отдав ответ на
-// предыдущую. Два ответа схлопывались в один, хост ждал второй bvalid вечно.
-//
-// Для pp_raw это было бы фатально: она делает ЧЕТЫРЕ записи POP подряд на
-// каждое измерение, ровно тот сценарий. JTAG-транзакция повисла бы на первом
-// же измерении, и выглядело бы это как "плата не отвечает" -- то есть
-// неотличимо от мёртвого битстрима.
+// АДРЕСНАЯ КАРТА. У ядра 0x00..0x50 (сборка 25.08, xhls_pp_dual_krnl_hw.h).
+// Наши регистры с 0x80: адрес умещается в 8 бит, ADDR_BITS=8 против 7 у
+// network_krnl -- разница ровно в этом бите, он и различает.
+localparam integer ADDR_BITS = 8;
+localparam logic [ADDR_BITS-1:0] A_RD       = 8'h80;
+localparam logic [ADDR_BITS-1:0] A_POP      = 8'h84;
+localparam logic [ADDR_BITS-1:0] A_COUNT    = 8'h88;
+localparam logic [ADDR_BITS-1:0] A_OVF      = 8'h8c;
+localparam logic [ADDR_BITS-1:0] A_MINWORDS = 8'h90;
+localparam logic [ADDR_BITS-1:0] A_CNT_RX   = 8'h94;
+localparam logic [ADDR_BITS-1:0] A_DRP_RX   = 8'h98;
+localparam logic [ADDR_BITS-1:0] A_CNT_TX   = 8'h9c;
+localparam logic [ADDR_BITS-1:0] A_DRP_TX   = 8'ha0;
+localparam logic [ADDR_BITS-1:0] A_MEAS_DRP = 8'ha4;
+localparam logic [ADDR_BITS-1:0] A_CLEAR    = 8'ha8;
+
+// ── запись: три состояния, как в network_control_s_axi ──────────────────────
 typedef enum logic [1:0] {WRIDLE, WRDATA, WRRESP} wstate_t;
 wstate_t wstate = WRIDLE;
-logic [11:0] wr_addr;
+logic [ADDR_BITS-1:0] waddr;
+
+// ГОТОВНОСТЬ ЗАВИСИТ ТОЛЬКО ОТ СОСТОЯНИЯ. Ни awaddr, ни k_awready здесь
+// нет -- иначе вернулись бы дефекты 1 и 2.
+wire aw_hs = s_axi_control_awvalid & (wstate == WRIDLE);
+wire w_hs  = s_axi_control_wvalid  & (wstate == WRDATA);
+wire b_hs  = s_axi_control_bready  & (wstate == WRRESP);
+
+// Кому адресована ЗАХВАЧЕННАЯ запись. Читается из waddr, который уже
+// защёлкнут -- то есть после рукопожатия, когда адрес действителен.
+wire wr_ours = (waddr >= A_RD);
 
 always_ff @(posedge ap_clk) begin
      if (~ap_rst_n) begin
           wstate      <= WRIDLE;
-          wr_addr     <= 12'b0;
+          waddr       <= {ADDR_BITS{1'b0}};
           fifo_pop    <= 1'b0;
           fifo_clear  <= 1'b0;
           min_words_r <= 32'd2;
      end else begin
-          fifo_pop   <= 1'b0;      // стробы на один такт
+          fifo_pop   <= 1'b0;      // стробы ровно на один такт
           fifo_clear <= 1'b0;
 
+          if (aw_hs) waddr <= s_axi_control_awaddr[ADDR_BITS-1:0];
+
           case (wstate)
-          WRIDLE:
-               if (s_axi_control_awvalid && aw_ours) begin
-                    wr_addr <= s_axi_control_awaddr;
-                    wstate  <= WRDATA;
-               end
-
-          WRDATA:
-               if (s_axi_control_wvalid) begin
-                    case (wr_addr)
-                    A_POP:      fifo_pop    <= 1'b1;
-                    A_CLEAR:    fifo_clear  <= 1'b1;
-                    A_MINWORDS: min_words_r <= s_axi_control_wdata;
-                    default: ;   // запись в R-регистр игнорируется молча
-                    endcase
-                    wstate <= WRRESP;
-               end
-
-          WRRESP:
-               // Ответ отдан -- только теперь готовы к новому адресу.
-               if (s_axi_control_bready)
-                    wstate <= WRIDLE;
+          WRIDLE:  if (aw_hs) wstate <= WRDATA;
+          WRDATA:  if (w_hs) begin
+                        if (wr_ours) begin
+                             case (waddr)
+                             A_POP:      fifo_pop    <= 1'b1;
+                             A_CLEAR:    fifo_clear  <= 1'b1;
+                             A_MINWORDS: min_words_r <= s_axi_control_wdata;
+                             default: ;  // запись в R-регистр игнорируется
+                             endcase
+                        end
+                        wstate <= WRRESP;
+                   end
+          WRRESP:  if (b_hs) wstate <= WRIDLE;
           endcase
      end
 end
 
-// ── чтение ──
-logic [31:0] rd_data_r;
-logic        rd_valid_r;
+// ── чтение: два состояния ───────────────────────────────────────────────────
+typedef enum logic [0:0] {RDIDLE, RDDATA} rstate_t;
+rstate_t rstate = RDIDLE;
+logic [ADDR_BITS-1:0] raddr;
+logic [31:0] our_rdata;
+
+wire ar_hs = s_axi_control_arvalid & (rstate == RDIDLE);
+wire r_hs  = s_axi_control_rready  & (rstate == RDDATA);
+wire rd_ours = (raddr >= A_RD);
+
 always_ff @(posedge ap_clk) begin
      if (~ap_rst_n) begin
-          rd_data_r  <= 32'b0;
-          rd_valid_r <= 1'b0;
+          rstate    <= RDIDLE;
+          raddr     <= {ADDR_BITS{1'b0}};
+          our_rdata <= 32'b0;
      end else begin
-          if (s_axi_control_arvalid && ar_ours && !rd_valid_r) begin
-               rd_valid_r <= 1'b1;
-               case (s_axi_control_araddr)
-               A_RD:       rd_data_r <= fifo_rd_data;
-               A_COUNT:    rd_data_r <= fifo_count;
-               A_OVF:      rd_data_r <= fifo_overflow;
-               A_MINWORDS: rd_data_r <= min_words_r;
-               A_CNT_RX:   rd_data_r <= nf_cnt_rx;
-               A_DRP_RX:   rd_data_r <= nf_drp_rx;
-               A_CNT_TX:   rd_data_r <= nf_cnt_tx;
-               A_DRP_TX:   rd_data_r <= nf_drp_tx;
-               A_MEAS_DRP: rd_data_r <= meas_dropped;
-               // Неописанный адрес в нашем диапазоне -- ЯВНЫЙ МАРКЕР, а не
+          if (ar_hs) begin
+               raddr <= s_axi_control_araddr[ADDR_BITS-1:0];
+               // Защёлкиваем значение в том же такте, что и адрес: к моменту
+               // RDDATA оно готово, лишнего такта не нужно.
+               case (s_axi_control_araddr[ADDR_BITS-1:0])
+               A_RD:       our_rdata <= fifo_rd_data;
+               A_COUNT:    our_rdata <= fifo_count;
+               A_OVF:      our_rdata <= fifo_overflow;
+               A_MINWORDS: our_rdata <= min_words_r;
+               A_CNT_RX:   our_rdata <= nf_cnt_rx;
+               A_DRP_RX:   our_rdata <= nf_drp_rx;
+               A_CNT_TX:   our_rdata <= nf_cnt_tx;
+               A_DRP_TX:   our_rdata <= nf_drp_tx;
+               A_MEAS_DRP: our_rdata <= meas_dropped;
+               // Неописанный адрес в НАШЕМ диапазоне -- явный маркер, а не
                // нуль: нуль читался бы как "счётчик пуст", то есть
-               // правдоподобно и неверно (defaults-that-fail-loudly).
-               default:    rd_data_r <= 32'hBADA_DDR5;
+               // правдоподобно и неверно.
+               default:    our_rdata <= 32'hBADA_DDR5;
                endcase
-          end else if (rd_valid_r && s_axi_control_rready) begin
-               rd_valid_r <= 1'b0;
           end
+
+          case (rstate)
+          RDIDLE: if (ar_hs) rstate <= RDDATA;
+          RDDATA: if (r_hs)  rstate <= RDIDLE;
+          endcase
      end
 end
-
-// ── арбитраж AXI-Lite: 0x000..0x0FF ядру, 0x100+ нам ────────────────────────
-//
-// РАЗДЕЛЕНИЕ ПО СТАРШИМ БИТАМ АДРЕСА, без декодера диапазонов. У ядра карта
-// 0x00..0x50 (xhls_pp_dual_krnl_hw.h), у нас с 0x100 -- значит достаточно
-// проверить addr[11:8]: ноль -- ядро, иначе мы. Запас в четыре с лишним раза,
-// так что новые скаляры ядра карту не сдвинут.
-//
-// ПОЧЕМУ НЕ ОДИН smartconnect В BD. Он потребовал бы второй AXI-Lite порт у
-// обёртки и правки build_bd.tcl -- скрипта, на котором держатся все ядра
-// репозитория. Здесь мультиплекс на десяток строк и ничего снаружи не
-// меняется: BD видит один s_axi_control, как у любого HLS-ядра.
-
-// Сигналы к control_s_axi ядра: пропускаем только свой диапазон.
-wire k_awvalid = s_axi_control_awvalid & ~aw_ours;
-wire k_wvalid  = s_axi_control_wvalid  & ~aw_ours;
-wire k_arvalid = s_axi_control_arvalid & ~ar_ours;
-wire k_bready  = s_axi_control_bready  & ~aw_ours;
-wire k_rready  = s_axi_control_rready  & ~ar_ours;
-
-wire        k_awready, k_wready, k_bvalid, k_arready, k_rvalid;
-wire [1:0]  k_bresp, k_rresp;
-wire [31:0] k_rdata;
-wire        k_interrupt;
-
-// Ответы мультиплексируем по тому же признаку. Наш путь -- регистры выше.
-assign s_axi_control_awready = aw_ours ? (wstate == WRIDLE) : k_awready;
-assign s_axi_control_wready  = aw_ours ? (wstate == WRDATA) : k_wready;
-assign s_axi_control_arready = ar_ours ? !rd_valid_r  : k_arready;
-
-// bvalid берётся из состояния автомата, а не отдельного регистра -- так
-// невозможно принять новый адрес, не отдав предыдущий ответ.
-wire our_bvalid = (wstate == WRRESP);
-
-assign s_axi_control_bvalid = our_bvalid | k_bvalid;
-assign s_axi_control_bresp  = our_bvalid ? 2'b00 : k_bresp;
-assign s_axi_control_rvalid = rd_valid_r | k_rvalid;
-assign s_axi_control_rdata  = rd_valid_r ? rd_data_r : k_rdata;
-assign s_axi_control_rresp  = rd_valid_r ? 2'b00    : k_rresp;
-assign interrupt            = k_interrupt;
 
 // ── инстанс HLS-ядра ────────────────────────────────────────────────────────
 //
@@ -788,24 +756,34 @@ hls_pp_dual_krnl_ip u_krnl (
      .s_axis_tcp_tx_status_b_TLAST  ( s_axis_tcp_tx_status_b_tlast  ),
 
      // AXI-Lite ядра: только свой диапазон адресов.
-     .s_axi_control_AWADDR  ( s_axi_control_awaddr[5:0] ),
-     .s_axi_control_AWVALID ( k_awvalid                 ),
-     .s_axi_control_AWREADY ( k_awready                 ),
-     .s_axi_control_WDATA   ( s_axi_control_wdata       ),
-     .s_axi_control_WSTRB   ( s_axi_control_wstrb       ),
-     .s_axi_control_WVALID  ( k_wvalid                  ),
-     .s_axi_control_WREADY  ( k_wready                  ),
-     .s_axi_control_BRESP   ( k_bresp                   ),
-     .s_axi_control_BVALID  ( k_bvalid                  ),
-     .s_axi_control_BREADY  ( k_bready                  ),
-     .s_axi_control_ARADDR  ( s_axi_control_araddr[5:0] ),
-     .s_axi_control_ARVALID ( k_arvalid                 ),
-     .s_axi_control_ARREADY ( k_arready                 ),
-     .s_axi_control_RDATA   ( k_rdata                   ),
-     .s_axi_control_RRESP   ( k_rresp                   ),
-     .s_axi_control_RVALID  ( k_rvalid                  ),
-     .s_axi_control_RREADY  ( k_rready                  ),
-     .interrupt             ( k_interrupt               )
+     // ШИРИНА АДРЕСА -- ПОЛНАЯ, а не [5:0]. Первая версия резала до шести
+     // бит, а карта ядра доходит до 0x50: регистры с 0x40 читались бы как
+     // 0x00, то есть ppState возвращал бы ap_ctrl. Дефект тихий -- всё
+     // отвечает, числа неверные. Сколько бит у порта на самом деле, знает
+     // сгенерированный IP; передаём весь адрес, лишнее Vivado обрежет по
+     // объявленной ширине -- и предупредит, если не хватит.
+     .s_axi_control_AWADDR  ( s_axi_control_awaddr ),
+     .s_axi_control_AWVALID ( k_awvalid            ),
+     .s_axi_control_AWREADY ( k_awready            ),
+     .s_axi_control_WDATA   ( s_axi_control_wdata  ),
+     .s_axi_control_WSTRB   ( s_axi_control_wstrb  ),
+     .s_axi_control_WVALID  ( k_wvalid             ),
+     .s_axi_control_WREADY  ( k_wready             ),
+     .s_axi_control_BRESP   ( k_bresp              ),
+     .s_axi_control_BVALID  ( k_bvalid             ),
+     // BREADY и RREADY ядру -- ПОСТОЯННАЯ ЕДИНИЦА. Его ответы наружу не
+     // идут (хосту отвечает наш автомат), но канал нельзя оставить
+     // висящим: иначе control_s_axi ядра застрянет в WRRESP и следующую
+     // запись не примет.
+     .s_axi_control_BREADY  ( 1'b1                 ),
+     .s_axi_control_ARADDR  ( s_axi_control_araddr ),
+     .s_axi_control_ARVALID ( k_arvalid            ),
+     .s_axi_control_ARREADY ( k_arready            ),
+     .s_axi_control_RDATA   ( k_rdata              ),
+     .s_axi_control_RRESP   ( k_rresp              ),
+     .s_axi_control_RVALID  ( k_rvalid             ),
+     .s_axi_control_RREADY  ( 1'b1                 ),
+     .interrupt             ( k_interrupt          )
 );
 
 endmodule

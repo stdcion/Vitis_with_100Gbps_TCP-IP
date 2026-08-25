@@ -60,7 +60,7 @@
 # result, so this is just the same formula. Channel N=1 is QSFP0, N=2 is
 # QSFP1, and so on. If you change this, change it in both files.
 proc ouch_base_network {{n 1}} { return [expr {($n - 1) * 0x20000}] }
-proc ouch_base_user    {{n 1}} { return [expr {($n - 1) * 0x20000 + 0x10000}] }
+proc ouch_base_user    {{n 1}} { return [expr {($n - 1) * 0x20000 + 0x8000}] }
 
 # Kept for backwards compatibility with older single-channel (N=1) calls --
 # new code should use ouch_base_network N / ouch_base_user N.
@@ -2644,17 +2644,17 @@ proc pp_dual_dump {{n 1}} {
 # If a value here disagrees with the wrapper, every reading is wrong while
 # looking plausible. Cross-check: package_hls_pp_dual_krnl.tcl prints the same
 # map at the end of the pack step.
-set ::PP_OFF_FIFO_RD    0x100
-set ::PP_OFF_FIFO_POP   0x104
-set ::PP_OFF_FIFO_COUNT 0x108
-set ::PP_OFF_FIFO_OVF   0x10c
-set ::PP_OFF_MINWORDS   0x110
-set ::PP_OFF_NF_CNT_RX  0x114
-set ::PP_OFF_NF_DRP_RX  0x118
-set ::PP_OFF_NF_CNT_TX  0x11c
-set ::PP_OFF_NF_DRP_TX  0x120
-set ::PP_OFF_MEAS_DRP   0x124
-set ::PP_OFF_FIFO_CLEAR 0x128
+set ::PP_OFF_FIFO_RD    0x80
+set ::PP_OFF_FIFO_POP   0x84
+set ::PP_OFF_FIFO_COUNT 0x88
+set ::PP_OFF_FIFO_OVF   0x8c
+set ::PP_OFF_MINWORDS   0x90
+set ::PP_OFF_NF_CNT_RX  0x94
+set ::PP_OFF_NF_DRP_RX  0x98
+set ::PP_OFF_NF_CNT_TX  0x9c
+set ::PP_OFF_NF_DRP_TX  0xa0
+set ::PP_OFF_MEAS_DRP   0xa4
+set ::PP_OFF_FIFO_CLEAR 0xa8
 
 # One clock at 165 MHz. Same constant as EPD_CLK_NS -- kept separate so that
 # retuning one kernel does not silently change the other's numbers.
