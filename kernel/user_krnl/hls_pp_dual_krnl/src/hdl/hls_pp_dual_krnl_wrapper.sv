@@ -290,16 +290,16 @@ assign s_axis_net_tx_a_tready = m_axis_net_tx_a_tready;
 // 32 бита при 165 МГц -- 26 секунд до переполнения. Разность 32-битных
 // значений верна и через переход, поэтому сбрасывать не нужно и переполнение
 // не мешает: (T1 - T2) считается по модулю 2^32.
-logic [31:0] cycle_counter = 32'b0;
-always_ff @(posedge ap_clk) begin
+reg [31:0] cycle_counter = 32'b0;
+always @(posedge ap_clk) begin
      if (~ap_rst_n) cycle_counter <= 32'b0;
      else           cycle_counter <= cycle_counter + 32'd1;
 end
 
 // ── регистры управления, доступные хосту ────────────────────────────────────
-logic [31:0] min_words_r = 32'd2;   // порог фильтра, по умолчанию 2 слова
-logic        fifo_clear;
-logic        fifo_pop;
+reg [31:0] min_words_r = 32'd2;   // порог фильтра, по умолчанию 2 слова
+reg        fifo_clear;
+reg        fifo_pop;
 
 // ── фильтр «наш кадр» на обеих точках axis_net ──────────────────────────────
 //
@@ -359,14 +359,23 @@ wire strobe_t1 = m_axis_tcp_tx_data_tvalid & m_axis_tcp_tx_data_tready
 //     (старое измерение потеряно, и это честнее склейки);
 //   * t1/T1 без предшествующего T2 -- метка от пакета, чей T2 мы пропустили
 //     (например, фильтр его не узнал). Игнорируем.
-typedef enum logic [1:0] {WAIT_T2, WAIT_t2, WAIT_t1, WAIT_T1} pp_state_t;
-pp_state_t st = WAIT_T2;
+// БЕЗ typedef enum -- localparam, как в обёртке probe и в
+// network_control_s_axi.sv. Причина: прогон pack 25.08 показал, что Vivado не
+// разобрал обёртку и молча упаковал другой модуль. У probe, который через этот
+// путь прошёл, НИ ОДНОГО typedef enum и ни одного always_ff -- только
+// localparam и always @(posedge). Возвращаюсь к проверенной форме, а не
+// выясняю, какая из конструкций виновата.
+localparam [1:0] WAIT_T2 = 2'd0,
+                 WAIT_t2 = 2'd1,
+                 WAIT_t1 = 2'd2,
+                 WAIT_T1 = 2'd3;
+reg [1:0] st = WAIT_T2;
 
-logic [31:0] ts_T2, ts_t2, ts_t1;
-logic        meas_valid;          // строб записи в FIFO
-logic [31:0] meas_dropped;        // сколько измерений порвалось на полпути
+reg [31:0] ts_T2, ts_t2, ts_t1;
+reg        meas_valid;          // строб записи в FIFO
+reg [31:0] meas_dropped;        // сколько измерений порвалось на полпути
 
-always_ff @(posedge ap_clk) begin
+always @(posedge ap_clk) begin
      if (~ap_rst_n) begin
           st           <= WAIT_T2;
           ts_T2        <= 32'b0;
@@ -475,30 +484,34 @@ lat_fifo u_fifo (
 // работает на этой плате (ADDR_BITS=7, три состояния записи, два чтения).
 
 // ── регистры управления, доступные хосту ────────────────────────────────────
-logic [31:0] min_words_r = 32'd2;   // порог фильтра, по умолчанию 2 слова
-logic        fifo_clear;
-logic        fifo_pop;
+reg [31:0] min_words_r = 32'd2;   // порог фильтра, по умолчанию 2 слова
+reg        fifo_clear;
+reg        fifo_pop;
 
 // АДРЕСНАЯ КАРТА. У ядра 0x00..0x50 (сборка 25.08, xhls_pp_dual_krnl_hw.h).
 // Наши регистры с 0x80: адрес умещается в 8 бит, ADDR_BITS=8 против 7 у
 // network_krnl -- разница ровно в этом бите, он и различает.
-localparam integer ADDR_BITS = 8;
-localparam logic [ADDR_BITS-1:0] A_RD       = 8'h80;
-localparam logic [ADDR_BITS-1:0] A_POP      = 8'h84;
-localparam logic [ADDR_BITS-1:0] A_COUNT    = 8'h88;
-localparam logic [ADDR_BITS-1:0] A_OVF      = 8'h8c;
-localparam logic [ADDR_BITS-1:0] A_MINWORDS = 8'h90;
-localparam logic [ADDR_BITS-1:0] A_CNT_RX   = 8'h94;
-localparam logic [ADDR_BITS-1:0] A_DRP_RX   = 8'h98;
-localparam logic [ADDR_BITS-1:0] A_CNT_TX   = 8'h9c;
-localparam logic [ADDR_BITS-1:0] A_DRP_TX   = 8'ha0;
-localparam logic [ADDR_BITS-1:0] A_MEAS_DRP = 8'ha4;
-localparam logic [ADDR_BITS-1:0] A_CLEAR    = 8'ha8;
+// ШИРИНА АДРЕСА -- ЛИТЕРАЛОМ В КАЖДОМ МЕСТЕ, а не через параметр.
+// Та же ловушка, что была в lat_fifo.v: parameter/localparam в размерности
+// порта или константы -- и ipx-парсер не разворачивает выражение, модуль не
+// собирается, а Vivado молча выбирает другой top.
+// 8 бит: у ядра карта до 0x50, наши регистры с 0x80.
+localparam [7:0] A_RD       = 8'h80;
+localparam [7:0] A_POP      = 8'h84;
+localparam [7:0] A_COUNT    = 8'h88;
+localparam [7:0] A_OVF      = 8'h8c;
+localparam [7:0] A_MINWORDS = 8'h90;
+localparam [7:0] A_CNT_RX   = 8'h94;
+localparam [7:0] A_DRP_RX   = 8'h98;
+localparam [7:0] A_CNT_TX   = 8'h9c;
+localparam [7:0] A_DRP_TX   = 8'ha0;
+localparam [7:0] A_MEAS_DRP = 8'ha4;
+localparam [7:0] A_CLEAR    = 8'ha8;
 
 // ── запись: три состояния, как в network_control_s_axi ──────────────────────
-typedef enum logic [1:0] {WRIDLE, WRDATA, WRRESP} wstate_t;
-wstate_t wstate = WRIDLE;
-logic [ADDR_BITS-1:0] waddr;
+localparam [1:0] WRIDLE = 2'd0, WRDATA = 2'd1, WRRESP = 2'd2;
+reg [1:0] wstate = WRIDLE;
+reg [7:0] waddr;
 
 // ГОТОВНОСТЬ ЗАВИСИТ ТОЛЬКО ОТ СОСТОЯНИЯ. Ни awaddr, ни k_awready здесь
 // нет -- иначе вернулись бы дефекты 1 и 2.
@@ -510,10 +523,10 @@ wire b_hs  = s_axi_control_bready  & (wstate == WRRESP);
 // защёлкнут -- то есть после рукопожатия, когда адрес действителен.
 wire wr_ours = (waddr >= A_RD);
 
-always_ff @(posedge ap_clk) begin
+always @(posedge ap_clk) begin
      if (~ap_rst_n) begin
           wstate      <= WRIDLE;
-          waddr       <= {ADDR_BITS{1'b0}};
+          waddr       <= 8'b0;
           fifo_pop    <= 1'b0;
           fifo_clear  <= 1'b0;
           min_words_r <= 32'd2;
@@ -521,7 +534,7 @@ always_ff @(posedge ap_clk) begin
           fifo_pop   <= 1'b0;      // стробы ровно на один такт
           fifo_clear <= 1'b0;
 
-          if (aw_hs) waddr <= s_axi_control_awaddr[ADDR_BITS-1:0];
+          if (aw_hs) waddr <= s_axi_control_awaddr[7:0];
 
           case (wstate)
           WRIDLE:  if (aw_hs) wstate <= WRDATA;
@@ -542,26 +555,26 @@ always_ff @(posedge ap_clk) begin
 end
 
 // ── чтение: два состояния ───────────────────────────────────────────────────
-typedef enum logic [0:0] {RDIDLE, RDDATA} rstate_t;
-rstate_t rstate = RDIDLE;
-logic [ADDR_BITS-1:0] raddr;
-logic [31:0] our_rdata;
+localparam RDIDLE = 1'd0, RDDATA = 1'd1;
+reg rstate = RDIDLE;
+reg [7:0] raddr;
+reg [31:0] our_rdata;
 
 wire ar_hs = s_axi_control_arvalid & (rstate == RDIDLE);
 wire r_hs  = s_axi_control_rready  & (rstate == RDDATA);
 wire rd_ours = (raddr >= A_RD);
 
-always_ff @(posedge ap_clk) begin
+always @(posedge ap_clk) begin
      if (~ap_rst_n) begin
           rstate    <= RDIDLE;
-          raddr     <= {ADDR_BITS{1'b0}};
+          raddr     <= 8'b0;
           our_rdata <= 32'b0;
      end else begin
           if (ar_hs) begin
-               raddr <= s_axi_control_araddr[ADDR_BITS-1:0];
+               raddr <= s_axi_control_araddr[7:0];
                // Защёлкиваем значение в том же такте, что и адрес: к моменту
                // RDDATA оно готово, лишнего такта не нужно.
-               case (s_axi_control_araddr[ADDR_BITS-1:0])
+               case (s_axi_control_araddr[7:0])
                A_RD:       our_rdata <= fifo_rd_data;
                A_COUNT:    our_rdata <= fifo_count;
                A_OVF:      our_rdata <= fifo_overflow;

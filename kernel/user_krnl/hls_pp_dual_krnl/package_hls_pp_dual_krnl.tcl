@@ -109,6 +109,58 @@ puts "output products для ${KRNL}_ip сгенерированы"
 set_property top hls_pp_dual_krnl_wrapper [current_fileset]
 update_compile_order -fileset sources_1
 
+# ── ОБЁРТКА ВООБЩЕ РАЗОБРАНА? ПРОВЕРЯЕМ СРАЗУ, А НЕ В КОНЦЕ ─────────────────
+#
+# Прогон 25.08 упал на проверке axis_net_* с числом 0 -- и это было СЛЕДСТВИЕ,
+# а не причина. Причина: Vivado не смог разобрать обёртку, выбрал другой модуль
+# как top ("a new suitable replacement top will be automatically selected") и
+# упаковал ЕГО. Единственный признак -- CRITICAL WARNING filemgmt 20-742 за
+# двести строк выше, среди сотен других сообщений.
+#
+# Сверка портов при этом ПРОШЛА, потому что читает файл regexp'ом по тексту, а
+# не через элаборацию. То есть она подтвердила, что имена верны, и ничего не
+# знала о том, что модуль не собрался.
+#
+# Здесь спрашиваем Vivado прямо: какой модуль он считает top. Не совпало --
+# останавливаемся и печатаем причину, а не идём дальше упаковывать не тот IP.
+set actual_top [get_property top [current_fileset]]
+if {$actual_top ne "${KRNL}_wrapper"} {
+     puts ""
+     puts "*** Vivado НЕ РАЗОБРАЛ обёртку."
+     puts "    просили top: ${KRNL}_wrapper"
+     puts "    Vivado взял: $actual_top"
+     puts ""
+     puts "    Ищите выше CRITICAL WARNING filemgmt 20-742 и сообщения"
+     puts "    HDL Parser / VRFC про $HDL_DIR/${KRNL}_wrapper.sv."
+     puts ""
+     puts "    Частые причины (проверено на этом проекте):"
+     puts "      * SystemVerilog-конструкции в файле, который Vivado читает"
+     puts "        как Verilog -- проверьте расширение .sv и FILE_TYPE;"
+     puts "      * parameter, из которого выводится localparam, в размерности"
+     puts "        порта или массива (было в lat_fifo.v);"
+     puts "      * использование сигнала до объявления -- синтез это иногда"
+     puts "        прощает, парсер IP нет."
+     puts ""
+     error "top-модуль не тот: $actual_top вместо ${KRNL}_wrapper"
+}
+puts "top-модуль: $actual_top -- обёртка разобрана"
+
+# ── ЯВНАЯ ЭЛАБОРАЦИЯ: показать ошибки парсера, если они есть ────────────────
+#
+# synth_design -rtl тут не годится (см. ниже), но у него есть родственник:
+# check_syntax проверяет весь fileset и печатает ошибки С НОМЕРАМИ СТРОК --
+# ровно то, чего не хватало в прогоне 25.08.
+#
+# Не фатально при отказе: сообщение важнее, чем остановка, потому что дальше
+# проверка top всё равно поймает несобранный модуль.
+if {[catch {check_syntax -fileset sources_1} syn_err]} {
+     puts ""
+     puts "*** check_syntax сообщил об ошибках:"
+     puts "    $syn_err"
+     puts ""
+}
+
+
 # Проверяем, что имена портов в обёртке совпадают с портами HLS-IP.
 #
 # ЗАЧЕМ НЕ synth_design. Сначала здесь стоял `synth_design -rtl`, и он давал
