@@ -1,0 +1,397 @@
+// =============================================================================
+// hls_pp_dual_krnl_wrapper -- четыре врезки времени на половине a
+// =============================================================================
+//
+// ЧТО ИЗМЕРЯЕТ. Четыре точки на пути одного пакета через QSFP0:
+//
+//     T2   кадр пришёл на axis_net_rx_a   край CMAC -> стек
+//     t2   payload дошёл до ядра          rx_data_a.tlast
+//     t1   ядро отдало payload            tx_data_a.tlast
+//     T1   кадр ушёл на axis_net_tx_a     стек -> край CMAC
+//
+// Три интервала, которые из них считаются НА ХОСТЕ, не здесь:
+//
+//     t2 - T2   приём стеком (TOE RX + DDR)
+//     t1 - t2   наше ядро (pp_echo: store-and-forward)
+//     T1 - t1   передача стеком (TOE TX + сегментация + CRC)
+//
+// ПОЧЕМУ ВЫЧИТАНИЕ НА ХОСТЕ. Сырые метки позволяют проверить согласованность:
+// если (t2-T2)+(t1-t2)+(T1-t1) != (T1-T2), значит метки от разных пакетов.
+// С готовыми дельтами такой проверки нет -- их сумма сойдётся всегда. Тот же
+// приём в epd_raw у probe (колонка status с флагом TORN).
+//
+// ОДИН СЧЁТЧИК НА ВСЕ ЧЕТЫРЕ ТОЧКИ. Отдельные счётчики на стадию совпадали бы
+// только при II=1 у всех, а у нас смешанный II, и csim такое не поймал бы.
+// Здесь один cycle_counter в HDL -- см. память shared-timebase-across-dataflow.
+//
+// СТРОБЫ -- tvalid & tready & tlast, НЕ ap_vld. ap_vld срабатывает на ap_done
+// стадии, а не на передаче слова, и метки разъезжались бы невидимо
+// (timestamp-strobes-from-bus-not-ap-vld). Здесь везде фронт передачи
+// ПОСЛЕДНЕГО слова: для payload это конец сообщения, для кадра -- конец кадра.
+//
+// axis_net ИДЁТ НАСКВОЗЬ. Обёртка врезается в шину между cmac_krnl и
+// network_krnl, но данные не трогает: провода assign-ом, tready обратно.
+// Регистров в тракте нет, задержки не добавляется. Фильтр и защёлки только
+// подсматривают.
+//
+// ЧТО ЗДЕСЬ НЕ ИЗМЕРЯЕТСЯ: CMAC (~150-200 нс на сторону) и кабель. Они за
+// врезкой, со стороны провода. Для задачи это и не нужно -- интересна
+// задержка, которой мы управляем.
+`timescale 1ns / 1ps
+`default_nettype none
+
+module hls_pp_dual_krnl_wrapper #(
+     // Порог длины кадра в 512-битных словах и маркер -- см. net_frame_filter.v.
+     // Значение маркера должно совпадать с тем, что пишет ppclient в
+     // payload[4..9] (host/hls_pp_dual_krnl/main.go, var marker).
+     parameter [47:0] PP_MARKER = 48'h5A3C96E1B7D2
+)(
+     input  wire         ap_clk,
+     input  wire         ap_rst_n,
+
+     // ── AXI-Lite: регистры ядра ПЛЮС наши. Адреса ядра идут насквозь в
+     //    control_s_axi HLS, наши перехватываются здесь (см. ниже).
+     input  wire [11:0]  s_axi_control_awaddr,
+     input  wire         s_axi_control_awvalid,
+     output wire         s_axi_control_awready,
+     input  wire [31:0]  s_axi_control_wdata,
+     input  wire [3:0]   s_axi_control_wstrb,
+     input  wire         s_axi_control_wvalid,
+     output wire         s_axi_control_wready,
+     output wire [1:0]   s_axi_control_bresp,
+     output wire         s_axi_control_bvalid,
+     input  wire         s_axi_control_bready,
+     input  wire [11:0]  s_axi_control_araddr,
+     input  wire         s_axi_control_arvalid,
+     output wire         s_axi_control_arready,
+     output wire [31:0]  s_axi_control_rdata,
+     output wire [1:0]   s_axi_control_rresp,
+     output wire         s_axi_control_rvalid,
+     input  wire         s_axi_control_rready,
+     output wire         interrupt,
+
+     // ── врезка в axis_net половины a: cmac_krnl_1 <-> network_krnl_1 ──
+     //
+     // RX: приходит от CMAC, уходит в стек.
+     input  wire         s_axis_net_rx_a_tvalid,
+     output wire         s_axis_net_rx_a_tready,
+     input  wire [511:0] s_axis_net_rx_a_tdata,
+     input  wire [63:0]  s_axis_net_rx_a_tkeep,
+     input  wire         s_axis_net_rx_a_tlast,
+     output wire         m_axis_net_rx_a_tvalid,
+     input  wire         m_axis_net_rx_a_tready,
+     output wire [511:0] m_axis_net_rx_a_tdata,
+     output wire [63:0]  m_axis_net_rx_a_tkeep,
+     output wire         m_axis_net_rx_a_tlast,
+     // TX: приходит от стека, уходит в CMAC.
+     input  wire         s_axis_net_tx_a_tvalid,
+     output wire         s_axis_net_tx_a_tready,
+     input  wire [511:0] s_axis_net_tx_a_tdata,
+     input  wire [63:0]  s_axis_net_tx_a_tkeep,
+     input  wire         s_axis_net_tx_a_tlast,
+     output wire         m_axis_net_tx_a_tvalid,
+     input  wire         m_axis_net_tx_a_tready,
+     output wire [511:0] m_axis_net_tx_a_tdata,
+     output wire [63:0]  m_axis_net_tx_a_tkeep,
+     output wire         m_axis_net_tx_a_tlast,
+
+     // ── шины ядра, которые нам нужны для t2/t1. Идут насквозь в ядро;
+     //    здесь только подсматриваем handshake, данные не трогаем.
+     input  wire         tap_rx_data_a_tvalid,
+     input  wire         tap_rx_data_a_tready,
+     input  wire         tap_rx_data_a_tlast,
+     input  wire         tap_tx_data_a_tvalid,
+     input  wire         tap_tx_data_a_tready,
+     input  wire         tap_tx_data_a_tlast
+);
+
+// ── passthrough axis_net: провода насквозь, ни одного регистра ───────────────
+assign m_axis_net_rx_a_tvalid = s_axis_net_rx_a_tvalid;
+assign m_axis_net_rx_a_tdata  = s_axis_net_rx_a_tdata;
+assign m_axis_net_rx_a_tkeep  = s_axis_net_rx_a_tkeep;
+assign m_axis_net_rx_a_tlast  = s_axis_net_rx_a_tlast;
+assign s_axis_net_rx_a_tready = m_axis_net_rx_a_tready;
+
+assign m_axis_net_tx_a_tvalid = s_axis_net_tx_a_tvalid;
+assign m_axis_net_tx_a_tdata  = s_axis_net_tx_a_tdata;
+assign m_axis_net_tx_a_tkeep  = s_axis_net_tx_a_tkeep;
+assign m_axis_net_tx_a_tlast  = s_axis_net_tx_a_tlast;
+assign s_axis_net_tx_a_tready = m_axis_net_tx_a_tready;
+
+// ── общая шкала времени ──────────────────────────────────────────────────────
+//
+// 32 бита при 165 МГц -- 26 секунд до переполнения. Разность 32-битных
+// значений верна и через переход, поэтому сбрасывать не нужно и переполнение
+// не мешает: (T1 - T2) считается по модулю 2^32.
+logic [31:0] cycle_counter = 32'b0;
+always_ff @(posedge ap_clk) begin
+     if (~ap_rst_n) cycle_counter <= 32'b0;
+     else           cycle_counter <= cycle_counter + 32'd1;
+end
+
+// ── регистры управления, доступные хосту ────────────────────────────────────
+logic [31:0] min_words_r = 32'd2;   // порог фильтра, по умолчанию 2 слова
+logic        fifo_clear;
+logic        fifo_pop;
+
+// ── фильтр «наш кадр» на обеих точках axis_net ──────────────────────────────
+//
+// Обоснование в шапке net_frame_filter.v; коротко: на axis_net идёт весь
+// трафик стека, служебные кадры (ARP, чистый ACK, ICMP) укладываются в одно
+// 512-битное слово, а SYN с опциями отсекается маркером.
+//
+// tready берём со стороны МАСТЕРА -- считается передача, а не предъявление.
+wire        net_rx_ours, net_tx_ours;
+wire [31:0] nf_cnt_rx, nf_cnt_tx, nf_drp_rx, nf_drp_tx;
+
+net_frame_filter #(.EPD_MARKER(PP_MARKER)) flt_rx (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .tvalid(s_axis_net_rx_a_tvalid), .tready(m_axis_net_rx_a_tready),
+     .tlast(s_axis_net_rx_a_tlast),   .tdata(s_axis_net_rx_a_tdata),
+     .min_words(min_words_r),
+     .frame_ours(net_rx_ours),
+     .count_ours(nf_cnt_rx), .count_drop(nf_drp_rx)
+);
+
+net_frame_filter #(.EPD_MARKER(PP_MARKER)) flt_tx (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .tvalid(s_axis_net_tx_a_tvalid), .tready(m_axis_net_tx_a_tready),
+     .tlast(s_axis_net_tx_a_tlast),   .tdata(s_axis_net_tx_a_tdata),
+     .min_words(min_words_r),
+     .frame_ours(net_tx_ours),
+     .count_ours(nf_cnt_tx), .count_drop(nf_drp_tx)
+);
+
+// ── четыре строба ───────────────────────────────────────────────────────────
+//
+// Форма всюду одна: tvalid & tready & tlast. Не ap_vld -- он срабатывает на
+// ap_done стадии, а не на передаче слова, и метки разъехались бы невидимо.
+//
+// На axis_net дополнительно требуется frame_ours: без него защёлка сработала
+// бы на первом же ARP или ACK.
+wire strobe_T2 = net_rx_ours;   // фильтр уже включает beat & tlast
+wire strobe_T1 = net_tx_ours;
+wire strobe_t2 = tap_rx_data_a_tvalid & tap_rx_data_a_tready & tap_rx_data_a_tlast;
+wire strobe_t1 = tap_tx_data_a_tvalid & tap_tx_data_a_tready & tap_tx_data_a_tlast;
+
+// ── сбор одного измерения ───────────────────────────────────────────────────
+//
+// СОСТОЯНИЕ, А НЕ ПРОСТЫЕ ЗАЩЁЛКИ. Простые регистры (как у probe) отдали бы
+// хосту последний пакет, а нам нужна серия. Значит измерение надо собрать
+// целиком и отдать в FIFO одним куском.
+//
+// ПОРЯДОК СОБЫТИЙ ЖЁСТКИЙ: T2 -> t2 -> t1 -> T1. Автомат идёт по нему и на
+// любом отклонении начинает заново, а не склеивает метки разных пакетов.
+//
+// Отклонения, которые реально бывают:
+//   * T2 пришёл повторно до t2 -- второй пакет догнал первый. Берём новый T2
+//     (старое измерение потеряно, и это честнее склейки);
+//   * t1/T1 без предшествующего T2 -- метка от пакета, чей T2 мы пропустили
+//     (например, фильтр его не узнал). Игнорируем.
+typedef enum logic [1:0] {WAIT_T2, WAIT_t2, WAIT_t1, WAIT_T1} pp_state_t;
+pp_state_t st = WAIT_T2;
+
+logic [31:0] ts_T2, ts_t2, ts_t1;
+logic        meas_valid;          // строб записи в FIFO
+logic [31:0] meas_dropped;        // сколько измерений порвалось на полпути
+
+always_ff @(posedge ap_clk) begin
+     if (~ap_rst_n) begin
+          st           <= WAIT_T2;
+          ts_T2        <= 32'b0;
+          ts_t2        <= 32'b0;
+          ts_t1        <= 32'b0;
+          meas_valid   <= 1'b0;
+          meas_dropped <= 32'b0;
+     end else begin
+          meas_valid <= 1'b0;      // строб на один такт
+
+          case (st)
+          WAIT_T2:
+               if (strobe_T2) begin
+                    ts_T2 <= cycle_counter;
+                    st    <= WAIT_t2;
+               end
+
+          WAIT_t2:
+               // Новый T2 раньше t2 -- пакеты пошли конвейером. Берём новый и
+               // считаем прошлый порванным: склеить t2 второго пакета с T2
+               // первого дало бы правдоподобное, но ложное число.
+               if (strobe_T2) begin
+                    ts_T2        <= cycle_counter;
+                    meas_dropped <= meas_dropped + 32'd1;
+               end else if (strobe_t2) begin
+                    ts_t2 <= cycle_counter;
+                    st    <= WAIT_t1;
+               end
+
+          WAIT_t1:
+               if (strobe_T2) begin
+                    ts_T2        <= cycle_counter;
+                    st           <= WAIT_t2;
+                    meas_dropped <= meas_dropped + 32'd1;
+               end else if (strobe_t1) begin
+                    ts_t1 <= cycle_counter;
+                    st    <= WAIT_T1;
+               end
+
+          WAIT_T1:
+               // T1 нашего кадра -- измерение готово.
+               //
+               // Тонкость: strobe_T2 и strobe_T1 могут прийти в одном такте
+               // (следующий запрос уже входит, пока наш ответ выходит). Тогда
+               // сначала закрываем текущее измерение, а новый T2 подхватываем
+               // сразу же -- иначе он потерялся бы.
+               if (strobe_T1) begin
+                    meas_valid <= 1'b1;
+                    if (strobe_T2) begin
+                         ts_T2 <= cycle_counter;
+                         st    <= WAIT_t2;
+                    end else begin
+                         st <= WAIT_T2;
+                    end
+               end else if (strobe_T2) begin
+                    ts_T2        <= cycle_counter;
+                    st           <= WAIT_t2;
+                    meas_dropped <= meas_dropped + 32'd1;
+               end
+          endcase
+     end
+end
+
+// Метка T1 берётся ПРЯМО с счётчика в такте strobe_T1, а не из регистра:
+// meas_valid поднимается в том же такте, и FIFO защёлкивает всё четыре
+// значения одновременно.
+wire [127:0] meas_word = {cycle_counter, ts_t1, ts_t2, ts_T2};
+
+// ── FIFO измерений ──────────────────────────────────────────────────────────
+wire [31:0] fifo_rd_data, fifo_count, fifo_overflow;
+wire        fifo_empty, fifo_full;
+
+lat_fifo u_fifo (
+     .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+     .wr_en(meas_valid), .wr_data(meas_word),
+     .clear(fifo_clear),
+     .rd_pop(fifo_pop), .rd_data(fifo_rd_data),
+     .count(fifo_count), .overflow(fifo_overflow),
+     .empty(fifo_empty), .full(fifo_full)
+);
+
+// ── AXI-Lite: наши регистры поверх регистров ядра ───────────────────────────
+//
+// РАЗДЕЛЕНИЕ ПО АДРЕСУ. Ядро (HLS) занимает 0x00..0x5F -- см.
+// xhls_pp_dual_krnl_hw.h. Наши регистры ставим с 0x100, с запасом: если у
+// ядра появятся новые скаляры, карта не наедет.
+//
+//   0x100  R   fifo_rd_data   текущее слово FIFO (чтение НЕ сдвигает)
+//   0x104  W   fifo_pop       запись любого значения -- сдвинуть указатель
+//   0x108  R   fifo_count     слов в FIFO (измерений = /4)
+//   0x10c  R   fifo_overflow  потеряно измерений из-за полного FIFO
+//   0x110  RW  min_words      порог длины кадра для фильтра
+//   0x114  R   nf_cnt_rx      кадров прошло фильтр на RX
+//   0x118  R   nf_drp_rx      отсеяно на RX
+//   0x11c  R   nf_cnt_tx      прошло на TX
+//   0x120  R   nf_drp_tx      отсеяно на TX
+//   0x124  R   meas_dropped   измерений порвалось на полпути
+//   0x128  W   fifo_clear     запись -- очистить FIFO (overflow не трогает)
+//
+// ПОЧЕМУ ЧТЕНИЕ НЕ СДВИГАЕТ УКАЗАТЕЛЬ. Read-to-pop экономил бы одну
+// транзакцию на слово, но делал бы чтение разрушающим: любой повторный
+// доступ (а Vivado при отладке читает регистры сам) съедал бы данные. Явный
+// pop дороже, зато не теряет.
+localparam logic [11:0] A_RD       = 12'h100;
+localparam logic [11:0] A_POP      = 12'h104;
+localparam logic [11:0] A_COUNT    = 12'h108;
+localparam logic [11:0] A_OVF      = 12'h10c;
+localparam logic [11:0] A_MINWORDS = 12'h110;
+localparam logic [11:0] A_CNT_RX   = 12'h114;
+localparam logic [11:0] A_DRP_RX   = 12'h118;
+localparam logic [11:0] A_CNT_TX   = 12'h11c;
+localparam logic [11:0] A_DRP_TX   = 12'h120;
+localparam logic [11:0] A_MEAS_DRP = 12'h124;
+localparam logic [11:0] A_CLEAR    = 12'h128;
+
+// Наш диапазон -- всё, что от 0x100. Ниже отдаём ядру.
+wire aw_ours = s_axi_control_awaddr[11:8] != 4'h0;
+wire ar_ours = s_axi_control_araddr[11:8] != 4'h0;
+
+// ── запись ──
+logic        wr_pending;
+logic [11:0] wr_addr;
+always_ff @(posedge ap_clk) begin
+     if (~ap_rst_n) begin
+          wr_pending <= 1'b0;
+          wr_addr    <= 12'b0;
+          fifo_pop   <= 1'b0;
+          fifo_clear <= 1'b0;
+          min_words_r <= 32'd2;
+     end else begin
+          fifo_pop   <= 1'b0;      // стробы на один такт
+          fifo_clear <= 1'b0;
+
+          if (s_axi_control_awvalid && aw_ours && !wr_pending) begin
+               wr_addr    <= s_axi_control_awaddr;
+               wr_pending <= 1'b1;
+          end
+          if (wr_pending && s_axi_control_wvalid) begin
+               wr_pending <= 1'b0;
+               case (wr_addr)
+               A_POP:      fifo_pop    <= 1'b1;
+               A_CLEAR:    fifo_clear  <= 1'b1;
+               A_MINWORDS: min_words_r <= s_axi_control_wdata;
+               default: ;   // запись в R-регистр игнорируется молча
+               endcase
+          end
+     end
+end
+
+// ── чтение ──
+logic [31:0] rd_data_r;
+logic        rd_valid_r;
+always_ff @(posedge ap_clk) begin
+     if (~ap_rst_n) begin
+          rd_data_r  <= 32'b0;
+          rd_valid_r <= 1'b0;
+     end else begin
+          if (s_axi_control_arvalid && ar_ours && !rd_valid_r) begin
+               rd_valid_r <= 1'b1;
+               case (s_axi_control_araddr)
+               A_RD:       rd_data_r <= fifo_rd_data;
+               A_COUNT:    rd_data_r <= fifo_count;
+               A_OVF:      rd_data_r <= fifo_overflow;
+               A_MINWORDS: rd_data_r <= min_words_r;
+               A_CNT_RX:   rd_data_r <= nf_cnt_rx;
+               A_DRP_RX:   rd_data_r <= nf_drp_rx;
+               A_CNT_TX:   rd_data_r <= nf_cnt_tx;
+               A_DRP_TX:   rd_data_r <= nf_drp_tx;
+               A_MEAS_DRP: rd_data_r <= meas_dropped;
+               // Неописанный адрес в нашем диапазоне -- ЯВНЫЙ МАРКЕР, а не
+               // нуль: нуль читался бы как "счётчик пуст", то есть
+               // правдоподобно и неверно (defaults-that-fail-loudly).
+               default:    rd_data_r <= 32'hBADA_DDR5;
+               endcase
+          end else if (rd_valid_r && s_axi_control_rready) begin
+               rd_valid_r <= 1'b0;
+          end
+     end
+end
+
+// ── арбитраж AXI-Lite между нами и ядром ────────────────────────────────────
+//
+// ЗАГЛУШКА. Реальный арбитраж требует инстанса ядра здесь же и мультиплекса
+// всех сигналов AXI-Lite. Это следующий шаг: сначала надо убедиться, что
+// врезки и FIFO работают, а карта регистров ядра уже занята (0x00..0x5F) и
+// не конфликтует с 0x100+.
+assign s_axi_control_awready = aw_ours ? !wr_pending : 1'b0;
+assign s_axi_control_wready  = aw_ours ? wr_pending  : 1'b0;
+assign s_axi_control_bresp   = 2'b00;
+assign s_axi_control_bvalid  = 1'b0;
+assign s_axi_control_arready = ar_ours ? !rd_valid_r : 1'b0;
+assign s_axi_control_rdata   = rd_data_r;
+assign s_axi_control_rresp   = 2'b00;
+assign s_axi_control_rvalid  = rd_valid_r;
+assign interrupt             = 1'b0;
+
+endmodule
+
+`default_nettype wire
