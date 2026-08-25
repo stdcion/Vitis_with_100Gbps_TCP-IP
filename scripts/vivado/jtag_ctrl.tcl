@@ -2478,7 +2478,16 @@ proc _pp_state_name {v} {
 # Half a gets the cable, half b does not. Both stacks are started anyway: the
 # kernel is ONE instance wired to both, and an unstarted stack backpressures
 # its half of the region.
-proc pp_dual_bringup {{ip_str_a 0a01d499} {mac_str_a 02aa00000001} \
+# Адреса по умолчанию -- ТЕ ЖЕ, что в зелёной фазе 3 (recv_dual_phase3).
+# 192.168.10.10 на половине a, .20 на половине b.
+#
+# Почему именно эти: на них лестница прошла на плате 25.08, значит ARP,
+# маска и gateway с ними заведомо работают. Проверено арифметикой:
+# IP_SUBNET_MASK=0x00FFFFFF применяется к РАЗВЁРНУТОМУ адресу
+# (network_stack.sv:631-634 разворачивает байты), после маски у обоих
+# адресов сеть 0x000aa8c0 -- одна /24, различаются последним байтом.
+# Последний байт важен: им индексируется ARP-таблица на 256 входов.
+proc pp_dual_bringup {{ip_str_a c0a80a0a} {mac_str_a 02aa00000001} \
                       {ip_str_b c0a80a14} {mac_str_b 02bb00000002} \
                       {basePort 7001}} {
      puts "=== hls_pp_dual_krnl bringup: ECHO on half a (QSFP0) ==="
@@ -2510,15 +2519,28 @@ proc pp_dual_bringup {{ip_str_a 0a01d499} {mac_str_a 02aa00000001} \
      puts ""
      puts "=== NEXT, FROM THE PC ==="
      puts ""
-     puts "  1. start the capture BEFORE sending -- it is the only source of"
-     puts "     truth that does not depend on our own telemetry:"
-     puts "       sudo tcpdump -i <iface> -ttt -w pp.pcap 'tcp port $basePort'"
+     puts "  1. START THE CAPTURE FIRST. It is the only source of truth that"
+     puts "     does not depend on our own telemetry -- and telemetry has"
+     puts "     misled us before (ap_ctrl=0x83 read as a hang when it was"
+     puts "     a sticky done bit)."
+     puts "       Windows: Wireshark on the QSFP interface,"
+     puts "                display filter:  tcp.port == $basePort"
+     puts "       Linux:   sudo tcpdump -i <iface> -ttt -w pp.pcap \\"
+     puts "                     'tcp port $basePort'"
      puts ""
-     puts "  2. send something small and recognisable:"
-     puts "       ncat [_de_dotted $ip_str_a] $basePort"
-     puts "     then type a line and press enter -- it must come back echoed."
+     puts "  2. SMOKE TEST -- 100 messages, is the echo there at all:"
+     puts "       ppclient.exe -host [_de_dotted $ip_str_a] -port $basePort -count 100"
+     puts "     Build it with host/hls_pp_dual_krnl/build.sh (gives ppclient.exe)."
+     puts "     Without the client, any TCP tool does:"
+     puts "       Windows: telnet [_de_dotted $ip_str_a] $basePort"
+     puts "       Linux:   ncat [_de_dotted $ip_str_a] $basePort"
+     puts "     Type a line, press enter -- it must come back."
      puts ""
-     puts "  3. read the counters back here:"
+     puts "  3. IF THE SMOKE TEST PASSES -- the real measurement:"
+     puts "       ppclient.exe -host [_de_dotted $ip_str_a] -port $basePort \\"
+     puts "            -bytes 64 -count 100000 -csv rtt.csv"
+     puts ""
+     puts "  4. read the counters back here:"
      puts "       pp_dual_dump"
      puts ""
      puts "WHAT THE OUTCOMES MEAN"
