@@ -2409,18 +2409,20 @@ set ::PP_OFF_NOTIFY     -1
 # telemetry; bringup calls it itself.
 proc pp_dual_offsets {} {
      set root [file normalize [file join [file dirname [info script]] .. ..]]
-     set pat "$root/kernel/user_krnl/hls_pp_dual_krnl/src/hls/hls_pp_dual_krnl_ip_proj/*/syn/verilog/../../*_hw.h"
+     # SAME pattern export_hls_ip.tcl:149 uses, so both scripts read the same
+     # file. My first version guessed two paths, one of which never existed --
+     # the header lives only under impl/ip/drivers, confirmed by the build log
+     # of 2026-08-25.
+     set pat "$root/kernel/user_krnl/hls_pp_dual_krnl/src/hls/hls_pp_dual_krnl_ip_proj/sol1/impl/ip/drivers/*/src/*_hw.h"
      set hits [glob -nocomplain $pat]
-     if {[llength $hits] == 0} {
-          # second place Vitis puts it
-          set hits [glob -nocomplain \
-               "$root/kernel/user_krnl/hls_pp_dual_krnl/src/hls/hls_pp_dual_krnl_ip_proj/*/impl/ip/drivers/*/src/*_hw.h"]
-     }
      if {[llength $hits] == 0} {
           puts "*** xhls_pp_dual_krnl_hw.h not found."
           puts "    Telemetry offsets stay unset; portState/ppState/notifyCount"
-          puts "    cannot be read. Find the file and pass offsets by hand:"
-          puts "      set ::PP_OFF_PORTSTATE 0x28   (example)"
+          puts "    cannot be read. Find the file and pass offsets by hand;"
+          puts "    the 2026-08-25 build gave:"
+          puts "      set ::PP_OFF_PORTSTATE 0x2c"
+          puts "      set ::PP_OFF_PPSTATE   0x3c"
+          puts "      set ::PP_OFF_NOTIFY    0x4c"
           puts "    Looked under kernel/user_krnl/hls_pp_dual_krnl/src/hls/"
           return 0
      }
