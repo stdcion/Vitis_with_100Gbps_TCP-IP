@@ -17,8 +17,27 @@ sc=hls_pp_dual_krnl_1.m_axis_tcp_read_pkg:network_krnl_1.s_axis_tcp_read_pkg
 sc=hls_pp_dual_krnl_1.m_axis_tcp_tx_meta:network_krnl_1.s_axis_tcp_tx_meta
 sc=hls_pp_dual_krnl_1.m_axis_tcp_tx_data:network_krnl_1.s_axis_tcp_tx_data
 
-sc=cmac_krnl_1.axis_net_rx:network_krnl_1.axis_net_rx
-sc=network_krnl_1.axis_net_tx:cmac_krnl_1.axis_net_tx
+# ── ВРЕЗКА ВРЕМЕНИ: axis_net половины a идёт ЧЕРЕЗ ЯДРО, а не напрямую ──
+#
+# Обёртка hls_pp_dual_krnl_wrapper врезана в шину между cmac_krnl_1 и
+# network_krnl_1: она пропускает данные насквозь (provoda assign-ом, ни одного
+# регистра в тракте) и попутно снимает метки T2 и T1 -- моменты, когда НАШ
+# кадр появился на краю CMAC.
+#
+# Без этой врезки измерялась бы только задержка ядра (t2..t1), а стек TOE
+# остался бы чёрным ящиком. Именно его вклад и интересен: по бюджету он
+# составляет большую часть пути.
+#
+# Половина b НЕ врезана и идёт напрямую (строки ниже): кабеля в QSFP1 нет,
+# измерять там нечего, а лишняя врезка -- лишний риск для зелёной фазы 3.
+#
+# ПОРЯДОК ВАЖЕН. RX: CMAC -> ядро -> стек. TX: стек -> ядро -> CMAC.
+# Перепутав направление, получим шину, где оба конца -- мастера, и BD
+# откажется соединять (это и хорошо: ошибка громкая, а не тихая).
+sc=cmac_krnl_1.axis_net_rx:hls_pp_dual_krnl_1.s_axis_net_rx_a
+sc=hls_pp_dual_krnl_1.m_axis_net_rx_a:network_krnl_1.axis_net_rx
+sc=network_krnl_1.axis_net_tx:hls_pp_dual_krnl_1.s_axis_net_tx_a
+sc=hls_pp_dual_krnl_1.m_axis_net_tx_a:cmac_krnl_1.axis_net_tx
 
 sc=network_krnl_2.m_axis_udp_rx:hls_pp_dual_krnl_1.s_axis_udp_rx_b
 sc=network_krnl_2.m_axis_udp_rx_meta:hls_pp_dual_krnl_1.s_axis_udp_rx_meta_b
@@ -38,5 +57,6 @@ sc=hls_pp_dual_krnl_1.m_axis_tcp_read_pkg_b:network_krnl_2.s_axis_tcp_read_pkg
 sc=hls_pp_dual_krnl_1.m_axis_tcp_tx_meta_b:network_krnl_2.s_axis_tcp_tx_meta
 sc=hls_pp_dual_krnl_1.m_axis_tcp_tx_data_b:network_krnl_2.s_axis_tcp_tx_data
 
+# Половина b -- НАПРЯМУЮ, без врезки. См. пояснение у половины a.
 sc=cmac_krnl_2.axis_net_rx:network_krnl_2.axis_net_rx
 sc=network_krnl_2.axis_net_tx:cmac_krnl_2.axis_net_tx

@@ -95,15 +95,182 @@ module hls_pp_dual_krnl_wrapper #(
      output wire [63:0]  m_axis_net_tx_a_tkeep,
      output wire         m_axis_net_tx_a_tlast,
 
-     // ── шины ядра, которые нам нужны для t2/t1. Идут насквозь в ядро;
-     //    здесь только подсматриваем handshake, данные не трогаем.
-     input  wire         tap_rx_data_a_tvalid,
-     input  wire         tap_rx_data_a_tready,
-     input  wire         tap_rx_data_a_tlast,
-     input  wire         tap_tx_data_a_tvalid,
-     input  wire         tap_tx_data_a_tready,
-     input  wire         tap_tx_data_a_tlast
+     // ── 32 AXI-Stream ядра: идут НАСКВОЗЬ в инстанс ядра ниже.
+     //
+     // Список сгенерирован из .cpp (INTERFACE axis port), а не набран руками:
+     // 160 сигналов, и опечатка в одном давала бы либо ошибку элаборации,
+     // либо -- хуже -- молча висящий провод. Двусторонняя сверка портов
+     // делается в package_*.tcl (память: wrapper-port-check-both-ways).
+     input  wire         s_axis_udp_rx_tvalid,
+     output wire         s_axis_udp_rx_tready,
+     input  wire [511:0] s_axis_udp_rx_tdata,
+     input  wire [63:0] s_axis_udp_rx_tkeep,
+     input  wire         s_axis_udp_rx_tlast,
+     output wire         m_axis_udp_tx_tvalid,
+     input  wire         m_axis_udp_tx_tready,
+     output wire [511:0] m_axis_udp_tx_tdata,
+     output wire [63:0] m_axis_udp_tx_tkeep,
+     output wire         m_axis_udp_tx_tlast,
+     input  wire         s_axis_udp_rx_meta_tvalid,
+     output wire         s_axis_udp_rx_meta_tready,
+     input  wire [255:0] s_axis_udp_rx_meta_tdata,
+     input  wire [31:0] s_axis_udp_rx_meta_tkeep,
+     input  wire         s_axis_udp_rx_meta_tlast,
+     output wire         m_axis_udp_tx_meta_tvalid,
+     input  wire         m_axis_udp_tx_meta_tready,
+     output wire [255:0] m_axis_udp_tx_meta_tdata,
+     output wire [31:0] m_axis_udp_tx_meta_tkeep,
+     output wire         m_axis_udp_tx_meta_tlast,
+     output wire         m_axis_tcp_listen_port_tvalid,
+     input  wire         m_axis_tcp_listen_port_tready,
+     output wire [15:0] m_axis_tcp_listen_port_tdata,
+     output wire [1:0] m_axis_tcp_listen_port_tkeep,
+     output wire         m_axis_tcp_listen_port_tlast,
+     input  wire         s_axis_tcp_port_status_tvalid,
+     output wire         s_axis_tcp_port_status_tready,
+     input  wire [7:0] s_axis_tcp_port_status_tdata,
+     input  wire [0:0] s_axis_tcp_port_status_tkeep,
+     input  wire         s_axis_tcp_port_status_tlast,
+     output wire         m_axis_tcp_open_connection_tvalid,
+     input  wire         m_axis_tcp_open_connection_tready,
+     output wire [63:0] m_axis_tcp_open_connection_tdata,
+     output wire [7:0] m_axis_tcp_open_connection_tkeep,
+     output wire         m_axis_tcp_open_connection_tlast,
+     input  wire         s_axis_tcp_open_status_tvalid,
+     output wire         s_axis_tcp_open_status_tready,
+     input  wire [127:0] s_axis_tcp_open_status_tdata,
+     input  wire [15:0] s_axis_tcp_open_status_tkeep,
+     input  wire         s_axis_tcp_open_status_tlast,
+     output wire         m_axis_tcp_close_connection_tvalid,
+     input  wire         m_axis_tcp_close_connection_tready,
+     output wire [15:0] m_axis_tcp_close_connection_tdata,
+     output wire [1:0] m_axis_tcp_close_connection_tkeep,
+     output wire         m_axis_tcp_close_connection_tlast,
+     input  wire         s_axis_tcp_notification_tvalid,
+     output wire         s_axis_tcp_notification_tready,
+     input  wire [127:0] s_axis_tcp_notification_tdata,
+     input  wire [15:0] s_axis_tcp_notification_tkeep,
+     input  wire         s_axis_tcp_notification_tlast,
+     output wire         m_axis_tcp_read_pkg_tvalid,
+     input  wire         m_axis_tcp_read_pkg_tready,
+     output wire [31:0] m_axis_tcp_read_pkg_tdata,
+     output wire [3:0] m_axis_tcp_read_pkg_tkeep,
+     output wire         m_axis_tcp_read_pkg_tlast,
+     input  wire         s_axis_tcp_rx_meta_tvalid,
+     output wire         s_axis_tcp_rx_meta_tready,
+     input  wire [15:0] s_axis_tcp_rx_meta_tdata,
+     input  wire [1:0] s_axis_tcp_rx_meta_tkeep,
+     input  wire         s_axis_tcp_rx_meta_tlast,
+     input  wire         s_axis_tcp_rx_data_tvalid,
+     output wire         s_axis_tcp_rx_data_tready,
+     input  wire [511:0] s_axis_tcp_rx_data_tdata,
+     input  wire [63:0] s_axis_tcp_rx_data_tkeep,
+     input  wire         s_axis_tcp_rx_data_tlast,
+     output wire         m_axis_tcp_tx_meta_tvalid,
+     input  wire         m_axis_tcp_tx_meta_tready,
+     output wire [31:0] m_axis_tcp_tx_meta_tdata,
+     output wire [3:0] m_axis_tcp_tx_meta_tkeep,
+     output wire         m_axis_tcp_tx_meta_tlast,
+     output wire         m_axis_tcp_tx_data_tvalid,
+     input  wire         m_axis_tcp_tx_data_tready,
+     output wire [511:0] m_axis_tcp_tx_data_tdata,
+     output wire [63:0] m_axis_tcp_tx_data_tkeep,
+     output wire         m_axis_tcp_tx_data_tlast,
+     input  wire         s_axis_tcp_tx_status_tvalid,
+     output wire         s_axis_tcp_tx_status_tready,
+     input  wire [63:0] s_axis_tcp_tx_status_tdata,
+     input  wire [7:0] s_axis_tcp_tx_status_tkeep,
+     input  wire         s_axis_tcp_tx_status_tlast,
+     input  wire         s_axis_udp_rx_b_tvalid,
+     output wire         s_axis_udp_rx_b_tready,
+     input  wire [511:0] s_axis_udp_rx_b_tdata,
+     input  wire [63:0] s_axis_udp_rx_b_tkeep,
+     input  wire         s_axis_udp_rx_b_tlast,
+     output wire         m_axis_udp_tx_b_tvalid,
+     input  wire         m_axis_udp_tx_b_tready,
+     output wire [511:0] m_axis_udp_tx_b_tdata,
+     output wire [63:0] m_axis_udp_tx_b_tkeep,
+     output wire         m_axis_udp_tx_b_tlast,
+     input  wire         s_axis_udp_rx_meta_b_tvalid,
+     output wire         s_axis_udp_rx_meta_b_tready,
+     input  wire [255:0] s_axis_udp_rx_meta_b_tdata,
+     input  wire [31:0] s_axis_udp_rx_meta_b_tkeep,
+     input  wire         s_axis_udp_rx_meta_b_tlast,
+     output wire         m_axis_udp_tx_meta_b_tvalid,
+     input  wire         m_axis_udp_tx_meta_b_tready,
+     output wire [255:0] m_axis_udp_tx_meta_b_tdata,
+     output wire [31:0] m_axis_udp_tx_meta_b_tkeep,
+     output wire         m_axis_udp_tx_meta_b_tlast,
+     output wire         m_axis_tcp_listen_port_b_tvalid,
+     input  wire         m_axis_tcp_listen_port_b_tready,
+     output wire [15:0] m_axis_tcp_listen_port_b_tdata,
+     output wire [1:0] m_axis_tcp_listen_port_b_tkeep,
+     output wire         m_axis_tcp_listen_port_b_tlast,
+     input  wire         s_axis_tcp_port_status_b_tvalid,
+     output wire         s_axis_tcp_port_status_b_tready,
+     input  wire [7:0] s_axis_tcp_port_status_b_tdata,
+     input  wire [0:0] s_axis_tcp_port_status_b_tkeep,
+     input  wire         s_axis_tcp_port_status_b_tlast,
+     output wire         m_axis_tcp_open_connection_b_tvalid,
+     input  wire         m_axis_tcp_open_connection_b_tready,
+     output wire [63:0] m_axis_tcp_open_connection_b_tdata,
+     output wire [7:0] m_axis_tcp_open_connection_b_tkeep,
+     output wire         m_axis_tcp_open_connection_b_tlast,
+     input  wire         s_axis_tcp_open_status_b_tvalid,
+     output wire         s_axis_tcp_open_status_b_tready,
+     input  wire [127:0] s_axis_tcp_open_status_b_tdata,
+     input  wire [15:0] s_axis_tcp_open_status_b_tkeep,
+     input  wire         s_axis_tcp_open_status_b_tlast,
+     output wire         m_axis_tcp_close_connection_b_tvalid,
+     input  wire         m_axis_tcp_close_connection_b_tready,
+     output wire [15:0] m_axis_tcp_close_connection_b_tdata,
+     output wire [1:0] m_axis_tcp_close_connection_b_tkeep,
+     output wire         m_axis_tcp_close_connection_b_tlast,
+     input  wire         s_axis_tcp_notification_b_tvalid,
+     output wire         s_axis_tcp_notification_b_tready,
+     input  wire [127:0] s_axis_tcp_notification_b_tdata,
+     input  wire [15:0] s_axis_tcp_notification_b_tkeep,
+     input  wire         s_axis_tcp_notification_b_tlast,
+     output wire         m_axis_tcp_read_pkg_b_tvalid,
+     input  wire         m_axis_tcp_read_pkg_b_tready,
+     output wire [31:0] m_axis_tcp_read_pkg_b_tdata,
+     output wire [3:0] m_axis_tcp_read_pkg_b_tkeep,
+     output wire         m_axis_tcp_read_pkg_b_tlast,
+     input  wire         s_axis_tcp_rx_meta_b_tvalid,
+     output wire         s_axis_tcp_rx_meta_b_tready,
+     input  wire [15:0] s_axis_tcp_rx_meta_b_tdata,
+     input  wire [1:0] s_axis_tcp_rx_meta_b_tkeep,
+     input  wire         s_axis_tcp_rx_meta_b_tlast,
+     input  wire         s_axis_tcp_rx_data_b_tvalid,
+     output wire         s_axis_tcp_rx_data_b_tready,
+     input  wire [511:0] s_axis_tcp_rx_data_b_tdata,
+     input  wire [63:0] s_axis_tcp_rx_data_b_tkeep,
+     input  wire         s_axis_tcp_rx_data_b_tlast,
+     output wire         m_axis_tcp_tx_meta_b_tvalid,
+     input  wire         m_axis_tcp_tx_meta_b_tready,
+     output wire [31:0] m_axis_tcp_tx_meta_b_tdata,
+     output wire [3:0] m_axis_tcp_tx_meta_b_tkeep,
+     output wire         m_axis_tcp_tx_meta_b_tlast,
+     output wire         m_axis_tcp_tx_data_b_tvalid,
+     input  wire         m_axis_tcp_tx_data_b_tready,
+     output wire [511:0] m_axis_tcp_tx_data_b_tdata,
+     output wire [63:0] m_axis_tcp_tx_data_b_tkeep,
+     output wire         m_axis_tcp_tx_data_b_tlast,
+     input  wire         s_axis_tcp_tx_status_b_tvalid,
+     output wire         s_axis_tcp_tx_status_b_tready,
+     input  wire [63:0] s_axis_tcp_tx_status_b_tdata,
+     input  wire [7:0] s_axis_tcp_tx_status_b_tkeep,
+     input  wire         s_axis_tcp_tx_status_b_tlast,
+
+     // Метки t2/t1 берём с шин rx_data/tx_data половины a. Отдельных
+     // tap-портов не нужно: шины и так проходят через обёртку, подсматриваем
+     // их прямо здесь.
+     output wire         dbg_unused
 );
+
+// Заглушка выхода: нужна, чтобы синтез не выбросил обёртку целиком, если
+// s_axi_control окажется неподключённым на раннем этапе отладки BD.
+assign dbg_unused = 1'b0;
 
 // ── passthrough axis_net: провода насквозь, ни одного регистра ───────────────
 assign m_axis_net_rx_a_tvalid = s_axis_net_rx_a_tvalid;
@@ -171,8 +338,12 @@ net_frame_filter #(.EPD_MARKER(PP_MARKER)) flt_tx (
 // бы на первом же ARP или ACK.
 wire strobe_T2 = net_rx_ours;   // фильтр уже включает beat & tlast
 wire strobe_T1 = net_tx_ours;
-wire strobe_t2 = tap_rx_data_a_tvalid & tap_rx_data_a_tready & tap_rx_data_a_tlast;
-wire strobe_t1 = tap_tx_data_a_tvalid & tap_tx_data_a_tready & tap_tx_data_a_tlast;
+// Половина a: rx_data -- вход ядра (s_axis), tx_data -- выход (m_axis).
+// tready берём тот же провод, что видит ядро: считается передача слова.
+wire strobe_t2 = s_axis_tcp_rx_data_tvalid & s_axis_tcp_rx_data_tready
+                                          & s_axis_tcp_rx_data_tlast;
+wire strobe_t1 = m_axis_tcp_tx_data_tvalid & m_axis_tcp_tx_data_tready
+                                          & m_axis_tcp_tx_data_tlast;
 
 // ── сбор одного измерения ───────────────────────────────────────────────────
 //
@@ -376,21 +547,241 @@ always_ff @(posedge ap_clk) begin
      end
 end
 
-// ── арбитраж AXI-Lite между нами и ядром ────────────────────────────────────
+// ── арбитраж AXI-Lite: 0x000..0x0FF ядру, 0x100+ нам ────────────────────────
 //
-// ЗАГЛУШКА. Реальный арбитраж требует инстанса ядра здесь же и мультиплекса
-// всех сигналов AXI-Lite. Это следующий шаг: сначала надо убедиться, что
-// врезки и FIFO работают, а карта регистров ядра уже занята (0x00..0x5F) и
-// не конфликтует с 0x100+.
-assign s_axi_control_awready = aw_ours ? !wr_pending : 1'b0;
-assign s_axi_control_wready  = aw_ours ? wr_pending  : 1'b0;
-assign s_axi_control_bresp   = 2'b00;
-assign s_axi_control_bvalid  = 1'b0;
-assign s_axi_control_arready = ar_ours ? !rd_valid_r : 1'b0;
-assign s_axi_control_rdata   = rd_data_r;
-assign s_axi_control_rresp   = 2'b00;
-assign s_axi_control_rvalid  = rd_valid_r;
-assign interrupt             = 1'b0;
+// РАЗДЕЛЕНИЕ ПО СТАРШИМ БИТАМ АДРЕСА, без декодера диапазонов. У ядра карта
+// 0x00..0x50 (xhls_pp_dual_krnl_hw.h), у нас с 0x100 -- значит достаточно
+// проверить addr[11:8]: ноль -- ядро, иначе мы. Запас в четыре с лишним раза,
+// так что новые скаляры ядра карту не сдвинут.
+//
+// ПОЧЕМУ НЕ ОДИН smartconnect В BD. Он потребовал бы второй AXI-Lite порт у
+// обёртки и правки build_bd.tcl -- скрипта, на котором держатся все ядра
+// репозитория. Здесь мультиплекс на десяток строк и ничего снаружи не
+// меняется: BD видит один s_axi_control, как у любого HLS-ядра.
+
+// Сигналы к control_s_axi ядра: пропускаем только свой диапазон.
+wire k_awvalid = s_axi_control_awvalid & ~aw_ours;
+wire k_wvalid  = s_axi_control_wvalid  & ~aw_ours;
+wire k_arvalid = s_axi_control_arvalid & ~ar_ours;
+wire k_bready  = s_axi_control_bready  & ~aw_ours;
+wire k_rready  = s_axi_control_rready  & ~ar_ours;
+
+wire        k_awready, k_wready, k_bvalid, k_arready, k_rvalid;
+wire [1:0]  k_bresp, k_rresp;
+wire [31:0] k_rdata;
+wire        k_interrupt;
+
+// Ответы мультиплексируем по тому же признаку. Наш путь -- регистры выше.
+assign s_axi_control_awready = aw_ours ? !wr_pending  : k_awready;
+assign s_axi_control_wready  = aw_ours ?  wr_pending  : k_wready;
+assign s_axi_control_arready = ar_ours ? !rd_valid_r  : k_arready;
+
+// bvalid для нашего диапазона: поднимаем на один такт после приёма данных.
+// Без этого запись в наш регистр повисла бы -- хост ждёт ответа по каналу B.
+logic our_bvalid;
+always_ff @(posedge ap_clk) begin
+     if (~ap_rst_n)                          our_bvalid <= 1'b0;
+     else if (wr_pending && s_axi_control_wvalid) our_bvalid <= 1'b1;
+     else if (our_bvalid && s_axi_control_bready)  our_bvalid <= 1'b0;
+end
+
+assign s_axi_control_bvalid = our_bvalid | k_bvalid;
+assign s_axi_control_bresp  = our_bvalid ? 2'b00 : k_bresp;
+assign s_axi_control_rvalid = rd_valid_r | k_rvalid;
+assign s_axi_control_rdata  = rd_valid_r ? rd_data_r : k_rdata;
+assign s_axi_control_rresp  = rd_valid_r ? 2'b00    : k_rresp;
+assign interrupt            = k_interrupt;
+
+// ── инстанс HLS-ядра ────────────────────────────────────────────────────────
+//
+// Имя модуля -- hls_pp_dual_krnl_ip: так его переименовывает create_ip в
+// package_*.tcl. Порты AXI-Stream в верхнем регистре (_TVALID и т.п.) --
+// так их генерирует HLS.
+hls_pp_dual_krnl_ip u_krnl (
+     .ap_clk   ( ap_clk   ),
+     .ap_rst_n ( ap_rst_n ),
+
+     .s_axis_udp_rx_TVALID ( s_axis_udp_rx_tvalid ),
+     .s_axis_udp_rx_TREADY ( s_axis_udp_rx_tready ),
+     .s_axis_udp_rx_TDATA  ( s_axis_udp_rx_tdata  ),
+     .s_axis_udp_rx_TKEEP  ( s_axis_udp_rx_tkeep  ),
+     .s_axis_udp_rx_TLAST  ( s_axis_udp_rx_tlast  ),
+     .m_axis_udp_tx_TVALID ( m_axis_udp_tx_tvalid ),
+     .m_axis_udp_tx_TREADY ( m_axis_udp_tx_tready ),
+     .m_axis_udp_tx_TDATA  ( m_axis_udp_tx_tdata  ),
+     .m_axis_udp_tx_TKEEP  ( m_axis_udp_tx_tkeep  ),
+     .m_axis_udp_tx_TLAST  ( m_axis_udp_tx_tlast  ),
+     .s_axis_udp_rx_meta_TVALID ( s_axis_udp_rx_meta_tvalid ),
+     .s_axis_udp_rx_meta_TREADY ( s_axis_udp_rx_meta_tready ),
+     .s_axis_udp_rx_meta_TDATA  ( s_axis_udp_rx_meta_tdata  ),
+     .s_axis_udp_rx_meta_TKEEP  ( s_axis_udp_rx_meta_tkeep  ),
+     .s_axis_udp_rx_meta_TLAST  ( s_axis_udp_rx_meta_tlast  ),
+     .m_axis_udp_tx_meta_TVALID ( m_axis_udp_tx_meta_tvalid ),
+     .m_axis_udp_tx_meta_TREADY ( m_axis_udp_tx_meta_tready ),
+     .m_axis_udp_tx_meta_TDATA  ( m_axis_udp_tx_meta_tdata  ),
+     .m_axis_udp_tx_meta_TKEEP  ( m_axis_udp_tx_meta_tkeep  ),
+     .m_axis_udp_tx_meta_TLAST  ( m_axis_udp_tx_meta_tlast  ),
+     .m_axis_tcp_listen_port_TVALID ( m_axis_tcp_listen_port_tvalid ),
+     .m_axis_tcp_listen_port_TREADY ( m_axis_tcp_listen_port_tready ),
+     .m_axis_tcp_listen_port_TDATA  ( m_axis_tcp_listen_port_tdata  ),
+     .m_axis_tcp_listen_port_TKEEP  ( m_axis_tcp_listen_port_tkeep  ),
+     .m_axis_tcp_listen_port_TLAST  ( m_axis_tcp_listen_port_tlast  ),
+     .s_axis_tcp_port_status_TVALID ( s_axis_tcp_port_status_tvalid ),
+     .s_axis_tcp_port_status_TREADY ( s_axis_tcp_port_status_tready ),
+     .s_axis_tcp_port_status_TDATA  ( s_axis_tcp_port_status_tdata  ),
+     .s_axis_tcp_port_status_TKEEP  ( s_axis_tcp_port_status_tkeep  ),
+     .s_axis_tcp_port_status_TLAST  ( s_axis_tcp_port_status_tlast  ),
+     .m_axis_tcp_open_connection_TVALID ( m_axis_tcp_open_connection_tvalid ),
+     .m_axis_tcp_open_connection_TREADY ( m_axis_tcp_open_connection_tready ),
+     .m_axis_tcp_open_connection_TDATA  ( m_axis_tcp_open_connection_tdata  ),
+     .m_axis_tcp_open_connection_TKEEP  ( m_axis_tcp_open_connection_tkeep  ),
+     .m_axis_tcp_open_connection_TLAST  ( m_axis_tcp_open_connection_tlast  ),
+     .s_axis_tcp_open_status_TVALID ( s_axis_tcp_open_status_tvalid ),
+     .s_axis_tcp_open_status_TREADY ( s_axis_tcp_open_status_tready ),
+     .s_axis_tcp_open_status_TDATA  ( s_axis_tcp_open_status_tdata  ),
+     .s_axis_tcp_open_status_TKEEP  ( s_axis_tcp_open_status_tkeep  ),
+     .s_axis_tcp_open_status_TLAST  ( s_axis_tcp_open_status_tlast  ),
+     .m_axis_tcp_close_connection_TVALID ( m_axis_tcp_close_connection_tvalid ),
+     .m_axis_tcp_close_connection_TREADY ( m_axis_tcp_close_connection_tready ),
+     .m_axis_tcp_close_connection_TDATA  ( m_axis_tcp_close_connection_tdata  ),
+     .m_axis_tcp_close_connection_TKEEP  ( m_axis_tcp_close_connection_tkeep  ),
+     .m_axis_tcp_close_connection_TLAST  ( m_axis_tcp_close_connection_tlast  ),
+     .s_axis_tcp_notification_TVALID ( s_axis_tcp_notification_tvalid ),
+     .s_axis_tcp_notification_TREADY ( s_axis_tcp_notification_tready ),
+     .s_axis_tcp_notification_TDATA  ( s_axis_tcp_notification_tdata  ),
+     .s_axis_tcp_notification_TKEEP  ( s_axis_tcp_notification_tkeep  ),
+     .s_axis_tcp_notification_TLAST  ( s_axis_tcp_notification_tlast  ),
+     .m_axis_tcp_read_pkg_TVALID ( m_axis_tcp_read_pkg_tvalid ),
+     .m_axis_tcp_read_pkg_TREADY ( m_axis_tcp_read_pkg_tready ),
+     .m_axis_tcp_read_pkg_TDATA  ( m_axis_tcp_read_pkg_tdata  ),
+     .m_axis_tcp_read_pkg_TKEEP  ( m_axis_tcp_read_pkg_tkeep  ),
+     .m_axis_tcp_read_pkg_TLAST  ( m_axis_tcp_read_pkg_tlast  ),
+     .s_axis_tcp_rx_meta_TVALID ( s_axis_tcp_rx_meta_tvalid ),
+     .s_axis_tcp_rx_meta_TREADY ( s_axis_tcp_rx_meta_tready ),
+     .s_axis_tcp_rx_meta_TDATA  ( s_axis_tcp_rx_meta_tdata  ),
+     .s_axis_tcp_rx_meta_TKEEP  ( s_axis_tcp_rx_meta_tkeep  ),
+     .s_axis_tcp_rx_meta_TLAST  ( s_axis_tcp_rx_meta_tlast  ),
+     .s_axis_tcp_rx_data_TVALID ( s_axis_tcp_rx_data_tvalid ),
+     .s_axis_tcp_rx_data_TREADY ( s_axis_tcp_rx_data_tready ),
+     .s_axis_tcp_rx_data_TDATA  ( s_axis_tcp_rx_data_tdata  ),
+     .s_axis_tcp_rx_data_TKEEP  ( s_axis_tcp_rx_data_tkeep  ),
+     .s_axis_tcp_rx_data_TLAST  ( s_axis_tcp_rx_data_tlast  ),
+     .m_axis_tcp_tx_meta_TVALID ( m_axis_tcp_tx_meta_tvalid ),
+     .m_axis_tcp_tx_meta_TREADY ( m_axis_tcp_tx_meta_tready ),
+     .m_axis_tcp_tx_meta_TDATA  ( m_axis_tcp_tx_meta_tdata  ),
+     .m_axis_tcp_tx_meta_TKEEP  ( m_axis_tcp_tx_meta_tkeep  ),
+     .m_axis_tcp_tx_meta_TLAST  ( m_axis_tcp_tx_meta_tlast  ),
+     .m_axis_tcp_tx_data_TVALID ( m_axis_tcp_tx_data_tvalid ),
+     .m_axis_tcp_tx_data_TREADY ( m_axis_tcp_tx_data_tready ),
+     .m_axis_tcp_tx_data_TDATA  ( m_axis_tcp_tx_data_tdata  ),
+     .m_axis_tcp_tx_data_TKEEP  ( m_axis_tcp_tx_data_tkeep  ),
+     .m_axis_tcp_tx_data_TLAST  ( m_axis_tcp_tx_data_tlast  ),
+     .s_axis_tcp_tx_status_TVALID ( s_axis_tcp_tx_status_tvalid ),
+     .s_axis_tcp_tx_status_TREADY ( s_axis_tcp_tx_status_tready ),
+     .s_axis_tcp_tx_status_TDATA  ( s_axis_tcp_tx_status_tdata  ),
+     .s_axis_tcp_tx_status_TKEEP  ( s_axis_tcp_tx_status_tkeep  ),
+     .s_axis_tcp_tx_status_TLAST  ( s_axis_tcp_tx_status_tlast  ),
+     .s_axis_udp_rx_b_TVALID ( s_axis_udp_rx_b_tvalid ),
+     .s_axis_udp_rx_b_TREADY ( s_axis_udp_rx_b_tready ),
+     .s_axis_udp_rx_b_TDATA  ( s_axis_udp_rx_b_tdata  ),
+     .s_axis_udp_rx_b_TKEEP  ( s_axis_udp_rx_b_tkeep  ),
+     .s_axis_udp_rx_b_TLAST  ( s_axis_udp_rx_b_tlast  ),
+     .m_axis_udp_tx_b_TVALID ( m_axis_udp_tx_b_tvalid ),
+     .m_axis_udp_tx_b_TREADY ( m_axis_udp_tx_b_tready ),
+     .m_axis_udp_tx_b_TDATA  ( m_axis_udp_tx_b_tdata  ),
+     .m_axis_udp_tx_b_TKEEP  ( m_axis_udp_tx_b_tkeep  ),
+     .m_axis_udp_tx_b_TLAST  ( m_axis_udp_tx_b_tlast  ),
+     .s_axis_udp_rx_meta_b_TVALID ( s_axis_udp_rx_meta_b_tvalid ),
+     .s_axis_udp_rx_meta_b_TREADY ( s_axis_udp_rx_meta_b_tready ),
+     .s_axis_udp_rx_meta_b_TDATA  ( s_axis_udp_rx_meta_b_tdata  ),
+     .s_axis_udp_rx_meta_b_TKEEP  ( s_axis_udp_rx_meta_b_tkeep  ),
+     .s_axis_udp_rx_meta_b_TLAST  ( s_axis_udp_rx_meta_b_tlast  ),
+     .m_axis_udp_tx_meta_b_TVALID ( m_axis_udp_tx_meta_b_tvalid ),
+     .m_axis_udp_tx_meta_b_TREADY ( m_axis_udp_tx_meta_b_tready ),
+     .m_axis_udp_tx_meta_b_TDATA  ( m_axis_udp_tx_meta_b_tdata  ),
+     .m_axis_udp_tx_meta_b_TKEEP  ( m_axis_udp_tx_meta_b_tkeep  ),
+     .m_axis_udp_tx_meta_b_TLAST  ( m_axis_udp_tx_meta_b_tlast  ),
+     .m_axis_tcp_listen_port_b_TVALID ( m_axis_tcp_listen_port_b_tvalid ),
+     .m_axis_tcp_listen_port_b_TREADY ( m_axis_tcp_listen_port_b_tready ),
+     .m_axis_tcp_listen_port_b_TDATA  ( m_axis_tcp_listen_port_b_tdata  ),
+     .m_axis_tcp_listen_port_b_TKEEP  ( m_axis_tcp_listen_port_b_tkeep  ),
+     .m_axis_tcp_listen_port_b_TLAST  ( m_axis_tcp_listen_port_b_tlast  ),
+     .s_axis_tcp_port_status_b_TVALID ( s_axis_tcp_port_status_b_tvalid ),
+     .s_axis_tcp_port_status_b_TREADY ( s_axis_tcp_port_status_b_tready ),
+     .s_axis_tcp_port_status_b_TDATA  ( s_axis_tcp_port_status_b_tdata  ),
+     .s_axis_tcp_port_status_b_TKEEP  ( s_axis_tcp_port_status_b_tkeep  ),
+     .s_axis_tcp_port_status_b_TLAST  ( s_axis_tcp_port_status_b_tlast  ),
+     .m_axis_tcp_open_connection_b_TVALID ( m_axis_tcp_open_connection_b_tvalid ),
+     .m_axis_tcp_open_connection_b_TREADY ( m_axis_tcp_open_connection_b_tready ),
+     .m_axis_tcp_open_connection_b_TDATA  ( m_axis_tcp_open_connection_b_tdata  ),
+     .m_axis_tcp_open_connection_b_TKEEP  ( m_axis_tcp_open_connection_b_tkeep  ),
+     .m_axis_tcp_open_connection_b_TLAST  ( m_axis_tcp_open_connection_b_tlast  ),
+     .s_axis_tcp_open_status_b_TVALID ( s_axis_tcp_open_status_b_tvalid ),
+     .s_axis_tcp_open_status_b_TREADY ( s_axis_tcp_open_status_b_tready ),
+     .s_axis_tcp_open_status_b_TDATA  ( s_axis_tcp_open_status_b_tdata  ),
+     .s_axis_tcp_open_status_b_TKEEP  ( s_axis_tcp_open_status_b_tkeep  ),
+     .s_axis_tcp_open_status_b_TLAST  ( s_axis_tcp_open_status_b_tlast  ),
+     .m_axis_tcp_close_connection_b_TVALID ( m_axis_tcp_close_connection_b_tvalid ),
+     .m_axis_tcp_close_connection_b_TREADY ( m_axis_tcp_close_connection_b_tready ),
+     .m_axis_tcp_close_connection_b_TDATA  ( m_axis_tcp_close_connection_b_tdata  ),
+     .m_axis_tcp_close_connection_b_TKEEP  ( m_axis_tcp_close_connection_b_tkeep  ),
+     .m_axis_tcp_close_connection_b_TLAST  ( m_axis_tcp_close_connection_b_tlast  ),
+     .s_axis_tcp_notification_b_TVALID ( s_axis_tcp_notification_b_tvalid ),
+     .s_axis_tcp_notification_b_TREADY ( s_axis_tcp_notification_b_tready ),
+     .s_axis_tcp_notification_b_TDATA  ( s_axis_tcp_notification_b_tdata  ),
+     .s_axis_tcp_notification_b_TKEEP  ( s_axis_tcp_notification_b_tkeep  ),
+     .s_axis_tcp_notification_b_TLAST  ( s_axis_tcp_notification_b_tlast  ),
+     .m_axis_tcp_read_pkg_b_TVALID ( m_axis_tcp_read_pkg_b_tvalid ),
+     .m_axis_tcp_read_pkg_b_TREADY ( m_axis_tcp_read_pkg_b_tready ),
+     .m_axis_tcp_read_pkg_b_TDATA  ( m_axis_tcp_read_pkg_b_tdata  ),
+     .m_axis_tcp_read_pkg_b_TKEEP  ( m_axis_tcp_read_pkg_b_tkeep  ),
+     .m_axis_tcp_read_pkg_b_TLAST  ( m_axis_tcp_read_pkg_b_tlast  ),
+     .s_axis_tcp_rx_meta_b_TVALID ( s_axis_tcp_rx_meta_b_tvalid ),
+     .s_axis_tcp_rx_meta_b_TREADY ( s_axis_tcp_rx_meta_b_tready ),
+     .s_axis_tcp_rx_meta_b_TDATA  ( s_axis_tcp_rx_meta_b_tdata  ),
+     .s_axis_tcp_rx_meta_b_TKEEP  ( s_axis_tcp_rx_meta_b_tkeep  ),
+     .s_axis_tcp_rx_meta_b_TLAST  ( s_axis_tcp_rx_meta_b_tlast  ),
+     .s_axis_tcp_rx_data_b_TVALID ( s_axis_tcp_rx_data_b_tvalid ),
+     .s_axis_tcp_rx_data_b_TREADY ( s_axis_tcp_rx_data_b_tready ),
+     .s_axis_tcp_rx_data_b_TDATA  ( s_axis_tcp_rx_data_b_tdata  ),
+     .s_axis_tcp_rx_data_b_TKEEP  ( s_axis_tcp_rx_data_b_tkeep  ),
+     .s_axis_tcp_rx_data_b_TLAST  ( s_axis_tcp_rx_data_b_tlast  ),
+     .m_axis_tcp_tx_meta_b_TVALID ( m_axis_tcp_tx_meta_b_tvalid ),
+     .m_axis_tcp_tx_meta_b_TREADY ( m_axis_tcp_tx_meta_b_tready ),
+     .m_axis_tcp_tx_meta_b_TDATA  ( m_axis_tcp_tx_meta_b_tdata  ),
+     .m_axis_tcp_tx_meta_b_TKEEP  ( m_axis_tcp_tx_meta_b_tkeep  ),
+     .m_axis_tcp_tx_meta_b_TLAST  ( m_axis_tcp_tx_meta_b_tlast  ),
+     .m_axis_tcp_tx_data_b_TVALID ( m_axis_tcp_tx_data_b_tvalid ),
+     .m_axis_tcp_tx_data_b_TREADY ( m_axis_tcp_tx_data_b_tready ),
+     .m_axis_tcp_tx_data_b_TDATA  ( m_axis_tcp_tx_data_b_tdata  ),
+     .m_axis_tcp_tx_data_b_TKEEP  ( m_axis_tcp_tx_data_b_tkeep  ),
+     .m_axis_tcp_tx_data_b_TLAST  ( m_axis_tcp_tx_data_b_tlast  ),
+     .s_axis_tcp_tx_status_b_TVALID ( s_axis_tcp_tx_status_b_tvalid ),
+     .s_axis_tcp_tx_status_b_TREADY ( s_axis_tcp_tx_status_b_tready ),
+     .s_axis_tcp_tx_status_b_TDATA  ( s_axis_tcp_tx_status_b_tdata  ),
+     .s_axis_tcp_tx_status_b_TKEEP  ( s_axis_tcp_tx_status_b_tkeep  ),
+     .s_axis_tcp_tx_status_b_TLAST  ( s_axis_tcp_tx_status_b_tlast  ),
+
+     // AXI-Lite ядра: только свой диапазон адресов.
+     .s_axi_control_AWADDR  ( s_axi_control_awaddr[5:0] ),
+     .s_axi_control_AWVALID ( k_awvalid                 ),
+     .s_axi_control_AWREADY ( k_awready                 ),
+     .s_axi_control_WDATA   ( s_axi_control_wdata       ),
+     .s_axi_control_WSTRB   ( s_axi_control_wstrb       ),
+     .s_axi_control_WVALID  ( k_wvalid                  ),
+     .s_axi_control_WREADY  ( k_wready                  ),
+     .s_axi_control_BRESP   ( k_bresp                   ),
+     .s_axi_control_BVALID  ( k_bvalid                  ),
+     .s_axi_control_BREADY  ( k_bready                  ),
+     .s_axi_control_ARADDR  ( s_axi_control_araddr[5:0] ),
+     .s_axi_control_ARVALID ( k_arvalid                 ),
+     .s_axi_control_ARREADY ( k_arready                 ),
+     .s_axi_control_RDATA   ( k_rdata                   ),
+     .s_axi_control_RRESP   ( k_rresp                   ),
+     .s_axi_control_RVALID  ( k_rvalid                  ),
+     .s_axi_control_RREADY  ( k_rready                  ),
+     .interrupt             ( k_interrupt               )
+);
 
 endmodule
 
