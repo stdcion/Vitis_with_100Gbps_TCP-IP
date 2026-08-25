@@ -84,12 +84,16 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-module net_frame_filter #(
-     // Маркер в payload[4..9]. Должен совпадать с константой, которую пишет
-     // ядро (hls_echo_probe_dual_krnl.cpp, состояние SEND_DATA). Параметр, а не
-     // localparam, чтобы значение стояло в одном месте на все четыре инстанса.
-     parameter [47:0] EPD_MARKER = 48'h5A3C96E1B7D2
-)(
+// БЕЗ ПАРАМЕТРОВ. У probe здесь был parameter [47:0] EPD_MARKER, и это
+// работало, потому что probe инстанцировал фильтр четыре раза и передавал
+// значение сверху. Но векторный параметр -- ровно то, на чём ipx-парсер
+// спотыкался в обёртке pp_dual (три прогона pack без объяснения причины), и
+// оставлять его здесь значит держать ту же мину.
+//
+// Значение теперь localparam внутри. Согласованность с ppclient проверяется
+// тестом host/hls_pp_dual_krnl/marker_test.go, который ЧИТАЕТ ЭТОТ ФАЙЛ и
+// раскладывает константу по битам -- то есть источник истины остался один.
+module net_frame_filter (
      input  wire         ap_clk,
      input  wire         ap_rst_n,
 
@@ -105,6 +109,11 @@ module net_frame_filter #(
      output reg  [31:0]  count_ours,   // прошло фильтр
      output reg  [31:0]  count_drop    // отсеяно (ARP/ACK/ICMP/SYN)
 );
+
+     // Маркер в payload[4..9] -- см. шапку. Значение должно совпадать с
+     // var marker в host/hls_pp_dual_krnl/main.go (порядок байт обратный к
+     // hex-записи, там это разобрано).
+     localparam [47:0] EPD_MARKER = 48'h5A3C96E1B7D2;
 
      // tready ОБЯЗАТЕЛЕН: без него считается предъявление, а не передача, и при
      // backpressure счёт слов уедет вместе с таймстемпом.

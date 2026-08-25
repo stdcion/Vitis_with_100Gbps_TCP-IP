@@ -40,12 +40,23 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-module hls_pp_dual_krnl_wrapper #(
-     // Порог длины кадра в 512-битных словах и маркер -- см. net_frame_filter.v.
-     // Значение маркера должно совпадать с тем, что пишет ppclient в
-     // payload[4..9] (host/hls_pp_dual_krnl/main.go, var marker).
-     parameter [47:0] PP_MARKER = 48'h5A3C96E1B7D2
-)(
+// БЕЗ ПАРАМЕТРОВ У МОДУЛЯ, И ЭТО ВЫНУЖДЕННО.
+//
+// Здесь стоял parameter [47:0] PP_MARKER -- 48-битный вектор. Именно на нём
+// Vivado не разбирал обёртку: три прогона pack показывали
+//
+//     CRITICAL WARNING [filemgmt 20-742] top can not be validated
+//     -> Vivado взял: lat_fifo
+//
+// без единой строки о причине. У probe, который через этот путь прошёл,
+// параметры ТОЛЬКО integer (C_S_AXI_CONTROL_DATA_WIDTH и подобные) --
+// векторных нет вовсе. Та же ловушка, что была в lat_fifo.v с DEPTH: ipx
+// разбирает integer, а выражения над векторами -- нет.
+//
+// Маркер теперь localparam внутри модуля. Параметризация не нужна: инстанс
+// один, значение задано в трёх местах (здесь, net_frame_filter.v, main.go) и
+// сверяется тестом host/hls_pp_dual_krnl/marker_test.go.
+module hls_pp_dual_krnl_wrapper (
      input  wire         ap_clk,
      input  wire         ap_rst_n,
 
@@ -272,6 +283,10 @@ module hls_pp_dual_krnl_wrapper #(
 // s_axi_control окажется неподключённым на раннем этапе отладки BD.
 assign dbg_unused = 1'b0;
 
+// Маркер задан localparam-ом ВНУТРИ net_frame_filter.v -- туда же смотрит
+// тест marker_test.go. Передавать его сверху параметром нельзя: векторный
+// параметр и есть то, на чём Vivado не разбирал обёртку.
+
 // ── passthrough axis_net: провода насквозь, ни одного регистра ───────────────
 assign m_axis_net_rx_a_tvalid = s_axis_net_rx_a_tvalid;
 assign m_axis_net_rx_a_tdata  = s_axis_net_rx_a_tdata;
@@ -311,7 +326,7 @@ reg        fifo_pop;
 wire        net_rx_ours, net_tx_ours;
 wire [31:0] nf_cnt_rx, nf_cnt_tx, nf_drp_rx, nf_drp_tx;
 
-net_frame_filter #(.EPD_MARKER(PP_MARKER)) flt_rx (
+net_frame_filter flt_rx (
      .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
      .tvalid(s_axis_net_rx_a_tvalid), .tready(m_axis_net_rx_a_tready),
      .tlast(s_axis_net_rx_a_tlast),   .tdata(s_axis_net_rx_a_tdata),
@@ -320,7 +335,7 @@ net_frame_filter #(.EPD_MARKER(PP_MARKER)) flt_rx (
      .count_ours(nf_cnt_rx), .count_drop(nf_drp_rx)
 );
 
-net_frame_filter #(.EPD_MARKER(PP_MARKER)) flt_tx (
+net_frame_filter flt_tx (
      .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
      .tvalid(s_axis_net_tx_a_tvalid), .tready(m_axis_net_tx_a_tready),
      .tlast(s_axis_net_tx_a_tlast),   .tdata(s_axis_net_tx_a_tdata),
