@@ -30,6 +30,12 @@
 #
 #     hls_echo_probe_dual_krnl (TCP stack latency measurement):
 #         see the epd_* section at the bottom of this file
+#     hls_pp_dual_krnl (TCP echo + axis_net timing taps):
+#         pp_dual_bringup                    both stacks up, kernel started
+#         pp_taps_status                     did the filter recognise our frames
+#         pp_measure                         min/med/max of the three intervals
+#         pp_raw                             raw stamps as CSV
+#         see the pp_* section at the bottom of this file
 #
 #     Every procedure below can also be called on its own via the trailing
 #     argument n (1=QSFP0, 2=QSFP1).
@@ -2871,4 +2877,22 @@ proc pp_minwords {v {n 1}} {
      puts "minWords = $rb"
      if {$rb != $v} { puts "  *** WRITE NOT CONFIRMED -- wrong base or bitstream" }
      if {$rb < 2}   { puts "  *** below 2: ACK/ARP will pass the filter" }
+}
+
+# Saves the FIFO to a CSV file. Same data pp_raw prints, without the
+# open/puts/close incantation -- that line needs backslash escaping when typed
+# through -tclargs, and getting it wrong writes a file containing the literal
+# command instead of the data.
+#
+# Path with FORWARD slashes even on Windows: Tcl treats a backslash as an
+# escape, so C:\pp_raw.csv silently becomes C:pp_raw.csv (current directory).
+proc pp_save {{path pp_raw.csv} {n 1}} {
+     set csv [pp_raw 0 $n]
+     set fh [open $path w]
+     puts $fh $csv
+     close $fh
+     set rows [expr {[llength [split $csv "\n"]] - 1}]
+     puts ""
+     puts "saved $rows measurements to [file normalize $path]"
+     return $path
 }
