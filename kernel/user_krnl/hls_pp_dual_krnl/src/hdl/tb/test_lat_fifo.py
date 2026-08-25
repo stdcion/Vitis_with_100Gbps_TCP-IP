@@ -16,7 +16,8 @@
 
 import sys
 
-DEPTH = 128
+DEPTH = 512          # слов; измерений = DEPTH/4 = 128
+WORDS_PER_SAMPLE = 4
 
 
 class LatFifo:
@@ -51,22 +52,41 @@ class LatFifo:
         # пережить чистку данных.
         self.wr = self.rd = self.cnt = 0
 
-    def tick(self, wr_en=False, wr_data=0, rd_pop=False):
-        if wr_en and not self.full and rd_pop and not self.empty:
-            self.mem[self.wr] = wr_data
-            self.wr = (self.wr + 1) % self.depth
-            self.rd = (self.rd + 1) % self.depth
-        elif wr_en and not self.full:
-            self.mem[self.wr] = wr_data
-            self.wr = (self.wr + 1) % self.depth
-            self.cnt += 1
-        elif rd_pop and not self.empty:
-            self.rd = (self.rd + 1) % self.depth
+    @property
+    def room4(self):
+        return self.cnt <= self.depth - WORDS_PER_SAMPLE
+
+    def tick(self, wr_en=False, stamps=None, rd_pop=False):
+        """stamps -- четвёрка (T2, t2, t1, T1) или None.
+
+        ВСЕ УСЛОВИЯ ВЫЧИСЛЯЮТСЯ ДО ИЗМЕНЕНИЯ СОСТОЯНИЯ. В HDL правая часть
+        неблокирующего присваивания берёт значение регистра ДО такта, поэтому
+        room4 и empty должны быть посчитаны один раз в начале.
+
+        Первая версия читала self.room4 повторно после self.cnt += 4 --
+        и получала уже новое значение. Тест ловил "потерю" последней записи
+        до края, которой в железе нет. Дефект был в модели, не в .v.
+        """
+        room4 = self.room4
+        was_empty = self.empty
+
+        if wr_en and room4:
+            for k in range(WORDS_PER_SAMPLE):
+                self.mem[(self.wr + k) % self.depth] = stamps[k]
+            self.wr = (self.wr + WORDS_PER_SAMPLE) % self.depth
+
+        if wr_en and room4 and rd_pop and not was_empty:
+            self.cnt += WORDS_PER_SAMPLE - 1
+        elif wr_en and room4:
+            self.cnt += WORDS_PER_SAMPLE
+        elif rd_pop and not was_empty:
             self.cnt -= 1
-            # full && rd_pop: запись отбрасывается, но ЗАСЧИТЫВАЕТСЯ.
-            if wr_en:
-                self.ovf += 1
-        elif wr_en:
+
+        if rd_pop and not was_empty:
+            self.rd = (self.rd + 1) % self.depth
+
+        # Потеря засчитывается ВСЕГДА, когда строб был, а места не было.
+        if wr_en and not room4:
             self.ovf += 1
 
 
@@ -82,6 +102,29 @@ def check(cond, what):
         fails += 1
 
 
+def sample(base):
+    """Правдоподобная четвёрка меток: T2 < t2 < t1 < T1.
+
+    Числа взяты из бюджета задержки (docs/toe-latency-budget-estimate):
+    приём стека ~40 тактов, ядро ~10, передача ~40. Абсолютные значения не
+    важны -- важно, что дельты положительны и сумма сходится.
+    """
+    T2 = base
+    t2 = base + 40
+    t1 = base + 50
+    T1 = base + 90
+    return (T2, t2, t1, T1)
+
+
+def drain(f):
+    """Вычитывает FIFO целиком и собирает четвёрки, как это сделает хост."""
+    words = []
+    while not f.empty:
+        words.append(f.rd_data())
+        f.tick(rd_pop=True)
+    return [tuple(words[i:i + 4]) for i in range(0, len(words), 4)]
+
+
 # ---------------------------------------------------------------------------
 print("[1] пустое FIFO")
 f = LatFifo()
@@ -89,131 +132,141 @@ check(f.empty and not f.full and f.cnt == 0, "после сброса пусто
 check(f.ovf == 0, "overflow ноль")
 
 # ---------------------------------------------------------------------------
-print("\n[2] запись и чтение по одному")
+print("\n[2] одно измерение: четыре слова, порядок T2,t2,t1,T1")
 f = LatFifo()
-f.tick(wr_en=True, wr_data=0xAAA)
-check(f.cnt == 1 and not f.empty, "одна запись легла")
-check(f.rd_data() == 0xAAA, "читается то, что записали")
-f.tick(rd_pop=True)
-check(f.cnt == 0 and f.empty, "после pop снова пусто")
+f.tick(wr_en=True, stamps=sample(1000))
+check(f.cnt == 4, "легло РОВНО четыре слова")
+got = drain(f)
+check(len(got) == 1, "вычитана одна четвёрка")
+check(got[0] == (1000, 1040, 1050, 1090), "метки в порядке T2,t2,t1,T1")
 
 # ---------------------------------------------------------------------------
-print("\n[3] порядок FIFO сохраняется")
+print("\n[3] СОГЛАСОВАННОСТЬ: суммa интервалов равна полному")
+#
+# Главная проверка, ради которой метки хранятся сырыми. Хост считает
+# (t2-T2) + (t1-t2) + (T1-t1) и сверяет с (T1-T2). Не сойдётся -- значит
+# метки от разных пакетов, и такую строку надо помечать, а не усреднять.
+# Тот же приём в epd_raw: колонка status с флагом TORN.
 f = LatFifo()
 for i in range(10):
-    f.tick(wr_en=True, wr_data=0x100 + i)
-got = []
-for _ in range(10):
-    got.append(f.rd_data())
-    f.tick(rd_pop=True)
-check(got == [0x100 + i for i in range(10)], "порядок первый-вошёл-первый-вышел")
+    f.tick(wr_en=True, stamps=sample(5000 + i * 200))
+bad = 0
+for (T2, t2, t1, T1) in drain(f):
+    if (t2 - T2) + (t1 - t2) + (T1 - t1) != (T1 - T2):
+        bad += 1
+check(bad == 0, "все 10 четвёрок согласованы")
 
 # ---------------------------------------------------------------------------
-print("\n[4] заполнение до края")
+print("\n[4] порядок измерений сохраняется")
 f = LatFifo()
-for i in range(DEPTH):
-    f.tick(wr_en=True, wr_data=i)
-check(f.cnt == DEPTH and f.full, "ровно DEPTH записей, full поднят")
+for i in range(20):
+    f.tick(wr_en=True, stamps=sample(i * 1000))
+got = drain(f)
+check([g[0] for g in got] == [i * 1000 for i in range(20)],
+      "измерения вышли в порядке записи")
+
+# ---------------------------------------------------------------------------
+print("\n[5] заполнение до края: ровно DEPTH/4 измерений")
+f = LatFifo()
+for i in range(DEPTH // 4):
+    f.tick(wr_en=True, stamps=sample(i * 100))
+check(f.cnt == DEPTH and f.full, "%d слов, full поднят" % DEPTH)
 check(f.ovf == 0, "ни одной потери до края")
 
 # ---------------------------------------------------------------------------
-print("\n[5] ПЕРЕПОЛНЕНИЕ: старое цело, новое отброшено")
+print("\n[6] ПЕРЕПОЛНЕНИЕ: старое цело, новое отброшено ЦЕЛИКОМ")
 #
-# Это главное требование: "чтобы фифо нормально сработало, без переключений".
-# Проверяем ИМЕННО ЭТО -- что первые DEPTH записей не пострадали.
+# Требование было: "чтобы фифо нормально сработало, без переключений".
+# Проверяем два свойства сразу:
+#   * первые DEPTH/4 измерений не пострадали;
+#   * отброшенные ушли ЧЕТВЁРКАМИ -- ни одного склеенного из двух пакетов.
 f = LatFifo()
-for i in range(DEPTH + 50):
-    f.tick(wr_en=True, wr_data=0x1000 + i)
-check(f.ovf == 50, "потерь ровно 50 (лишние записи)")
-check(f.cnt == DEPTH, "в FIFO по-прежнему DEPTH записей")
-got = []
-for _ in range(DEPTH):
-    got.append(f.rd_data())
-    f.tick(rd_pop=True)
-expect = [0x1000 + i for i in range(DEPTH)]
-check(got == expect, "СТАРЫЕ записи целы -- лежат ПЕРВЫЕ DEPTH, без затирания")
+total = DEPTH // 4 + 37
+for i in range(total):
+    f.tick(wr_en=True, stamps=sample(i * 100))
+check(f.ovf == 37, "потеряно ровно 37 ИЗМЕРЕНИЙ (не слов)")
+check(f.cnt == DEPTH, "в FIFO по-прежнему полно")
+got = drain(f)
+check(len(got) == DEPTH // 4, "вычитано %d измерений" % (DEPTH // 4))
+check([g[0] for g in got] == [i * 100 for i in range(DEPTH // 4)],
+      "СТАРЫЕ измерения целы: первые %d, без затирания" % (DEPTH // 4))
+bad = sum(1 for (T2, t2, t1, T1) in got
+          if (t2 - T2) + (t1 - t2) + (T1 - t1) != (T1 - T2))
+check(bad == 0, "ни одного склеенного измерения после переполнения")
 
 # ---------------------------------------------------------------------------
-print("\n[6] одновременные wr_en и rd_pop: cnt не меняется")
+print("\n[7] места на ТРИ слова недостаточно -- запись не начинается")
+#
+# Ключ к согласованности. Если бы проверялось место под одно слово, при трёх
+# свободных легли бы T2,t2,t1 -- а T1 от СЛЕДУЮЩЕГО пакета. Хост увидел бы
+# правдоподобную четвёрку из двух разных измерений.
+f = LatFifo()
+for i in range(DEPTH // 4 - 1):
+    f.tick(wr_en=True, stamps=sample(i * 100))
+# освобождаем ровно три слова
+for _ in range(1):
+    f.tick(rd_pop=True)
+f.tick(rd_pop=True)
+f.tick(rd_pop=True)
+free = DEPTH - f.cnt
+check(free == 7, "свободно 7 слов (4 хвост + 3 освобождённых)")
+# теперь забиваем так, чтобы осталось ровно 3
+f.tick(wr_en=True, stamps=sample(90000))
+free = DEPTH - f.cnt
+check(free == 3, "осталось ровно 3 свободных слова")
+ovf_was = f.ovf
+f.tick(wr_en=True, stamps=sample(99999))
+check(f.ovf == ovf_was + 1, "запись при 3 свободных ОТБРОШЕНА и засчитана")
+check(DEPTH - f.cnt == 3, "частичной записи не произошло: свободно всё те же 3")
+
+# ---------------------------------------------------------------------------
+print("\n[8] одновременные запись и чтение")
 f = LatFifo()
 for i in range(10):
-    f.tick(wr_en=True, wr_data=i)
+    f.tick(wr_en=True, stamps=sample(i * 100))
 before = f.cnt
-val = f.rd_data()
-f.tick(wr_en=True, wr_data=0x999, rd_pop=True)
-check(f.cnt == before, "cnt тот же: одна вошла, одна вышла")
-check(val == 0, "прочитали старейшую (0)")
+first = f.rd_data()
+f.tick(wr_en=True, stamps=sample(77000), rd_pop=True)
+check(f.cnt == before + 3, "cnt: +4 за запись, -1 за чтение")
+check(first == 0, "прочитано первое слово старейшего измерения")
 check(f.ovf == 0, "потерь нет")
 
 # ---------------------------------------------------------------------------
-print("\n[7] край: full + wr_en + rd_pop одновременно")
-#
-# При полном FIFO и одновременном rd_pop место освобождается в этом же такте.
-# Первая ветвь always требует !full, поэтому управление уходит в ветвь rd_pop:
-# чтение проходит, а ЗАПИСЬ ОТБРАСЫВАЕТСЯ, хотя место появилось.
-#
-# ЭТО ОСОЗНАННОЕ ПОВЕДЕНИЕ, А НЕ ДЕФЕКТ. Пропустить запись в этом такте
-# означало бы читать и писать одну ячейку одновременно при wr_ptr == rd_ptr --
-# на BRAM это чтение неопределённого значения. Отбросить проще и безопаснее.
-#
-# Цена: одна потерянная запись на такое совпадение. Наступить оно может только
-# если хост читает FIFO, пока идут пакеты, -- а порядок работы обратный
-# (прогон, потом чтение). И даже наступив, потеря ВИДНА в overflow, а не
-# молчит.
-#
-# Проверяем ФАКТ, а не желаемое: запись отбрасывается, чтение проходит,
-# счётчик потерь растёт на 1.
+print("\n[9] clear чистит данные, но НЕ счётчик потерь")
 f = LatFifo()
-for i in range(DEPTH):
-    f.tick(wr_en=True, wr_data=i)
-assert f.full
-ovf_before, cnt_before = f.ovf, f.cnt
-oldest = f.rd_data()
-f.tick(wr_en=True, wr_data=0xDEAD, rd_pop=True)
-check(oldest == 0, "чтение отдало старейшую запись")
-check(f.cnt == cnt_before - 1, "cnt уменьшился: чтение прошло, запись нет")
-check(f.ovf == ovf_before + 1, "потеря ЗАСЧИТАНА в overflow, а не молча")
-
-# ---------------------------------------------------------------------------
-print("\n[8] clear чистит данные, но НЕ счётчик потерь")
-f = LatFifo()
-for i in range(DEPTH + 7):
-    f.tick(wr_en=True, wr_data=i)
+for i in range(DEPTH // 4 + 5):
+    f.tick(wr_en=True, stamps=sample(i * 100))
 ovf_was = f.ovf
 f.clear()
 check(f.cnt == 0 and f.empty, "после clear данных нет")
 check(f.ovf == ovf_was, "overflow пережил clear -- потери прошлого прогона видны")
 
 # ---------------------------------------------------------------------------
-print("\n[9] pop из пустого ничего не ломает")
+print("\n[10] pop из пустого ничего не ломает")
 f = LatFifo()
 for _ in range(5):
     f.tick(rd_pop=True)
 check(f.cnt == 0 and f.rd == 0, "указатель не поехал")
-f.tick(wr_en=True, wr_data=0x55)
-check(f.rd_data() == 0x55, "запись после лишних pop читается верно")
+f.tick(wr_en=True, stamps=sample(4242))
+check(f.rd_data() == 4242, "запись после лишних pop читается верно")
 
 # ---------------------------------------------------------------------------
-print("\n[10] реальный сценарий: 100 измерений, потом чтение")
+print("\n[11] реальный сценарий: 100 измерений, потом чтение")
 #
-# Ровно то, как это будет работать: ppclient -count 100, затем хост
-# вычитывает FIFO целиком.
+# Ровно как это будет работать: ppclient -count 100, затем хост вычитывает
+# FIFO целиком в файл.
 f = LatFifo()
 for i in range(100):
-    f.tick(wr_en=True, wr_data=(i << 10) | 0x40000000)
-check(f.cnt == 100, "100 измерений в FIFO")
-check(f.ovf == 0, "ни одной потери -- 100 < DEPTH")
-out = []
-while not f.empty:
-    out.append(f.rd_data())
-    f.tick(rd_pop=True)
-check(len(out) == 100, "вычитано 100 слов")
-# МАСКА ОБЯЗАТЕЛЬНА. Первая версия проверки писала (w >> 10) == i и падала:
-# бит 30 (valid_all) после сдвига остаётся в слове, поэтому сравнение с i
-# ложно при любом целом FIFO. Дефект был в ТЕСТЕ, не в железе -- ровно тот
-# случай, когда красный тест обвиняет невиновного.
-check(all(((w >> 10) & 0x3FF) == i for i, w in enumerate(out)),
-      "все измерения на месте и по порядку")
+    f.tick(wr_en=True, stamps=sample(10000 + i * 500))
+check(f.cnt == 400, "100 измерений = 400 слов")
+check(f.ovf == 0, "ни одной потери: 100 < %d" % (DEPTH // 4))
+got = drain(f)
+check(len(got) == 100, "вычитано 100 измерений")
+bad = sum(1 for (T2, t2, t1, T1) in got
+          if (t2 - T2) + (t1 - t2) + (T1 - t1) != (T1 - T2))
+check(bad == 0, "все 100 согласованы")
+check(all(g[0] == 10000 + i * 500 for i, g in enumerate(got)),
+      "все на месте и по порядку")
 
 # ---------------------------------------------------------------------------
 print("\n=== Итог: " + ("ВСЕ ПРОВЕРКИ ПРОШЛИ" if fails == 0
