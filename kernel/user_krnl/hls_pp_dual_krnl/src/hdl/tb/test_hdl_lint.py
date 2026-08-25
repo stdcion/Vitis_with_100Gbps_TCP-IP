@@ -160,6 +160,57 @@ for f in HDL:
             bad.append(f"{os.path.basename(f)}: {kw}")
 check(not bad, "чистый Verilog-2001" + ("" if not bad else ": " + "; ".join(bad)))
 
+print("\n[7] все сигналы объявлены")
+#
+# ЭТО НАШЛОСЬ НЕ ЗДЕСЬ, А В pack 14:57 -- двенадцать сообщений
+# "'k_awvalid' is not declared". Блок объявлений k_* пропал при переписывании
+# арбитража, а использование в инстансе ядра осталось.
+#
+# И это худший класс дефекта: Vivado РАЗОБРАЛ модуль, упаковал IP, integrity
+# check прошёл. Без check_syntax дефект дошёл бы до синтеза BD, где
+# неподключённые провода стали бы нулями -- ядро не отвечало бы на AXI-Lite
+# вообще, а выглядело бы это как "регистры не пишутся".
+#
+# Проверка простая: каждый идентификатор, похожий на сигнал и используемый в
+# правой части или в списке подключений, должен быть либо объявлен, либо быть
+# портом, либо localparam.
+KEYWORDS = set("""
+module endmodule input output inout wire reg logic assign always begin end
+case endcase default if else posedge negedge or and not xor localparam
+parameter integer generate endgenerate for while function endfunction task
+endtask initial timescale default_nettype none ifdef ifndef endif define
+signed unsigned genvar real time
+""".split())
+
+bad = []
+for f in HDL:
+    src = strip_comments(open(f).read())
+    # объявленные имена: порты, wire/reg, localparam
+    declared = set()
+    for m in re.finditer(r"\b(?:input|output|inout)\s+(?:wire|reg|logic)?\s*(?:\[[^\]]+\]\s*)?(\w+)", src):
+        declared.add(m.group(1))
+    for m in re.finditer(r"\b(?:wire|reg|logic)\s+(?:\[[^\]]+\]\s*)?([\w\s,]+?)\s*(?:=|;)", src):
+        for name in m.group(1).split(","):
+            declared.add(name.strip())
+    for m in re.finditer(r"\blocalparam\b[^;]*?(\w+)\s*=", src):
+        declared.add(m.group(1))
+    for m in re.finditer(r"localparam\s+(?:\[[^\]]+\]\s+)?([\w\s,=\'hbdo0-9_]+);", src):
+        for part in m.group(1).split(","):
+            nm = part.split("=")[0].strip()
+            if nm: declared.add(nm)
+    # имена модулей и инстансов -- не сигналы
+    for m in re.finditer(r"^\s*(\w+)\s+(\w+)\s*\(", src, re.M):
+        declared.add(m.group(1)); declared.add(m.group(2))
+
+    # использования: в списках подключений .port ( signal )
+    for m in re.finditer(r"\.\w+\s*\(\s*([A-Za-z_]\w*)", src):
+        name = m.group(1)
+        if name in KEYWORDS or name in declared: continue
+        bad.append(f"{os.path.basename(f)}: {name} использован, не объявлен")
+
+check(not bad, "необъявленных сигналов нет"
+      + ("" if not bad else ": " + "; ".join(sorted(set(bad))[:6])))
+
 print("\n=== Итог: " + ("ВСЕ ПРОВЕРКИ ПРОШЛИ" if fails == 0
                         else "ОТКАЗОВ: %d" % fails) + " ===")
 sys.exit(1 if fails else 0)

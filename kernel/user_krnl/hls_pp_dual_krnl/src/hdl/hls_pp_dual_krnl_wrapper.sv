@@ -622,6 +622,53 @@ always @(posedge ap_clk) begin
      end
 end
 
+// ── проброс к control_s_axi ядра ────────────────────────────────────────────
+//
+// БЛОК ПРОПАЛ ПРИ ПЕРЕПИСЫВАНИИ АРБИТРАЖА, и это нашёл check_syntax в прогоне
+// 14:57: двенадцать сообщений "'k_awvalid' is not declared". Использование в
+// инстансе осталось, объявления удалились вместе со старой логикой.
+//
+// Vivado при этом РАЗОБРАЛ модуль (top определился верно) и упаковал IP --
+// то есть без check_syntax дефект дошёл бы до синтеза BD, где неподключённые
+// провода превратились бы в постоянные нули: ядро не отвечало бы на AXI-Lite
+// вообще, и выглядело бы это как "регистры не пишутся".
+//
+// КЛЮЧЕВОЕ: рукопожатия делает НАШ автомат, а ядру транзакция передаётся
+// только если адрес его. Ответы ядра не ждём -- хосту уже ответили.
+//
+// Почему так можно: control_s_axi от HLS это обычные регистры. Запись
+// применяется в такте w_hs, чтение отдаёт значение в такте ar_hs. Свои
+// BVALID/RVALID он поднимает сам, но наружу они не идут, а BREADY/RREADY ему
+// подаётся константной единицей -- иначе застрянет в WRRESP.
+wire        k_awready, k_wready, k_bvalid, k_arready, k_rvalid;
+wire [1:0]  k_bresp, k_rresp;
+wire [31:0] k_rdata;
+wire        k_interrupt;
+
+// Отдаём ядру валидные строб-сигналы только на ЕГО транзакциях. Признак --
+// адрес ниже нашего диапазона; на такте рукопожатия берём его с шины, дальше
+// из защёлкнутого waddr/raddr.
+wire k_awvalid = aw_hs & (s_axi_control_awaddr[7:0] < A_RD);
+wire k_wvalid  = w_hs  & ~wr_ours;
+wire k_arvalid = ar_hs & (s_axi_control_araddr[7:0] < A_RD);
+
+// ── ответы хосту: полностью от НАШЕГО автомата ──────────────────────────────
+//
+// Ни awready, ни bvalid не зависят ни от адреса, ни от ядра -- ровно то, что
+// требует спецификация AXI: условия приёма только от VALID/READY.
+assign s_axi_control_awready = (wstate == WRIDLE);
+assign s_axi_control_wready  = (wstate == WRDATA);
+assign s_axi_control_bvalid  = (wstate == WRRESP);
+assign s_axi_control_bresp   = 2'b00;   // OKAY всегда
+assign s_axi_control_arready = (rstate == RDIDLE);
+assign s_axi_control_rvalid  = (rstate == RDDATA);
+assign s_axi_control_rresp   = 2'b00;
+assign interrupt             = k_interrupt;
+
+// Данные чтения: наш регистр или то, что отдало ядро. Выбор по raddr, который
+// уже защёлкнут.
+assign s_axi_control_rdata = rd_ours ? our_rdata : k_rdata;
+
 // ── инстанс HLS-ядра ────────────────────────────────────────────────────────
 //
 // Имя модуля -- hls_pp_dual_krnl_ip: так его переименовывает create_ip в
