@@ -188,6 +188,18 @@ void pp_echo(ap_uint<32>& ppStateOut,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
+     // ПОРЯДОК ЭТОГО enum -- ЧИСЛА, КОТОРЫЕ ЧИТАЮТСЯ С ПЛАТЫ.
+     //
+     // ppState отдаётся наружу как есть, поэтому значения зашиты ещё в ДВУХ
+     // местах, и при правке порядка их надо менять вместе:
+     //
+     //   scripts/vivado/jtag_ctrl.tcl   proc _pp_state_name  -- расшифровка
+     //                                  в pp_dual_dump
+     //   host/hls_pp_dual_krnl/main.go  подсказка при "эхо не пришло"
+     //
+     // Разъехавшись, они будут называть НЕ ТОТ шаг, а именно по этому числу
+     // мы и решаем, где искать дефект. Проверка на согласованность --
+     // сравнить руками, автоматической нет.
      enum ppStateType {NOTIFY, META, RX, REQ, STATUS, TX};
      static ppStateType ppState = NOTIFY;
 #pragma HLS RESET variable=ppState
