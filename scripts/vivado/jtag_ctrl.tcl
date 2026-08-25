@@ -2625,3 +2625,250 @@ proc pp_dual_dump {{n 1}} {
           puts "  data did arrive and the RX side of the stack works."
      }
 }
+
+# =============================================================================
+# hls_pp_dual_krnl -- timing taps: FIFO of raw stamps
+# =============================================================================
+#
+# Register map, part two. The kernel's own registers live at 0x00..0x50 and are
+# read by pp_dual_offsets from the generated header. These belong to the HDL
+# wrapper and are fixed by localparam in hls_pp_dual_krnl_wrapper.sv, so they
+# are hardcoded here on purpose -- no header generates them.
+#
+# If a value here disagrees with the wrapper, every reading is wrong while
+# looking plausible. Cross-check: package_hls_pp_dual_krnl.tcl prints the same
+# map at the end of the pack step.
+set ::PP_OFF_FIFO_RD    0x100
+set ::PP_OFF_FIFO_POP   0x104
+set ::PP_OFF_FIFO_COUNT 0x108
+set ::PP_OFF_FIFO_OVF   0x10c
+set ::PP_OFF_MINWORDS   0x110
+set ::PP_OFF_NF_CNT_RX  0x114
+set ::PP_OFF_NF_DRP_RX  0x118
+set ::PP_OFF_NF_CNT_TX  0x11c
+set ::PP_OFF_NF_DRP_TX  0x120
+set ::PP_OFF_MEAS_DRP   0x124
+set ::PP_OFF_FIFO_CLEAR 0x128
+
+# One clock at 165 MHz. Same constant as EPD_CLK_NS -- kept separate so that
+# retuning one kernel does not silently change the other's numbers.
+set ::PP_CLK_NS 6.061
+
+# -----------------------------------------------------------------------------
+# pp_taps_status -- filter and FIFO counters, one screen
+# -----------------------------------------------------------------------------
+#
+# Run this BEFORE reading the FIFO. It answers the question the raw dump
+# cannot: is the filter recognising our frames at all?
+#
+#   nfCountRx grows, nfCountTx grows   frames recognised both ways -- good
+#   nfCountRx 0, nfDropRx grows        NOTHING passes the filter. Either the
+#                                     client is not sending the marker, or
+#                                     minWords is too high, or the tap is
+#                                     wired to the wrong bus.
+#   nfCountRx grows, nfCountTx 0       requests recognised, replies not: the
+#                                     kernel is not echoing, or the reply
+#                                     carries no marker (it should -- echo
+#                                     copies the payload verbatim)
+#   both 0                             no traffic at all reached the taps
+proc pp_taps_status {{n 1}} {
+     set base [ouch_base_user $n]
+     set rd [list]
+     foreach {label off} [list \
+          "filter RX passed" $::PP_OFF_NF_CNT_RX \
+          "filter RX dropped" $::PP_OFF_NF_DRP_RX \
+          "filter TX passed" $::PP_OFF_NF_CNT_TX \
+          "filter TX dropped" $::PP_OFF_NF_DRP_TX \
+          "minWords" $::PP_OFF_MINWORDS \
+          "FIFO words" $::PP_OFF_FIFO_COUNT \
+          "FIFO overflow" $::PP_OFF_FIFO_OVF \
+          "torn measurements" $::PP_OFF_MEAS_DRP] {
+          set v [axi_read32 [expr {$base + $off}]]
+          puts [format "  %-18s %u" $label $v]
+          lappend rd $v
+     }
+     lassign $rd cnt_rx drp_rx cnt_tx drp_tx minw words ovf torn
+     puts ""
+     puts [format "  measurements in FIFO: %u (words/4)" [expr {$words / 4}]]
+     if {$cnt_rx == 0 && $drp_rx == 0} {
+          puts "  -> no traffic reached the RX tap at all. Check the cable, the"
+          puts "     stack (echo_bringup) and that config_sp routes axis_net"
+          puts "     through the wrapper."
+     } elseif {$cnt_rx == 0} {
+          puts "  -> RX tap sees traffic but recognises NOTHING. The filter needs"
+          puts "     both length >= minWords AND the marker in payload\[4..9\]."
+          puts "     ppclient writes it; a plain ncat does not."
+     } elseif {$cnt_tx == 0} {
+          puts "  -> requests recognised, replies not. Either the kernel is not"
+          puts "     echoing (check ppState) or the reply lost the marker."
+     }
+     if {$ovf > 0} {
+          puts [format "  -> FIFO overflowed %u times: the dump is the START of the" $ovf]
+          puts "     run, not all of it. Send fewer packets, or clear and rerun."
+     }
+     if {$torn > 0} {
+          puts [format "  -> %u measurements torn: a packet overtook the previous one" $torn]
+          puts "     before its stamps were complete. Normal under load; the"
+          puts "     measurements that DID complete are unaffected."
+     }
+     return $rd
+}
+
+# -----------------------------------------------------------------------------
+# pp_raw -- drain the FIFO as CSV
+# -----------------------------------------------------------------------------
+#
+# Prints one line per measurement: four RAW stamps, the three intervals derived
+# from them, and a consistency column. Nothing is discarded and nothing is
+# rounded -- the analysis happens outside Vivado.
+#
+# WHY THE RAW STAMPS AND NOT JUST THE INTERVALS. Because the intervals can only
+# be checked against each other if the stamps are there:
+#
+#     (t2-T2) + (t1-t2) + (T1-t1) must equal (T1-T2)
+#
+# It always does arithmetically -- which is the point. The check that matters is
+# whether the stamps are MONOTONIC (T2 < t2 < t1 < T1). They are not if the
+# hardware FSM stitched stamps from two different packets, and that is exactly
+# the failure that produces plausible-looking nonsense. Column `ok` flags it.
+#
+# ARITHMETIC IS MODULO 2^32. The cycle counter wraps every 26 s at 165 MHz, and
+# a measurement straddling the wrap is still valid -- the differences come out
+# right. So the columns are computed with & 0xFFFFFFFF, not by comparing
+# absolute values.
+#
+# Redirect to a file the usual Tcl way:
+#     set fh [open C:/pp_raw.csv w]; puts $fh [pp_raw]; close $fh
+#
+# count defaults to 0 = drain everything the FIFO holds.
+proc pp_raw {{count 0} {n 1}} {
+     set base [ouch_base_user $n]
+
+     set words [axi_read32 [expr {$base + $::PP_OFF_FIFO_COUNT}]]
+     set have [expr {$words / 4}]
+     if {$count == 0 || $count > $have} { set count $have }
+
+     set hdr "sample,T2,t2,t1,T1,stack_rx,kernel,stack_tx,total,total_ns,ok"
+     set out $hdr
+     puts $hdr
+
+     if {$have == 0} {
+          puts "# FIFO is empty -- nothing measured. Run pp_taps_status first:"
+          puts "# it says whether the filter recognised any frame at all."
+          return $out
+     }
+
+     for {set i 0} {$i < $count} {incr i} {
+          # Four reads, then four pops. Reading does NOT advance the pointer --
+          # deliberate, see the wrapper: read-to-pop would make any accidental
+          # re-read (Vivado does that on its own during debug) eat data.
+          set st [list]
+          for {set k 0} {$k < 4} {incr k} {
+               lappend st [axi_read32 [expr {$base + $::PP_OFF_FIFO_RD}]]
+               axi_write32 [expr {$base + $::PP_OFF_FIFO_POP}] 1
+          }
+          lassign $st T2 t2 t1 T1
+
+          set m 0xFFFFFFFF
+          set d_rx  [expr {($t2 - $T2) & $m}]
+          set d_krn [expr {($t1 - $t2) & $m}]
+          set d_tx  [expr {($T1 - $t1) & $m}]
+          set d_all [expr {($T1 - $T2) & $m}]
+
+          # The real check: are the stamps monotonic, and is the total sane?
+          # A stitched measurement typically shows one huge interval -- the
+          # wrap-around of a negative difference.
+          #
+          # 100000 cycles = 606 us at 165 MHz. The budget says the whole
+          # gateway is 1.0-1.8 us, so anything past that is not "slow", it is
+          # "wrong pair of stamps".
+          set ok "ok"
+          if {($d_rx + $d_krn + $d_tx) != $d_all} {
+               set ok "TORN"
+          } elseif {$d_all > 100000} {
+               set ok "HUGE"
+          }
+
+          set line [format "%d,%u,%u,%u,%u,%u,%u,%u,%u,%.1f,%s" \
+                        $i $T2 $t2 $t1 $T1 \
+                        $d_rx $d_krn $d_tx $d_all \
+                        [expr {$d_all * $::PP_CLK_NS}] $ok]
+          puts $line
+          append out "\n$line"
+     }
+     return $out
+}
+
+# -----------------------------------------------------------------------------
+# pp_measure -- collect and summarise in one command
+# -----------------------------------------------------------------------------
+#
+# The numbers that matter: median and minimum of each of the three intervals.
+# Not the mean -- one torn measurement shifts it, and the tail here is
+# scheduler noise on the host, not gateway behaviour.
+#
+# Rows flagged TORN or HUGE are EXCLUDED from the statistics and COUNTED in the
+# output. Dropping them silently would hide the very cases worth looking at;
+# averaging them in would poison every number.
+proc pp_measure {{n 1}} {
+     set csv [pp_raw 0 $n]
+     set lines [split $csv "\n"]
+     if {[llength $lines] < 2} { return }
+
+     set rx {} ; set krn {} ; set tx {} ; set all {}
+     set bad 0
+     foreach line [lrange $lines 1 end] {
+          set f [split $line ","]
+          if {[llength $f] != 11} { continue }
+          if {[lindex $f 10] ne "ok"} { incr bad ; continue }
+          lappend rx  [lindex $f 5]
+          lappend krn [lindex $f 6]
+          lappend tx  [lindex $f 7]
+          lappend all [lindex $f 8]
+     }
+     set good [llength $all]
+     puts ""
+     puts "=== gateway latency, $good measurements ==="
+     if {$bad > 0} {
+          puts "  ($bad rows excluded as TORN/HUGE -- see the csv)"
+     }
+     if {$good == 0} {
+          puts "  nothing usable. pp_taps_status says why."
+          return
+     }
+     foreach {label vals} [list \
+          "stack RX  T2->t2" $rx \
+          "kernel    t2->t1" $krn \
+          "stack TX  t1->T1" $tx \
+          "TOTAL     T2->T1" $all] {
+          set s [lsort -integer $vals]
+          set mn [lindex $s 0]
+          set md [lindex $s [expr {[llength $s] / 2}]]
+          set mx [lindex $s end]
+          puts [format "  %-18s min %5u  med %5u  max %5u cycles   (med %.3f us)" \
+                    $label $mn $md $mx [expr {$md * $::PP_CLK_NS / 1000.0}]]
+     }
+     puts ""
+     puts "  min is the number to compare against the budget: it is the path"
+     puts "  without contention. med carries queueing, max carries outliers."
+}
+
+# Clears the FIFO. Does NOT clear the overflow counter -- losses from the
+# previous run stay visible, which is the point of that counter.
+proc pp_clear {{n 1}} {
+     axi_write32 [expr {[ouch_base_user $n] + $::PP_OFF_FIFO_CLEAR}] 1
+     puts "FIFO cleared (overflow counter kept)"
+}
+
+# Sets the frame-length threshold of the filter, in 512-bit words.
+#
+# Default is 2, and that is right for -bytes 11..4096: our frame is then two
+# words or more, while ACK/ARP/ICMP are one. Lower it only to debug the filter
+# itself -- at 1 the service frames start passing, and the taps latch on them.
+proc pp_minwords {v {n 1}} {
+     axi_write32 [expr {[ouch_base_user $n] + $::PP_OFF_MINWORDS}] $v
+     set rb [axi_read32 [expr {[ouch_base_user $n] + $::PP_OFF_MINWORDS}]]
+     puts "minWords = $rb"
+     if {$rb != $v} { puts "  *** WRITE NOT CONFIRMED -- wrong base or bitstream" }
+     if {$rb < 2}   { puts "  *** below 2: ACK/ARP will pass the filter" }
+}
