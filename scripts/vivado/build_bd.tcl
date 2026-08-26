@@ -897,6 +897,23 @@ for {set n 1} {$n <= $NUM_QSFP} {incr n} {
                       сверь OUCH_BASE_USER($n) в scripts/vivado/jtag_ctrl.tcl."
           }
           puts "  ${USER_KRNL}_$n s_axi_control -> $addr_user"
+     } elseif {$USER_HAS_CTRL && (!$USER_KRNL_DUAL || $n <= $n_user_instances)} {
+          # У ЯЧЕЙКИ ЕСТЬ s_axi_control, А АДРЕСНОГО СЕГМЕНТА НЕТ.
+          #
+          # Именно это случилось 25.08 и стоило прогона на плате: обёртка не
+          # объявляла parameter C_S_AXI_CONTROL_ADDR_WIDTH, поэтому ipx не вывел
+          # размер memory map, assign_bd_address сегмента не создал -- а этот
+          # elseif молча пропускал случай. Адрес остался случайным, и user-ядро
+          # читалось как 0xDEC0DEE3, тогда как network_krnl отвечал нормально.
+          #
+          # Теперь это ошибка. Молчать здесь нельзя: снаружи отказ выглядит как
+          # "наше ядро мёртвое", и искать причину будут в ядре, а не в упаковке.
+          error "у ${USER_KRNL}_$n есть s_axi_control, но НЕТ адресного\
+                 сегмента в jtag_axi_0/Data.\
+                 Причина обычно одна: IP не объявляет parameter integer\
+                 C_S_AXI_CONTROL_ADDR_WIDTH, и ipx не вывел размер memory map.\
+                 Проверь объявление модуля в src/hdl/${USER_KRNL}_wrapper.sv --\
+                 у probe и network_krnl этот параметр есть."
      } elseif {$USER_KRNL_DUAL && $n > $n_user_instances} {
           # Ожидаемо: при dual-режиме экземпляра ${USER_KRNL}_$n для n>1
           # просто не существует (см. n_user_instances выше) — это не

@@ -2414,7 +2414,9 @@ set ::PP_OFF_NOTIFY     -1
 # Reads the HLS-generated register map. Run once per session before dumping
 # telemetry; bringup calls it itself.
 proc pp_dual_offsets {} {
-     set root [file normalize [file join [file dirname [info script]] .. ..]]
+     # Корень взят из ::JTAG_REPO_ROOT, а не из [info script]: внутри proc,
+     # вызванного из консоли, тот пуст (см. пояснение у переменной).
+     set root $::JTAG_REPO_ROOT
      # SAME pattern export_hls_ip.tcl:149 uses, so both scripts read the same
      # file. My first version guessed two paths, one of which never existed --
      # the header lives only under impl/ip/drivers, confirmed by the build log
@@ -2429,7 +2431,10 @@ proc pp_dual_offsets {} {
           puts "      set ::PP_OFF_PORTSTATE 0x2c"
           puts "      set ::PP_OFF_PPSTATE   0x3c"
           puts "      set ::PP_OFF_NOTIFY    0x4c"
-          puts "    Looked under kernel/user_krnl/hls_pp_dual_krnl/src/hls/"
+          puts "    Looked for: $pat"
+          puts "    repo root:  $root"
+          puts "    If the root is wrong, set it by hand:"
+          puts "      set ::JTAG_REPO_ROOT C:/path/to/easynet"
           return 0
      }
      set hdr [lindex $hits 0]
@@ -2658,6 +2663,17 @@ set ::PP_OFF_FIFO_CLEAR 0xa8
 
 # One clock at 165 MHz. Same constant as EPD_CLK_NS -- kept separate so that
 # retuning one kernel does not silently change the other's numbers.
+# КОРЕНЬ РЕПОЗИТОРИЯ, ЗАПОМНЕННЫЙ ПРИ ЗАГРУЗКЕ ФАЙЛА.
+#
+# Здесь [info script] возвращает путь к jtag_ctrl.tcl, потому что мы ВНУТРИ
+# его исполнения. Внутри proc, вызванного из Tcl Console, [info script] пуст --
+# и путь получался относительным от текущего каталога Vivado.
+#
+# Именно так 25.08 pp_dual_offsets не нашёл xhls_pp_dual_krnl_hw.h: файл лежал
+# на месте, а искали не там. Симптом: "offsets stay unset", телеметрия
+# нечитаема, хотя прошивка в порядке.
+set ::JTAG_REPO_ROOT [file normalize [file join [file dirname [info script]] .. ..]]
+
 set ::PP_CLK_NS 6.061
 
 # -----------------------------------------------------------------------------

@@ -68,23 +68,36 @@ for f in HDL:
 check(not bad, "невалидных констант нет" + ("" if not bad else ": " + "; ".join(bad)))
 
 # ---------------------------------------------------------------------------
-print("\n[2] у модулей нет параметров")
+print("\n[2] у модулей нет ВЕКТОРНЫХ параметров")
 #
-# Векторный parameter у модуля -- то, на чём ipx-парсер спотыкался в обёртке
-# (parameter [47:0] PP_MARKER) и в lat_fifo (parameter DEPTH_LOG2, из которого
-# выводился localparam в размерности массива). У probe, который через pack
-# прошёл, параметры только integer.
+# ЗАПРЕТ ИМЕННО НА ВЕКТОРНЫЕ, а не на все, и это выяснилось дорого.
 #
-# Здесь запрет полный: инстанс каждого модуля один, параметризация не нужна,
-# а цена ошибки -- упакованный не тот модуль.
+# parameter [47:0] PP_MARKER ломал разбор обёртки целиком: три прогона pack
+# показывали "top can not be validated" без объяснения. ipx не разворачивает
+# выражения над векторными параметрами.
+#
+# Но убрать параметры ПОЛНОСТЬЮ оказалось хуже: без
+# C_S_AXI_CONTROL_ADDR_WIDTH ipx не выводит РАЗМЕР memory map для
+# s_axi_control, сегмент в BD не создаётся, и user-ядро читается по случайному
+# адресу как 0xDEC0DEE3 (прогон на плате 25.08). network_krnl при этом
+# отвечает нормально -- то есть отказ выглядит как "наше ядро мёртвое".
+#
+# integer ipx понимает: так у probe (C_S_AXI_CONTROL_ADDR_WIDTH = 12) и у
+# network_krnl (C_S_AXI_ADDR_WIDTH), то есть у всех, кто читается по JTAG.
 bad = []
 for f in HDL:
     src = strip_comments(open(f).read())
-    for m in re.finditer(r"module\s+(\w+)\s*#\s*\(", src):
-        bad.append(f"{os.path.basename(f)}: module {m.group(1)} с параметрами")
-check(not bad, "параметров у модулей нет" + ("" if not bad else ": " + "; ".join(bad)))
+    m = re.search(r"module\s+(\w+)\s*#\s*\((.*?)\)\s*\(", src, re.S)
+    if not m:
+        continue
+    mod, plist = m.groups()
+    for pm in re.finditer(r"parameter\s+(\S+)\s+(\w+)", plist):
+        typ, name = pm.groups()
+        if typ != "integer":
+            bad.append(f"{os.path.basename(f)}: {mod}, parameter {typ} {name}")
+check(not bad, "векторных параметров нет"
+      + ("" if not bad else ": " + "; ".join(bad)))
 
-# ---------------------------------------------------------------------------
 print("\n[3] нет дубликатов объявлений")
 #
 # Vivado на это даёт WARNING 9-3395 и "second declaration is ignored" -- то

@@ -40,7 +40,26 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-// БЕЗ ПАРАМЕТРОВ У МОДУЛЯ, И ЭТО ВЫНУЖДЕННО.
+// ПАРАМЕТРЫ ЕСТЬ, НО ТОЛЬКО integer -- И ОБА НУЖНЫ.
+//
+// C_S_AXI_CONTROL_ADDR_WIDTH обязателен: из него ipx выводит РАЗМЕР memory map
+// для s_axi_control. Без параметра размер неизвестен, memory map не создаётся,
+// и в BD у ячейки НЕТ адресного сегмента.
+//
+// Симптом на плате (прогон 25.08): network_krnl отвечает нормально, а user-ядро
+// читается как 0xDEC0DEE3 -- то есть по этому адресу вообще ничего нет.
+// assign_bd_address не нашёл сегмента, проверка адреса в build_bd.tcl молча
+// пропустилась (там `if {[llength $seg_user] > 0}`), и адрес остался случайным.
+//
+// Так же у probe (C_S_AXI_CONTROL_ADDR_WIDTH = 12) и у network_krnl
+// (C_S_AXI_ADDR_WIDTH) -- то есть у всех, кто на этой плате читается по JTAG.
+//
+// ВЕКТОРНЫЕ параметры при этом по-прежнему запрещены: parameter [47:0]
+// PP_MARKER ломал разбор обёртки целиком (три прогона pack без объяснения).
+// integer ipx понимает, вектор -- нет. Ограничение в test_hdl_lint именно на
+// векторные, не на все.
+//
+// ЧТО БЫЛО ДО ЭТОГО:
 //
 // Здесь стоял parameter [47:0] PP_MARKER -- 48-битный вектор. Именно на нём
 // Vivado не разбирал обёртку: три прогона pack показывали
@@ -56,26 +75,29 @@
 // Маркер теперь localparam внутри модуля. Параметризация не нужна: инстанс
 // один, значение задано в трёх местах (здесь, net_frame_filter.v, main.go) и
 // сверяется тестом host/hls_pp_dual_krnl/marker_test.go.
-module hls_pp_dual_krnl_wrapper (
+module hls_pp_dual_krnl_wrapper #(
+     parameter integer C_S_AXI_CONTROL_DATA_WIDTH = 32,
+     parameter integer C_S_AXI_CONTROL_ADDR_WIDTH = 12
+)(
      input  wire         ap_clk,
      input  wire         ap_rst_n,
 
      // ── AXI-Lite: регистры ядра ПЛЮС наши. Адреса ядра идут насквозь в
      //    control_s_axi HLS, наши перехватываются здесь (см. ниже).
-     input  wire [11:0]  s_axi_control_awaddr,
+     input  wire [C_S_AXI_CONTROL_ADDR_WIDTH-1:0] s_axi_control_awaddr,
      input  wire         s_axi_control_awvalid,
      output wire         s_axi_control_awready,
-     input  wire [31:0]  s_axi_control_wdata,
+     input  wire [C_S_AXI_CONTROL_DATA_WIDTH-1:0] s_axi_control_wdata,
      input  wire [3:0]   s_axi_control_wstrb,
      input  wire         s_axi_control_wvalid,
      output wire         s_axi_control_wready,
      output wire [1:0]   s_axi_control_bresp,
      output wire         s_axi_control_bvalid,
      input  wire         s_axi_control_bready,
-     input  wire [11:0]  s_axi_control_araddr,
+     input  wire [C_S_AXI_CONTROL_ADDR_WIDTH-1:0] s_axi_control_araddr,
      input  wire         s_axi_control_arvalid,
      output wire         s_axi_control_arready,
-     output wire [31:0]  s_axi_control_rdata,
+     output wire [C_S_AXI_CONTROL_DATA_WIDTH-1:0] s_axi_control_rdata,
      output wire [1:0]   s_axi_control_rresp,
      output wire         s_axi_control_rvalid,
      input  wire         s_axi_control_rready,
