@@ -2411,6 +2411,35 @@ set ::PP_OFF_PORTSTATE  -1
 set ::PP_OFF_PPSTATE    -1
 set ::PP_OFF_NOTIFY     -1
 
+# Смещения телеметрии БЕЗ чтения заголовка -- для машины у платы, где
+# исходников нет.
+#
+# ЗАЧЕМ. pp_dual_offsets ищет xhls_pp_dual_krnl_hw.h в дереве репозитория. У
+# платы обычно лежит только .bit и этот скрипт (прогон 25.08: repo root
+# D:/Alveo/konstebl, исходников там нет), и телеметрия оставалась нечитаемой --
+# то есть отладка стояла на пустом месте.
+#
+# ЗНАЧЕНИЯ ИЗ СБОРКИ 25.08. Они меняются только при добавлении скаляров в
+# .cpp: HLS раскладывает адреса по порядку аргументов, шаг 0x10 на 32-битный
+# выход с ap_vld. Если в ядро добавили скаляр -- эти числа устареют, и надо
+# взять новые из вывода export_hls_ip.tcl (он печатает карту в конце).
+#
+# Сверить можно на месте: portState при закрытом порте читается как 0/1/2, а
+# не как 0xBADC0DE5 или мусор.
+proc pp_set_offsets {} {
+     set ::PP_OFF_PORTSTATE 0x2c
+     set ::PP_OFF_PPSTATE   0x3c
+     set ::PP_OFF_NOTIFY    0x4c
+     puts "offsets set by hand (build 2026-08-25):"
+     puts [format "  portState    0x%02x" $::PP_OFF_PORTSTATE]
+     puts [format "  ppState      0x%02x" $::PP_OFF_PPSTATE]
+     puts [format "  notifyCount  0x%02x" $::PP_OFF_NOTIFY]
+     puts ""
+     puts "If these are wrong, take them from the export_hls_ip.tcl output"
+     puts "(it prints the register map at the end of the run)."
+     return 3
+}
+
 # Reads the HLS-generated register map. Run once per session before dumping
 # telemetry; bringup calls it itself.
 proc pp_dual_offsets {} {
@@ -2433,8 +2462,18 @@ proc pp_dual_offsets {} {
           puts "      set ::PP_OFF_NOTIFY    0x4c"
           puts "    Looked for: $pat"
           puts "    repo root:  $root"
-          puts "    If the root is wrong, set it by hand:"
-          puts "      set ::JTAG_REPO_ROOT C:/path/to/easynet"
+          puts ""
+          puts "    TWO WAYS OUT:"
+          puts ""
+          puts "    1. Sources ARE on this machine -- point at the root:"
+          puts "         set ::JTAG_REPO_ROOT C:/path/to/easynet"
+          puts "         pp_dual_offsets"
+          puts ""
+          puts "    2. Sources are NOT here (the usual case next to the board)"
+          puts "       -- set the offsets directly. The map only changes when"
+          puts "       new scalars are added to the .cpp:"
+          puts "         pp_set_offsets"
+          puts ""
           return 0
      }
      set hdr [lindex $hits 0]

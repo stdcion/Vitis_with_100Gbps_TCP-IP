@@ -133,26 +133,58 @@ void pp_listen(int listenPort,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-     static bool portRequested = false;
      static bool portOpened = false;
+     static ap_uint<32> attempts = 0;
 
-     if (!portRequested)
+     // ЗАПРОС ПОВТОРЯЕТСЯ КАЖДЫЙ ПРОХОД, ПОКА ПОРТ НЕ ОТКРЫТ.
+     //
+     // Первая версия писала порт РОВНО ОДИН РАЗ (static portRequested), и это
+     // отличало её от апстрима -- у него listen_port_handler это `for` без
+     // состояния, то есть при auto_restart порт запрашивается СНОВА на каждом
+     // перезапуске региона, пока стек не подтвердит.
+     //
+     // ПОЧЕМУ ЭТО ВАЖНО. Хост стартует ядро (0x81) после network_start, но
+     // "стек запущен" не значит "TOE готов принять listen": ему нужно время на
+     // инициализацию таблиц в DDR. Если единственный запрос пришёл в это окно,
+     // второй попытки не будет никогда, и portState навсегда останется 1.
+     //
+     // Прогон на плате 25.08 дал ровно эту картину: connection refused на
+     // 7001, то есть стек ответил RST -- он жив и обрабатывает пакет, а порт
+     // не зарегистрирован.
+     //
+     // ПОВТОР БЕЗОПАСЕН, проверено по коду TOE. port_table.cpp:63-70 на
+     // запрос уже открытого порта отвечает true, а не отказом:
+     //
+     //     if (listeningPortTable[port]) portTable2rxApp_listen_rsp.write(true);
+     //
+     // То есть лишние запросы ничего не портят.
+     if (!portOpened)
      {
-          pkt16 listen_port_pkt;
-          listen_port_pkt.data(15, 0) = listenPort;
-          m_axis_tcp_listen_port.write(listen_port_pkt);
-          portRequested = true;
-     }
-     else if (!portOpened && !s_axis_tcp_port_status.empty())
-     {
-          pkt8 status_pkt = s_axis_tcp_port_status.read();
-          bool success = status_pkt.data(0, 0);
-          if (success) portOpened = true;
-          else         portRequested = false;
+          if (!m_axis_tcp_listen_port.full())
+          {
+               pkt16 listen_port_pkt;
+               listen_port_pkt.data(15, 0) = listenPort;
+               m_axis_tcp_listen_port.write(listen_port_pkt);
+               attempts++;
+          }
+
+          // Ответ читаем в том же проходе, если он уже есть. Неблокирующе:
+          // стек отвечает через десятки тактов, а стадия обязана вернуться.
+          if (!s_axis_tcp_port_status.empty())
+          {
+               pkt8 status_pkt = s_axis_tcp_port_status.read();
+               if (status_pkt.data(0, 0)) portOpened = true;
+          }
      }
 
+     // portState: 0 -- ни одной попытки (стадия не работает вовсе),
+     //            1 -- запросы идут, подтверждения нет,
+     //            2 -- порт открыт.
+     //
+     // Ноль теперь означает ровно одно: стадия не запускается. Это отличает
+     // "ядро мёртвое" от "стек не отвечает", чего первая версия не давала.
      portState = portOpened ? (ap_uint<32>)2
-                            : (portRequested ? (ap_uint<32>)1 : (ap_uint<32>)0);
+                            : (attempts > 0 ? (ap_uint<32>)1 : (ap_uint<32>)0);
 }
 
 /*
