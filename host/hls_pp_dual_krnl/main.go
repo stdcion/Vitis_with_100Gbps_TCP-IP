@@ -163,8 +163,8 @@ func main() {
 	// Таймер одной строкой. Числа нужны: без них "RTT 3 мкс" не отличить
 	// от "таймер квантует по 1 мкс и мы видим 3 отсчёта". Предупреждения --
 	// только когда есть о чём предупреждать.
-	fmt.Printf("timer: gran %dns, overhead %dns, %.0f%% zero-diffs (%s)\n",
-		gran, ovh, zeroFrac*100, runtime.GOOS)
+	fmt.Printf("timer: %s, gran %dns, overhead %dns, %.0f%% zero-diffs (%s)\n",
+		clockName(), gran, ovh, zeroFrac*100, runtime.GOOS)
 	if zeroFrac > 0.9 {
 		fmt.Println("WARNING: timer too coarse for microsecond RTT")
 	} else if gran > 200 {
@@ -222,7 +222,7 @@ func main() {
 		// данных, а не измеряемого пути.
 		binary.BigEndian.PutUint32(tx[0:4], uint32(i))
 
-		t0 := time.Now()
+		t0 := nowTicks()
 
 		if _, err := conn.Write(tx); err != nil {
 			fmt.Fprintf(os.Stderr, "send failed after %d msgs: %v\n", i, err)
@@ -241,7 +241,7 @@ func main() {
 			break
 		}
 
-		t1 := time.Now()
+		t1 := nowTicks()
 
 		// Сверка ВНЕ измеряемого интервала: сравнение больших сообщений
 		// вытесняет данные из кэша и добавляет шум СЛЕДУЮЩЕМУ сэмплу.
@@ -257,7 +257,7 @@ func main() {
 		}
 
 		if i >= *warmup {
-			samples = append(samples, t1.Sub(t0).Nanoseconds())
+			samples = append(samples, ticksToNs(t1-t0))
 		}
 	}
 
@@ -318,11 +318,14 @@ func equalBytes(a, b []byte) bool {
 func calibrateClock() (zeroFrac float64, gran, ovh int64) {
 	const n = 20000
 
+	// Через nowTicks/ticksToNs, а не time.Now: на Windows time.Now даёт
+	// разрешение ~0.5 мс и все разницы выходят нулевыми (прогон 25.08 показал
+	// 100% нулей). Подробности в clock_windows.go.
 	diffs := make([]int64, 0, n)
 	for i := 0; i < n; i++ {
-		a := time.Now()
-		b := time.Now()
-		diffs = append(diffs, b.Sub(a).Nanoseconds())
+		a := nowTicks()
+		b := nowTicks()
+		diffs = append(diffs, ticksToNs(b-a))
 	}
 	sort.Slice(diffs, func(i, j int) bool { return diffs[i] < diffs[j] })
 
