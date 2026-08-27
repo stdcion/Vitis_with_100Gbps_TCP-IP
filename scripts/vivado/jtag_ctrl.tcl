@@ -55,12 +55,34 @@
 #   about the race.
 # -----------------------------------------------------------------------------
 
-# s_axi_control base addresses. build_bd.tcl sets them explicitly
-# (_addr_network/_addr_user, step 0x20000 between channels) and checks the
-# result, so this is just the same formula. Channel N=1 is QSFP0, N=2 is
-# QSFP1, and so on. If you change this, change it in both files.
+# БАЗОВЫЕ АДРЕСА s_axi_control. СВЕРЕНЫ С net_bd.bd, А НЕ ВЫВЕДЕНЫ.
+#
+# Формула должна совпадать с _addr_network/_addr_user в build_bd.tcl -- тот
+# задаёт адреса явно и роняет сборку при расхождении. Шаг между каналами
+# 0x20000, канал N=1 это QSFP0, N=2 -- QSFP1.
+#
+# ПРОВЕРЕНО 27.08 по net_bd.bd (JSON пишет Vivado, наших вычислений там нет):
+#
+#     "/network_krnl_1/s_axi_control/reg0"      offset 0x00000000  range 4K
+#     "/hls_pp_dual_krnl_1/s_axi_control/reg0"  offset 0x00010000  range 4K
+#     "/network_krnl_2/s_axi_control/reg0"      offset 0x00020000  range 4K
+#
+# ЗДЕСЬ БЫЛО 0x8000, И ЭТО СТОИЛО ПРОГОНА 25.08.
+#
+# Смещение user-ядра всегда было 0x10000. Я заменил его на 0x8000 в коммите
+# 1021978, который менял адреса регистров ОБЁРТКИ (0x100 -> 0x80) -- задел
+# заодно, по схожести чисел, и не тронул комментарий, поэтому тот продолжал
+# утверждать "та же формула, что в build_bd.tcl", опровергая сам себя.
+#
+# Последствие: bringup писал useConn/basePort по 0x8000, где ничего нет.
+# Ядро не получало ни порта, ни ap_start, телеметрия читалась 0xDEC0DEE3 --
+# и снаружи это выглядело как "ядро мёртвое". Именно поэтому pp_dual не
+# работал и без обёртки: обёртка была не при чём.
+#
+# ПРОВЕРЯТЬ ТАК, а не рассуждением (одна строка, ответ сразу):
+#     grep -A2 "s_axi_control/reg0" <PROJ>/net_vivado.srcs/sources_1/bd/net_bd/net_bd.bd
 proc ouch_base_network {{n 1}} { return [expr {($n - 1) * 0x20000}] }
-proc ouch_base_user    {{n 1}} { return [expr {($n - 1) * 0x20000 + 0x8000}] }
+proc ouch_base_user    {{n 1}} { return [expr {($n - 1) * 0x20000 + 0x10000}] }
 
 # Kept for backwards compatibility with older single-channel (N=1) calls --
 # new code should use ouch_base_network N / ouch_base_user N.
@@ -2665,16 +2687,15 @@ set ::PP_OFF_FIFO_CLEAR 0xa8
 
 # One clock at 165 MHz. Same constant as EPD_CLK_NS -- kept separate so that
 # retuning one kernel does not silently change the other's numbers.
-# КОРЕНЬ РЕПОЗИТОРИЯ, ЗАПОМНЕННЫЙ ПРИ ЗАГРУЗКЕ ФАЙЛА.
+# КОРЕНЬ РЕПОЗИТОРИЯ БОЛЬШЕ НЕ НУЖЕН -- переменная удалена.
 #
-# Здесь [info script] возвращает путь к jtag_ctrl.tcl, потому что мы ВНУТРИ
-# его исполнения. Внутри proc, вызванного из Tcl Console, [info script] пуст --
-# и путь получался относительным от текущего каталога Vivado.
+# Была нужна pp_dual_offsets, который искал xhls_pp_dual_krnl_hw.h в дереве
+# репозитория. Теперь смещения заданы константами (см. PP_OFF_* выше), и
+# скрипту не нужны ни исходники, ни сгенерированные заголовки: у машины рядом
+# с платой их обычно нет, и 25.08 это стоило прогона.
 #
-# Именно так 25.08 pp_dual_offsets не нашёл xhls_pp_dual_krnl_hw.h: файл лежал
-# на месте, а искали не там. Симптом: "offsets stay unset", телеметрия
-# нечитаема, хотя прошивка в порядке.
-set ::JTAG_REPO_ROOT [file normalize [file join [file dirname [info script]] .. ..]]
+# Единственное обращение к файловой системе, которое осталось во всём файле --
+# pp_save, и он ФАЙЛ ПИШЕТ (CSV с измерениями), а не читает.
 
 set ::PP_CLK_NS 6.061
 
