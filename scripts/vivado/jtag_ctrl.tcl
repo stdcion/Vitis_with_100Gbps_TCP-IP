@@ -2389,113 +2389,77 @@ proc _de_dotted {ip_str} {
 # A kernel doing its job cycles NOTIFY->...->TX and parks in NOTIFY between
 # messages. Parked anywhere else = that step is where it stopped.
 #
-# REGISTER OFFSETS ARE NOT GUESSED.
+# КАРТА РЕГИСТРОВ ЗАДАНА КОНСТАНТАМИ, КАК ВО ВСЕХ ПРЕДЫДУЩИХ ЭКСПЕРИМЕНТАХ.
 #
-# The scalar order in the .cpp signature decides them, and HLS emits the map
-# into xhls_pp_dual_krnl_hw.h. pp_dual_offsets reads that file. Hardcoding
-# them from the recv_dual map would be wrong: this kernel has three extra
-# scalars, so everything after expectedRxByteCnt shifts.
-# -----------------------------------------------------------------------------
-
-# Offsets of useConn/basePort/expectedRxByteCnt match recv_dual: same first
-# three scalars, in the same order. Verified against the recv_dual map.
+# Так сделано у RECV_OFF_*, DE_OFF_*, EPD_OFF_* -- ни один из них не читал
+# сгенерированный заголовок. Здесь была попытка "надёжнее": pp_dual_offsets
+# искал xhls_pp_dual_krnl_hw.h в дереве репозитория и брал адреса оттуда.
+# Это оказалось хуже по трём причинам, все проверены на прогоне 25.08:
+#
+#   1. У платы исходников нет (repo root был D:/Alveo/konstebl), заголовок не
+#      находился, телеметрия оставалась нечитаемой -- отладка стояла.
+#   2. Пришлось делать ручной обход pp_set_offsets, то есть те же константы,
+#      только в двух местах и с шансом разойтись.
+#   3. В ручном обходе я зашил CTRL-адреса вместо DATA (см. ниже) -- ошибка,
+#      которой при выводе по правилу просто не было бы.
+#
+# ПРАВИЛО РАСКЛАДКИ HLS s_axilite (подтверждено логом сборки dual_echo,
+# 1108_full.txt: portState_a DATA=0x30 CTRL=0x34, portState_b DATA=0x60):
+#
+#     0x00 ap_ctrl, 0x04 GIE, 0x08 IER, 0x0c ISR, скаляры с 0x10;
+#     ВХОД 32 бита -- 8 байт; ВХОД 64 бита -- 16 байт;
+#     ВЫХОД с ap_vld -- 16 байт (DATA по адресу, CTRL по адресу+4).
+#
+# Порядок аргументов в сигнатуре hls_pp_dual_krnl():
+#     useConn, basePort, expectedRxByteCnt, portState, ppState, notifyCount
+#
 set ::PP_OFF_AP_CTRL   0x00
 set ::PP_OFF_USECONN   0x10
 set ::PP_OFF_BASEPORT  0x18
 set ::PP_OFF_RXBYTES   0x20
 
-# Telemetry offsets: filled by pp_dual_offsets from the generated header.
-# Deliberately left as -1 so a forgotten call fails loudly instead of reading
-# a plausible-looking wrong register.
-set ::PP_OFF_PORTSTATE  -1
-set ::PP_OFF_PPSTATE    -1
-set ::PP_OFF_NOTIFY     -1
+# Телеметрия. DATA, не CTRL. СВЕРЕНО С ЛОГОМ СБОРКИ 27.08 (вывод
+# export_hls_ip.tcl в конце прогона -- он печатает xhls_pp_dual_krnl_hw.h).
+#
+# ВНИМАНИЕ НА expectedRxByteCnt: ОН ap_uint<64>, ЗАНИМАЕТ 16 БАЙТ.
+#
+#     0x20  expectedRxByteCnt[31:0]
+#     0x24  expectedRxByteCnt[63:32]
+#     0x28  reserved
+#     0x2c  portState DATA        0x30  portState CTRL
+#
+# Здесь я один раз уже ошибся: посчитал его 32-битным входом (8 байт), и вся
+# телеметрия после него уехала на 4 байта вниз -- 0x28/0x38/0x48 вместо
+# 0x2c/0x3c/0x4c. Вывод "по правилу" совпал с логом для dual_echo только
+# потому, что там все скаляры 32-битные.
+#
+# ПРАВИЛО ПОЛНОСТЬЮ: вход 32 бита -- 8 байт; вход 64 бита -- 16 байт;
+# выход 32 бита с ap_vld -- 16 байт (DATA, +4 CTRL, +8 reserved).
+# Проверять сложением по логу сборки, а не только по порядку аргументов.
+set ::PP_OFF_PORTSTATE  0x2c
+set ::PP_OFF_PPSTATE    0x3c
+set ::PP_OFF_NOTIFY     0x4c
 
-# Смещения телеметрии БЕЗ чтения заголовка -- для машины у платы, где
-# исходников нет.
-#
-# ЗАЧЕМ. pp_dual_offsets ищет xhls_pp_dual_krnl_hw.h в дереве репозитория. У
-# платы обычно лежит только .bit и этот скрипт (прогон 25.08: repo root
-# D:/Alveo/konstebl, исходников там нет), и телеметрия оставалась нечитаемой --
-# то есть отладка стояла на пустом месте.
-#
-# ЗНАЧЕНИЯ ИЗ СБОРКИ 25.08. Они меняются только при добавлении скаляров в
-# .cpp: HLS раскладывает адреса по порядку аргументов, шаг 0x10 на 32-битный
-# выход с ap_vld. Если в ядро добавили скаляр -- эти числа устареют, и надо
-# взять новые из вывода export_hls_ip.tcl (он печатает карту в конце).
-#
-# Сверить можно на месте: portState при закрытом порте читается как 0/1/2, а
-# не как 0xBADC0DE5 или мусор.
-proc pp_set_offsets {} {
-     set ::PP_OFF_PORTSTATE 0x2c
-     set ::PP_OFF_PPSTATE   0x3c
-     set ::PP_OFF_NOTIFY    0x4c
-     puts "offsets set by hand (build 2026-08-25):"
-     puts [format "  portState    0x%02x" $::PP_OFF_PORTSTATE]
-     puts [format "  ppState      0x%02x" $::PP_OFF_PPSTATE]
-     puts [format "  notifyCount  0x%02x" $::PP_OFF_NOTIFY]
-     puts ""
-     puts "If these are wrong, take them from the export_hls_ip.tcl output"
-     puts "(it prints the register map at the end of the run)."
+# CTRL-регистры рядом с каждым выходом: бит 0 = *_ap_vld, Read/COR.
+# Читать их осознанно и редко -- чтение сбрасывает флаг свежести.
+set ::PP_OFF_PORTSTATE_CTRL  0x30
+set ::PP_OFF_PPSTATE_CTRL    0x40
+set ::PP_OFF_NOTIFY_CTRL     0x50
+
+# Печатает карту. Оставлено как pp_dual_offsets/pp_set_offsets для
+# совместимости с записанными командами прогона, но ничего больше не ищет и
+# не выставляет -- адреса уже заданы выше.
+proc pp_dual_offsets {} {
+     puts "pp_dual register map (constants, no header lookup):"
+     foreach {label var} {portState PP_OFF_PORTSTATE ppState PP_OFF_PPSTATE \
+                          notifyCount PP_OFF_NOTIFY} {
+          puts [format "  %-12s 0x%02x   (CTRL 0x%02x, ap_vld, Read/COR)" \
+                    $label [set ::$var] [set ::${var}_CTRL]]
+     }
      return 3
 }
 
-# Reads the HLS-generated register map. Run once per session before dumping
-# telemetry; bringup calls it itself.
-proc pp_dual_offsets {} {
-     # Корень взят из ::JTAG_REPO_ROOT, а не из [info script]: внутри proc,
-     # вызванного из консоли, тот пуст (см. пояснение у переменной).
-     set root $::JTAG_REPO_ROOT
-     # SAME pattern export_hls_ip.tcl:149 uses, so both scripts read the same
-     # file. My first version guessed two paths, one of which never existed --
-     # the header lives only under impl/ip/drivers, confirmed by the build log
-     # of 2026-08-25.
-     set pat "$root/kernel/user_krnl/hls_pp_dual_krnl/src/hls/hls_pp_dual_krnl_ip_proj/sol1/impl/ip/drivers/*/src/*_hw.h"
-     set hits [glob -nocomplain $pat]
-     if {[llength $hits] == 0} {
-          puts "*** xhls_pp_dual_krnl_hw.h not found."
-          puts "    Telemetry offsets stay unset; portState/ppState/notifyCount"
-          puts "    cannot be read. Find the file and pass offsets by hand;"
-          puts "    the 2026-08-25 build gave:"
-          puts "      set ::PP_OFF_PORTSTATE 0x2c"
-          puts "      set ::PP_OFF_PPSTATE   0x3c"
-          puts "      set ::PP_OFF_NOTIFY    0x4c"
-          puts "    Looked for: $pat"
-          puts "    repo root:  $root"
-          puts ""
-          puts "    TWO WAYS OUT:"
-          puts ""
-          puts "    1. Sources ARE on this machine -- point at the root:"
-          puts "         set ::JTAG_REPO_ROOT C:/path/to/easynet"
-          puts "         pp_dual_offsets"
-          puts ""
-          puts "    2. Sources are NOT here (the usual case next to the board)"
-          puts "       -- set the offsets directly. The map only changes when"
-          puts "       new scalars are added to the .cpp:"
-          puts "         pp_set_offsets"
-          puts ""
-          return 0
-     }
-     set hdr [lindex $hits 0]
-     puts "register map: [file tail $hdr]"
-     set fh [open $hdr r]
-     set txt [read $fh]
-     close $fh
-     set found 0
-     foreach {name var} {portState PP_OFF_PORTSTATE ppState PP_OFF_PPSTATE \
-                         notifyCount PP_OFF_NOTIFY} {
-          # matches lines like: #define XHLS_PP_DUAL_KRNL_CONTROL_ADDR_PORTSTATE_DATA 0x28
-          set up [string toupper $name]
-          if {[regexp -line "ADDR_${up}_DATA\\s+(0x\[0-9a-fA-F\]+)" $txt -> off]} {
-               set ::$var $off
-               puts [format "  %-12s %s" $name $off]
-               incr found
-          } else {
-               puts "  $name  NOT FOUND in header"
-          }
-     }
-     return $found
-}
+proc pp_set_offsets {} { return [pp_dual_offsets] }
 
 # One scalar, or a clear marker when its offset is unknown.
 proc _pp_read {label var {n 1}} {
@@ -2618,7 +2582,6 @@ proc pp_dual_status {{n 1}} {
 # pp_dual_dump -- read everything, then say what it means
 # -----------------------------------------------------------------------------
 proc pp_dual_dump {{n 1}} {
-     if {$::PP_OFF_PPSTATE == -1} { pp_dual_offsets ; puts "" }
      puts "=== pp_dual telemetry ==="
      pp_dual_status $n
      puts ""
