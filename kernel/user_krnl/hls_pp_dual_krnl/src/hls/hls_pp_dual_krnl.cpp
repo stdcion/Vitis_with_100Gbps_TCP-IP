@@ -134,7 +134,22 @@ void pp_listen(int listenPort,
 #pragma HLS INLINE off
 
      static bool portOpened = false;
+#pragma HLS RESET variable=portOpened
      static ap_uint<32> attempts = 0;
+
+     // RESET ТОЛЬКО НА portOpened, НЕ НА attempts -- ТАК ЖЕ, КАК В АПСТРИМЕ.
+     //
+     // По умолчанию HLS сбрасывает по ap_rst только управляющие регистры
+     // (ap_CS_fsm, ap_done_reg, ap_start_reg) -- проверено по
+     // сгенерированному RTL работающего recv_krnl: в reset-блоках его стадий
+     // нет НИ ОДНОЙ пользовательской переменной. Значение `= false` попадает
+     // лишь в initial/битстрим, то есть после перезапуска ядра (не пересборки)
+     // portOpened сохранит старое значение и порт не будет запрошен заново.
+     //
+     // attempts оставлен без RESET сознательно: это счётчик телеметрии, а не
+     // состояние автомата. Апстрим (iperf_client server()) ставит RESET
+     // ровно на один регистр состояния -- listenState -- и ни на один из
+     // остальных static. На весь сетевой стек там 1 RESET при 1023 static.
 
      // ЗАПРОС ПОВТОРЯЕТСЯ КАЖДЫЙ ПРОХОД, ПОКА ПОРТ НЕ ОТКРЫТ.
      //
@@ -235,6 +250,24 @@ void pp_echo(ap_uint<32>& ppStateOut,
      enum ppStateType {NOTIFY, META, RX, REQ, STATUS, TX};
      static ppStateType ppState = NOTIFY;
 #pragma HLS RESET variable=ppState
+
+     // ОДИН RESET, И ТОЛЬКО НА ppState -- ЭТО НЕ ЭКОНОМИЯ, А ПРОВЕРЕННОЕ ПРАВИЛО.
+     //
+     // Апстрим (iperf_client server()) ставит RESET ровно на listenState и ни
+     // на одну переменную данных; на весь сетевой стек 1 RESET при 1023 static.
+     //
+     // Почему этого достаточно здесь: КАЖДАЯ переменная ниже записывается при
+     // ВХОДЕ в своё состояние раньше, чем читается. sessionID/msgLength/
+     // wordCount пишутся в NOTIFY, txLength в REQ, wordIdx/bytesRemaining в
+     // STATUS перед переходом в TX. Поэтому после сброса ppState в NOTIFY их
+     // прежние значения недостижимы -- мусор в них не наблюдаем.
+     //
+     // ppState же читается ПЕРВЫМ (switch) до любой записи, поэтому без RESET
+     // ядро после перезапуска могло бы стартовать посреди TX и погнать в стек
+     // мусор из payload[] под чужим sessionID.
+     //
+     // payload[] (BRAM) не сбрасывается принципиально: RESET на массив
+     // развернулся бы в цикл обнуления на 64 такта и сломал бы II=1.
 
      static ap_uint<512> payload[PP_MAX_WORDS];
 #pragma HLS BIND_STORAGE variable=payload type=RAM_2P impl=BRAM
