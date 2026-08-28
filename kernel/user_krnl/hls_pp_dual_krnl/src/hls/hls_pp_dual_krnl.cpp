@@ -436,16 +436,9 @@ void pp_echo(ap_uint<32>& ppStateOut,
 extern "C" {
 void hls_pp_dual_krnl(
                // ── канал a -> network_krnl_1 (QSFP0): ЭХО ──
-               hls::stream<pkt512>& s_axis_udp_rx,
-               hls::stream<pkt512>& m_axis_udp_tx,
-               hls::stream<pkt256>& s_axis_udp_rx_meta,
-               hls::stream<pkt256>& m_axis_udp_tx_meta,
 
                hls::stream<pkt16>& m_axis_tcp_listen_port,
                hls::stream<pkt8>& s_axis_tcp_port_status,
-               hls::stream<pkt64>& m_axis_tcp_open_connection,
-               hls::stream<pkt128>& s_axis_tcp_open_status,
-               hls::stream<pkt16>& m_axis_tcp_close_connection,
                hls::stream<pkt128>& s_axis_tcp_notification,
                hls::stream<pkt32>& m_axis_tcp_read_pkg,
                hls::stream<pkt16>& s_axis_tcp_rx_meta,
@@ -454,22 +447,6 @@ void hls_pp_dual_krnl(
                hls::stream<pkt512>& m_axis_tcp_tx_data,
                hls::stream<pkt64>& s_axis_tcp_tx_status,
                // ── канал b -> network_krnl_2 (QSFP1): как в фазе 3 ──
-               hls::stream<pkt512>& s_axis_udp_rx_b,
-               hls::stream<pkt512>& m_axis_udp_tx_b,
-               hls::stream<pkt256>& s_axis_udp_rx_meta_b,
-               hls::stream<pkt256>& m_axis_udp_tx_meta_b,
-               hls::stream<pkt16>& m_axis_tcp_listen_port_b,
-               hls::stream<pkt8>& s_axis_tcp_port_status_b,
-               hls::stream<pkt64>& m_axis_tcp_open_connection_b,
-               hls::stream<pkt128>& s_axis_tcp_open_status_b,
-               hls::stream<pkt16>& m_axis_tcp_close_connection_b,
-               hls::stream<pkt128>& s_axis_tcp_notification_b,
-               hls::stream<pkt32>& m_axis_tcp_read_pkg_b,
-               hls::stream<pkt16>& s_axis_tcp_rx_meta_b,
-               hls::stream<pkt512>& s_axis_tcp_rx_data_b,
-               hls::stream<pkt32>& m_axis_tcp_tx_meta_b,
-               hls::stream<pkt512>& m_axis_tcp_tx_data_b,
-               hls::stream<pkt64>& s_axis_tcp_tx_status_b,
 
                int useConn,
                int basePort,
@@ -480,15 +457,8 @@ void hls_pp_dual_krnl(
                       ) {
 
 
-#pragma HLS INTERFACE axis port = s_axis_udp_rx
-#pragma HLS INTERFACE axis port = m_axis_udp_tx
-#pragma HLS INTERFACE axis port = s_axis_udp_rx_meta
-#pragma HLS INTERFACE axis port = m_axis_udp_tx_meta
 #pragma HLS INTERFACE axis port = m_axis_tcp_listen_port
 #pragma HLS INTERFACE axis port = s_axis_tcp_port_status
-#pragma HLS INTERFACE axis port = m_axis_tcp_open_connection
-#pragma HLS INTERFACE axis port = s_axis_tcp_open_status
-#pragma HLS INTERFACE axis port = m_axis_tcp_close_connection
 #pragma HLS INTERFACE axis port = s_axis_tcp_notification
 #pragma HLS INTERFACE axis port = m_axis_tcp_read_pkg
 #pragma HLS INTERFACE axis port = s_axis_tcp_rx_meta
@@ -497,22 +467,6 @@ void hls_pp_dual_krnl(
 #pragma HLS INTERFACE axis port = m_axis_tcp_tx_data
 #pragma HLS INTERFACE axis port = s_axis_tcp_tx_status
 
-#pragma HLS INTERFACE axis port = s_axis_udp_rx_b
-#pragma HLS INTERFACE axis port = m_axis_udp_tx_b
-#pragma HLS INTERFACE axis port = s_axis_udp_rx_meta_b
-#pragma HLS INTERFACE axis port = m_axis_udp_tx_meta_b
-#pragma HLS INTERFACE axis port = m_axis_tcp_listen_port_b
-#pragma HLS INTERFACE axis port = s_axis_tcp_port_status_b
-#pragma HLS INTERFACE axis port = m_axis_tcp_open_connection_b
-#pragma HLS INTERFACE axis port = s_axis_tcp_open_status_b
-#pragma HLS INTERFACE axis port = m_axis_tcp_close_connection_b
-#pragma HLS INTERFACE axis port = s_axis_tcp_notification_b
-#pragma HLS INTERFACE axis port = m_axis_tcp_read_pkg_b
-#pragma HLS INTERFACE axis port = s_axis_tcp_rx_meta_b
-#pragma HLS INTERFACE axis port = s_axis_tcp_rx_data_b
-#pragma HLS INTERFACE axis port = m_axis_tcp_tx_meta_b
-#pragma HLS INTERFACE axis port = m_axis_tcp_tx_data_b
-#pragma HLS INTERFACE axis port = s_axis_tcp_tx_status_b
 #pragma HLS INTERFACE s_axilite port=useConn bundle = control
 #pragma HLS INTERFACE s_axilite port=basePort bundle = control
 #pragma HLS INTERFACE s_axilite port=expectedRxByteCnt bundle = control
@@ -538,78 +492,52 @@ void hls_pp_dual_krnl(
                m_axis_tcp_tx_data,
                s_axis_tcp_tx_status);
 
-          tie_off_tcp_open_connection(m_axis_tcp_open_connection,
-               s_axis_tcp_open_status);
-
-          tie_off_udp(s_axis_udp_rx,
-               m_axis_udp_tx,
-               s_axis_udp_rx_meta,
-               m_axis_udp_tx_meta);
-
-          tie_off_tcp_close_con(m_axis_tcp_close_connection);
-
-          // ── КАНАЛ b: ТОЛЬКО ЗАГЛУШКИ. listenPorts и recvData УБРАНЫ ──
+          // ── ЗАГЛУШЕК ЗДЕСЬ БОЛЬШЕ НЕТ. ОНИ В RTL-ОБЁРТКЕ ──────────────
           //
-          // ЭТО И БЫЛА ПРИЧИНА ОТКАЗА НА ПЛАТЕ (прогоны 25-26.08).
+          // Раньше тут стояли шесть tie_off_* из communication.hpp. Они и
+          // оказались причиной отказа 27.08: плата выпустила 3000 SYN к
+          // 0.0.0.0 и 513 ARP, TOE утонул в мусорных сессиях и на настоящий
+          // SYN от ПК сессии не осталось.
           //
-          // Апстримный recvData содержит
-          //     do { ... } while (rxByteCnt < expRxBytePerSession);
-          // (communication.hpp:1239) -- цикл, который НЕ ЗАВЕРШАЕТСЯ, пока не
-          // принято expectedRxByteCnt байт. То есть стадия висит вечно и
-          // ap_done не выдаёт. То же у listenPorts: port_status_handler читает
-          // блокирующе.
+          // ПОЧЕМУ tie_off ПИШЕТ В СТЕК. Каждая объявляет ЛОКАЛЬНЫЙ поток и
+          // проверяет его на пустоту:
           //
-          // Барьер ap_sync_done -- это И по ap_done ВСЕХ стадий региона. Пока
-          // висящие стадии половины b не завершились, барьер не срабатывает и
-          // регион не перезапускается. А наши pp_listen и pp_echo КОРОТКИЕ:
-          // отработали один проход и ждут перезапуска, который не придёт.
+          //     hls::stream<ipTuple> openConnection;      // никто не пишет
+          //     if (!openConnection.empty())              // должно быть false
+          //          m_axis_tcp_open_connection.write(...);
           //
-          // ПОЧЕМУ ФАЗА 3 РАБОТАЛА С ТЕМИ ЖЕ ФУНКЦИЯМИ, И ТОЖЕ БЕЗ КАБЕЛЯ
-          // В QSFP1: дело не в том, что стадия висит, а в том, СКОЛЬКО РАБОТЫ
-          // ОНА ДЕЛАЕТ ЗА ОДИН ВЫЗОВ.
+          // У потока нет производителя (HLS предупреждает XFORM 203-731), и он
+          // схлопывается в константы -- проверено по сгенерированному RTL:
           //
-          //   recvData (апстрим) делает ВСЮ работу внутри вызова:
-          //       do { обработать уведомление } while (rxByteCnt < expected);
-          //   он крутится и обрабатывает каждое. Перезапуск ему НЕ НУЖЕН.
+          //     assign openConnection_dout    = 48'd0;
+          //     assign openConnection_empty_n = 1'b1;   // "НЕ пуст" ВСЕГДА
           //
-          //   pp_echo (наш) делает ОДИН шаг автомата и return. Чтобы
-          //   обработать пакет целиком, нужно много вызовов.
+          // То есть empty() всегда false, условие выполняется каждый проход, и
+          // стадия просит стек открыть соединение к 0.0.0.0:0.
           //
-          // В фазе 3 все 12 стадий были первого типа, поэтому висящий барьер
-          // им не мешал -- перезапуск не требовался. ap_done=0 там тоже был.
+          // ПОЧЕМУ У АПСТРИМНОГО recv_krnl ТО ЖЕ САМОЕ И ОН РАБОТАЕТ. Там в
+          // регионе висит recvData, поэтому
+          //     ap_sync_ready = AND(готовность всех стадий)
+          // никогда не поднимается, ap_sync_reg не сбрасывается и
+          //     stage_ap_start = (~ap_sync_reg) & ap_start
+          // остаётся нулём. Стадии запускаются РОВНО ОДИН РАЗ -- один мусорный
+          // SYN за всё время, его никто не замечает.
           //
-          // Ломает СОСЕДСТВО: автомату нужен перезапуск, а висящая стадия
-          // рядом его не даёт. Наблюдаемо: pp_listen успел записать порт (один
-          // шаг), pp_echo проверил уведомления один раз и замолчал навсегда.
+          // Убрав висящую половину b, я включил барьер -- и вместе с
+          // pp_listen/pp_echo начали перезапускаться шесть заглушек. То есть
+          // поток мусора создало предыдущее исправление, а не сами tie_off.
           //
-          // ПОДТВЕРЖДЕНИЕ С ПЛАТЫ: pp_dual дал ap_ctrl=0x85, то есть
-          // ap_done=0 -- регион не завершился НИ РАЗУ. У network_krnl рядом
-          // ap_done=1, он перезапускается штатно.
+          // КАК ДЕЛАЕТ АПСТРИМ. iperf_client не использует tie_off вообще: у
+          // него в сигнатуре нет ни одного лишнего потока, а неиспользуемые
+          // порты заглушены КОНСТАНТАМИ В RTL-ОБЁРТКЕ
+          // (kernel/user_krnl/iperf_krnl/src/hdl/user_krnl.sv:239):
           //
-          // Половина b была добавлена только чтобы отличие от зелёной фазы 3
-          // было минимальным. Кабеля в QSFP1 нет, принимать там нечего --
-          // а цена оказалась в неработающем ядре.
-          tie_off_tcp_listen_port(m_axis_tcp_listen_port_b,
-               s_axis_tcp_port_status_b);
-
-          tie_off_tcp_rx(s_axis_tcp_notification_b,
-               m_axis_tcp_read_pkg_b,
-               s_axis_tcp_rx_meta_b,
-               s_axis_tcp_rx_data_b);
-
-          tie_off_udp(s_axis_udp_rx_b,
-               m_axis_udp_tx_b,
-               s_axis_udp_rx_meta_b,
-               m_axis_udp_tx_meta_b);
-
-          tie_off_tcp_open_connection(m_axis_tcp_open_connection_b,
-               s_axis_tcp_open_status_b);
-
-          tie_off_tcp_tx(m_axis_tcp_tx_meta_b,
-               m_axis_tcp_tx_data_b,
-               s_axis_tcp_tx_status_b);
-
-          tie_off_tcp_close_con(m_axis_tcp_close_connection_b);
+          //     assign s_axis_udp_rx_tready = 1'b1;   // принимай и выбрасывай
+          //     assign m_axis_udp_tx_tvalid = 1'b0;   // не передавай НИКОГДА
+          //
+          // Константа в барьере не участвует, перезапускать нечего, отправить
+          // пакет физически невозможно. Мы делаем так же -- см. блок
+          // "заглушки неиспользуемых портов" в hls_pp_dual_krnl_wrapper.sv.
 
      }
 }

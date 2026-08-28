@@ -691,6 +691,112 @@ assign interrupt             = k_interrupt;
 // уже защёлкнут.
 assign s_axi_control_rdata = rd_ours ? our_rdata : k_rdata;
 
+
+// ── ЗАГЛУШКИ НЕИСПОЛЬЗУЕМЫХ ПОРТОВ: КОНСТАНТЫ, А НЕ HLS-СТАДИИ ──────────────
+//
+// Ядро больше не принимает эти потоки: из его сигнатуры удалены 23 порта,
+// вместе с шестью tie_off_* из communication.hpp. Здесь они закрыты так, как
+// это делает работающий iperf_krnl в src/hdl/user_krnl.sv:239 --
+//
+//     assign s_axis_udp_rx_tready = 1'b1;   // принимай и выбрасывай
+//     assign m_axis_udp_tx_tvalid = 1'b0;   // не передавай НИКОГДА
+//
+// ПОЧЕМУ КОНСТАНТА, А НЕ ЗАГЛУШКА В HLS. tie_off_* были стадиями DATAFLOW:
+// они участвовали в барьере, перезапускались вместе с pp_listen/pp_echo, и на
+// каждом перезапуске исполняли `if (!localStream.empty())`, где HLS схлопнул
+// empty_n в константу 1 (проверено по RTL: assign openConnection_empty_n =
+// 1'b1, dout = 48'd0). Итог на плате 27.08: 3000 SYN к 0.0.0.0 и 513 ARP,
+// TOE утонул в мусорных сессиях и настоящий SYN от ПК обслужить не смог.
+//
+// tvalid = 1'b0 -- провод на землю. В барьере не участвует, перезапускать
+// нечего, отправить пакет физически невозможно.
+//
+// TDATA/TKEEP/TLAST у master-портов заданы нулями осознанно: при tvalid=0
+// они не считываются, но оставлять их неподключёнными нельзя -- Vivado
+// выведет предупреждение, а в BD получится плавающий вход.
+
+assign m_axis_tcp_close_connection_tvalid = 1'b0;
+assign m_axis_tcp_close_connection_tdata  = 16'b0;
+assign m_axis_tcp_close_connection_tkeep  = 2'b0;
+assign m_axis_tcp_close_connection_tlast  = 1'b0;
+
+assign m_axis_tcp_close_connection_b_tvalid = 1'b0;
+assign m_axis_tcp_close_connection_b_tdata  = 16'b0;
+assign m_axis_tcp_close_connection_b_tkeep  = 2'b0;
+assign m_axis_tcp_close_connection_b_tlast  = 1'b0;
+
+assign m_axis_tcp_listen_port_b_tvalid = 1'b0;
+assign m_axis_tcp_listen_port_b_tdata  = 16'b0;
+assign m_axis_tcp_listen_port_b_tkeep  = 2'b0;
+assign m_axis_tcp_listen_port_b_tlast  = 1'b0;
+
+assign m_axis_tcp_open_connection_tvalid = 1'b0;
+assign m_axis_tcp_open_connection_tdata  = 64'b0;
+assign m_axis_tcp_open_connection_tkeep  = 8'b0;
+assign m_axis_tcp_open_connection_tlast  = 1'b0;
+
+assign m_axis_tcp_open_connection_b_tvalid = 1'b0;
+assign m_axis_tcp_open_connection_b_tdata  = 64'b0;
+assign m_axis_tcp_open_connection_b_tkeep  = 8'b0;
+assign m_axis_tcp_open_connection_b_tlast  = 1'b0;
+
+assign m_axis_tcp_read_pkg_b_tvalid = 1'b0;
+assign m_axis_tcp_read_pkg_b_tdata  = 32'b0;
+assign m_axis_tcp_read_pkg_b_tkeep  = 4'b0;
+assign m_axis_tcp_read_pkg_b_tlast  = 1'b0;
+
+assign m_axis_tcp_tx_data_b_tvalid = 1'b0;
+assign m_axis_tcp_tx_data_b_tdata  = 512'b0;
+assign m_axis_tcp_tx_data_b_tkeep  = 64'b0;
+assign m_axis_tcp_tx_data_b_tlast  = 1'b0;
+
+assign m_axis_tcp_tx_meta_b_tvalid = 1'b0;
+assign m_axis_tcp_tx_meta_b_tdata  = 32'b0;
+assign m_axis_tcp_tx_meta_b_tkeep  = 4'b0;
+assign m_axis_tcp_tx_meta_b_tlast  = 1'b0;
+
+assign m_axis_udp_tx_tvalid = 1'b0;
+assign m_axis_udp_tx_tdata  = 512'b0;
+assign m_axis_udp_tx_tkeep  = 64'b0;
+assign m_axis_udp_tx_tlast  = 1'b0;
+
+assign m_axis_udp_tx_b_tvalid = 1'b0;
+assign m_axis_udp_tx_b_tdata  = 512'b0;
+assign m_axis_udp_tx_b_tkeep  = 64'b0;
+assign m_axis_udp_tx_b_tlast  = 1'b0;
+
+assign m_axis_udp_tx_meta_tvalid = 1'b0;
+assign m_axis_udp_tx_meta_tdata  = 256'b0;
+assign m_axis_udp_tx_meta_tkeep  = 32'b0;
+assign m_axis_udp_tx_meta_tlast  = 1'b0;
+
+assign m_axis_udp_tx_meta_b_tvalid = 1'b0;
+assign m_axis_udp_tx_meta_b_tdata  = 256'b0;
+assign m_axis_udp_tx_meta_b_tkeep  = 32'b0;
+assign m_axis_udp_tx_meta_b_tlast  = 1'b0;
+
+assign s_axis_tcp_notification_b_tready = 1'b1;
+
+assign s_axis_tcp_open_status_tready = 1'b1;
+
+assign s_axis_tcp_open_status_b_tready = 1'b1;
+
+assign s_axis_tcp_port_status_b_tready = 1'b1;
+
+assign s_axis_tcp_rx_data_b_tready = 1'b1;
+
+assign s_axis_tcp_rx_meta_b_tready = 1'b1;
+
+assign s_axis_tcp_tx_status_b_tready = 1'b1;
+
+assign s_axis_udp_rx_tready = 1'b1;
+
+assign s_axis_udp_rx_b_tready = 1'b1;
+
+assign s_axis_udp_rx_meta_tready = 1'b1;
+
+assign s_axis_udp_rx_meta_b_tready = 1'b1;
+
 // ── инстанс HLS-ядра ────────────────────────────────────────────────────────
 //
 // Имя модуля -- hls_pp_dual_krnl_ip: так его переименовывает create_ip в
@@ -700,26 +806,6 @@ hls_pp_dual_krnl_ip u_krnl (
      .ap_clk   ( ap_clk   ),
      .ap_rst_n ( ap_rst_n ),
 
-     .s_axis_udp_rx_TVALID ( s_axis_udp_rx_tvalid ),
-     .s_axis_udp_rx_TREADY ( s_axis_udp_rx_tready ),
-     .s_axis_udp_rx_TDATA  ( s_axis_udp_rx_tdata  ),
-     .s_axis_udp_rx_TKEEP  ( s_axis_udp_rx_tkeep  ),
-     .s_axis_udp_rx_TLAST  ( s_axis_udp_rx_tlast  ),
-     .m_axis_udp_tx_TVALID ( m_axis_udp_tx_tvalid ),
-     .m_axis_udp_tx_TREADY ( m_axis_udp_tx_tready ),
-     .m_axis_udp_tx_TDATA  ( m_axis_udp_tx_tdata  ),
-     .m_axis_udp_tx_TKEEP  ( m_axis_udp_tx_tkeep  ),
-     .m_axis_udp_tx_TLAST  ( m_axis_udp_tx_tlast  ),
-     .s_axis_udp_rx_meta_TVALID ( s_axis_udp_rx_meta_tvalid ),
-     .s_axis_udp_rx_meta_TREADY ( s_axis_udp_rx_meta_tready ),
-     .s_axis_udp_rx_meta_TDATA  ( s_axis_udp_rx_meta_tdata  ),
-     .s_axis_udp_rx_meta_TKEEP  ( s_axis_udp_rx_meta_tkeep  ),
-     .s_axis_udp_rx_meta_TLAST  ( s_axis_udp_rx_meta_tlast  ),
-     .m_axis_udp_tx_meta_TVALID ( m_axis_udp_tx_meta_tvalid ),
-     .m_axis_udp_tx_meta_TREADY ( m_axis_udp_tx_meta_tready ),
-     .m_axis_udp_tx_meta_TDATA  ( m_axis_udp_tx_meta_tdata  ),
-     .m_axis_udp_tx_meta_TKEEP  ( m_axis_udp_tx_meta_tkeep  ),
-     .m_axis_udp_tx_meta_TLAST  ( m_axis_udp_tx_meta_tlast  ),
      .m_axis_tcp_listen_port_TVALID ( m_axis_tcp_listen_port_tvalid ),
      .m_axis_tcp_listen_port_TREADY ( m_axis_tcp_listen_port_tready ),
      .m_axis_tcp_listen_port_TDATA  ( m_axis_tcp_listen_port_tdata  ),
@@ -730,21 +816,6 @@ hls_pp_dual_krnl_ip u_krnl (
      .s_axis_tcp_port_status_TDATA  ( s_axis_tcp_port_status_tdata  ),
      .s_axis_tcp_port_status_TKEEP  ( s_axis_tcp_port_status_tkeep  ),
      .s_axis_tcp_port_status_TLAST  ( s_axis_tcp_port_status_tlast  ),
-     .m_axis_tcp_open_connection_TVALID ( m_axis_tcp_open_connection_tvalid ),
-     .m_axis_tcp_open_connection_TREADY ( m_axis_tcp_open_connection_tready ),
-     .m_axis_tcp_open_connection_TDATA  ( m_axis_tcp_open_connection_tdata  ),
-     .m_axis_tcp_open_connection_TKEEP  ( m_axis_tcp_open_connection_tkeep  ),
-     .m_axis_tcp_open_connection_TLAST  ( m_axis_tcp_open_connection_tlast  ),
-     .s_axis_tcp_open_status_TVALID ( s_axis_tcp_open_status_tvalid ),
-     .s_axis_tcp_open_status_TREADY ( s_axis_tcp_open_status_tready ),
-     .s_axis_tcp_open_status_TDATA  ( s_axis_tcp_open_status_tdata  ),
-     .s_axis_tcp_open_status_TKEEP  ( s_axis_tcp_open_status_tkeep  ),
-     .s_axis_tcp_open_status_TLAST  ( s_axis_tcp_open_status_tlast  ),
-     .m_axis_tcp_close_connection_TVALID ( m_axis_tcp_close_connection_tvalid ),
-     .m_axis_tcp_close_connection_TREADY ( m_axis_tcp_close_connection_tready ),
-     .m_axis_tcp_close_connection_TDATA  ( m_axis_tcp_close_connection_tdata  ),
-     .m_axis_tcp_close_connection_TKEEP  ( m_axis_tcp_close_connection_tkeep  ),
-     .m_axis_tcp_close_connection_TLAST  ( m_axis_tcp_close_connection_tlast  ),
      .s_axis_tcp_notification_TVALID ( s_axis_tcp_notification_tvalid ),
      .s_axis_tcp_notification_TREADY ( s_axis_tcp_notification_tready ),
      .s_axis_tcp_notification_TDATA  ( s_axis_tcp_notification_tdata  ),
@@ -780,86 +851,6 @@ hls_pp_dual_krnl_ip u_krnl (
      .s_axis_tcp_tx_status_TDATA  ( s_axis_tcp_tx_status_tdata  ),
      .s_axis_tcp_tx_status_TKEEP  ( s_axis_tcp_tx_status_tkeep  ),
      .s_axis_tcp_tx_status_TLAST  ( s_axis_tcp_tx_status_tlast  ),
-     .s_axis_udp_rx_b_TVALID ( s_axis_udp_rx_b_tvalid ),
-     .s_axis_udp_rx_b_TREADY ( s_axis_udp_rx_b_tready ),
-     .s_axis_udp_rx_b_TDATA  ( s_axis_udp_rx_b_tdata  ),
-     .s_axis_udp_rx_b_TKEEP  ( s_axis_udp_rx_b_tkeep  ),
-     .s_axis_udp_rx_b_TLAST  ( s_axis_udp_rx_b_tlast  ),
-     .m_axis_udp_tx_b_TVALID ( m_axis_udp_tx_b_tvalid ),
-     .m_axis_udp_tx_b_TREADY ( m_axis_udp_tx_b_tready ),
-     .m_axis_udp_tx_b_TDATA  ( m_axis_udp_tx_b_tdata  ),
-     .m_axis_udp_tx_b_TKEEP  ( m_axis_udp_tx_b_tkeep  ),
-     .m_axis_udp_tx_b_TLAST  ( m_axis_udp_tx_b_tlast  ),
-     .s_axis_udp_rx_meta_b_TVALID ( s_axis_udp_rx_meta_b_tvalid ),
-     .s_axis_udp_rx_meta_b_TREADY ( s_axis_udp_rx_meta_b_tready ),
-     .s_axis_udp_rx_meta_b_TDATA  ( s_axis_udp_rx_meta_b_tdata  ),
-     .s_axis_udp_rx_meta_b_TKEEP  ( s_axis_udp_rx_meta_b_tkeep  ),
-     .s_axis_udp_rx_meta_b_TLAST  ( s_axis_udp_rx_meta_b_tlast  ),
-     .m_axis_udp_tx_meta_b_TVALID ( m_axis_udp_tx_meta_b_tvalid ),
-     .m_axis_udp_tx_meta_b_TREADY ( m_axis_udp_tx_meta_b_tready ),
-     .m_axis_udp_tx_meta_b_TDATA  ( m_axis_udp_tx_meta_b_tdata  ),
-     .m_axis_udp_tx_meta_b_TKEEP  ( m_axis_udp_tx_meta_b_tkeep  ),
-     .m_axis_udp_tx_meta_b_TLAST  ( m_axis_udp_tx_meta_b_tlast  ),
-     .m_axis_tcp_listen_port_b_TVALID ( m_axis_tcp_listen_port_b_tvalid ),
-     .m_axis_tcp_listen_port_b_TREADY ( m_axis_tcp_listen_port_b_tready ),
-     .m_axis_tcp_listen_port_b_TDATA  ( m_axis_tcp_listen_port_b_tdata  ),
-     .m_axis_tcp_listen_port_b_TKEEP  ( m_axis_tcp_listen_port_b_tkeep  ),
-     .m_axis_tcp_listen_port_b_TLAST  ( m_axis_tcp_listen_port_b_tlast  ),
-     .s_axis_tcp_port_status_b_TVALID ( s_axis_tcp_port_status_b_tvalid ),
-     .s_axis_tcp_port_status_b_TREADY ( s_axis_tcp_port_status_b_tready ),
-     .s_axis_tcp_port_status_b_TDATA  ( s_axis_tcp_port_status_b_tdata  ),
-     .s_axis_tcp_port_status_b_TKEEP  ( s_axis_tcp_port_status_b_tkeep  ),
-     .s_axis_tcp_port_status_b_TLAST  ( s_axis_tcp_port_status_b_tlast  ),
-     .m_axis_tcp_open_connection_b_TVALID ( m_axis_tcp_open_connection_b_tvalid ),
-     .m_axis_tcp_open_connection_b_TREADY ( m_axis_tcp_open_connection_b_tready ),
-     .m_axis_tcp_open_connection_b_TDATA  ( m_axis_tcp_open_connection_b_tdata  ),
-     .m_axis_tcp_open_connection_b_TKEEP  ( m_axis_tcp_open_connection_b_tkeep  ),
-     .m_axis_tcp_open_connection_b_TLAST  ( m_axis_tcp_open_connection_b_tlast  ),
-     .s_axis_tcp_open_status_b_TVALID ( s_axis_tcp_open_status_b_tvalid ),
-     .s_axis_tcp_open_status_b_TREADY ( s_axis_tcp_open_status_b_tready ),
-     .s_axis_tcp_open_status_b_TDATA  ( s_axis_tcp_open_status_b_tdata  ),
-     .s_axis_tcp_open_status_b_TKEEP  ( s_axis_tcp_open_status_b_tkeep  ),
-     .s_axis_tcp_open_status_b_TLAST  ( s_axis_tcp_open_status_b_tlast  ),
-     .m_axis_tcp_close_connection_b_TVALID ( m_axis_tcp_close_connection_b_tvalid ),
-     .m_axis_tcp_close_connection_b_TREADY ( m_axis_tcp_close_connection_b_tready ),
-     .m_axis_tcp_close_connection_b_TDATA  ( m_axis_tcp_close_connection_b_tdata  ),
-     .m_axis_tcp_close_connection_b_TKEEP  ( m_axis_tcp_close_connection_b_tkeep  ),
-     .m_axis_tcp_close_connection_b_TLAST  ( m_axis_tcp_close_connection_b_tlast  ),
-     .s_axis_tcp_notification_b_TVALID ( s_axis_tcp_notification_b_tvalid ),
-     .s_axis_tcp_notification_b_TREADY ( s_axis_tcp_notification_b_tready ),
-     .s_axis_tcp_notification_b_TDATA  ( s_axis_tcp_notification_b_tdata  ),
-     .s_axis_tcp_notification_b_TKEEP  ( s_axis_tcp_notification_b_tkeep  ),
-     .s_axis_tcp_notification_b_TLAST  ( s_axis_tcp_notification_b_tlast  ),
-     .m_axis_tcp_read_pkg_b_TVALID ( m_axis_tcp_read_pkg_b_tvalid ),
-     .m_axis_tcp_read_pkg_b_TREADY ( m_axis_tcp_read_pkg_b_tready ),
-     .m_axis_tcp_read_pkg_b_TDATA  ( m_axis_tcp_read_pkg_b_tdata  ),
-     .m_axis_tcp_read_pkg_b_TKEEP  ( m_axis_tcp_read_pkg_b_tkeep  ),
-     .m_axis_tcp_read_pkg_b_TLAST  ( m_axis_tcp_read_pkg_b_tlast  ),
-     .s_axis_tcp_rx_meta_b_TVALID ( s_axis_tcp_rx_meta_b_tvalid ),
-     .s_axis_tcp_rx_meta_b_TREADY ( s_axis_tcp_rx_meta_b_tready ),
-     .s_axis_tcp_rx_meta_b_TDATA  ( s_axis_tcp_rx_meta_b_tdata  ),
-     .s_axis_tcp_rx_meta_b_TKEEP  ( s_axis_tcp_rx_meta_b_tkeep  ),
-     .s_axis_tcp_rx_meta_b_TLAST  ( s_axis_tcp_rx_meta_b_tlast  ),
-     .s_axis_tcp_rx_data_b_TVALID ( s_axis_tcp_rx_data_b_tvalid ),
-     .s_axis_tcp_rx_data_b_TREADY ( s_axis_tcp_rx_data_b_tready ),
-     .s_axis_tcp_rx_data_b_TDATA  ( s_axis_tcp_rx_data_b_tdata  ),
-     .s_axis_tcp_rx_data_b_TKEEP  ( s_axis_tcp_rx_data_b_tkeep  ),
-     .s_axis_tcp_rx_data_b_TLAST  ( s_axis_tcp_rx_data_b_tlast  ),
-     .m_axis_tcp_tx_meta_b_TVALID ( m_axis_tcp_tx_meta_b_tvalid ),
-     .m_axis_tcp_tx_meta_b_TREADY ( m_axis_tcp_tx_meta_b_tready ),
-     .m_axis_tcp_tx_meta_b_TDATA  ( m_axis_tcp_tx_meta_b_tdata  ),
-     .m_axis_tcp_tx_meta_b_TKEEP  ( m_axis_tcp_tx_meta_b_tkeep  ),
-     .m_axis_tcp_tx_meta_b_TLAST  ( m_axis_tcp_tx_meta_b_tlast  ),
-     .m_axis_tcp_tx_data_b_TVALID ( m_axis_tcp_tx_data_b_tvalid ),
-     .m_axis_tcp_tx_data_b_TREADY ( m_axis_tcp_tx_data_b_tready ),
-     .m_axis_tcp_tx_data_b_TDATA  ( m_axis_tcp_tx_data_b_tdata  ),
-     .m_axis_tcp_tx_data_b_TKEEP  ( m_axis_tcp_tx_data_b_tkeep  ),
-     .m_axis_tcp_tx_data_b_TLAST  ( m_axis_tcp_tx_data_b_tlast  ),
-     .s_axis_tcp_tx_status_b_TVALID ( s_axis_tcp_tx_status_b_tvalid ),
-     .s_axis_tcp_tx_status_b_TREADY ( s_axis_tcp_tx_status_b_tready ),
-     .s_axis_tcp_tx_status_b_TDATA  ( s_axis_tcp_tx_status_b_tdata  ),
-     .s_axis_tcp_tx_status_b_TKEEP  ( s_axis_tcp_tx_status_b_tkeep  ),
-     .s_axis_tcp_tx_status_b_TLAST  ( s_axis_tcp_tx_status_b_tlast  ),
 
      // AXI-Lite ядра: только свой диапазон адресов.
      // ШИРИНА АДРЕСА -- ПОЛНАЯ, а не [5:0]. Первая версия резала до шести
